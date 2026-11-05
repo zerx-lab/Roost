@@ -1,0 +1,10 @@
+# 测试里允许 unwrap/expect/panic/下标,生产代码由 .cargo/config.toml 的 deny 规则约束
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+
+# 栈上大数组/大 future 的阈值(字节),超过就该放到堆上或拆分
+array-size-threshold = 16384
+future-size-threshold = 16384

@@ -1,0 +1,24 @@
+# 对本目录下任何 Rust crate 生效(cargo 自 cwd 向上查找本文件)。
+# 环境变量 RUSTFLAGS / CARGO_TARGET_DIR 会覆盖这里,脚本里不要随手设置。
+
+[build]
+# 构建产物必须落在插件目录之外:Tern 递归监听 link 的插件目录,任何文件变化都会重载全部插件。
+target-dir = "/tmp/roost-cargo-target"
+
+# 防 panic / 防内存失控的 clippy 规则。只在 clippy 下生效,rustc 普通构建会忽略 clippy:: 工具 lint。
+# 测试代码的豁免见 clippy.toml。
+rustflags = [
+  "-Dclippy::unwrap_used",
+  "-Dclippy::expect_used",
+  "-Dclippy::panic",
+  "-Dclippy::todo",
+  "-Dclippy::unimplemented",
+  "-Dclippy::indexing_slicing",
+  "-Dclippy::string_slice",
+  "-Dclippy::get_unwrap",
+  "-Dclippy::mem_forget",
+  "-Dclippy::large_stack_arrays",
+  "-Dclippy::large_futures",
+  "-Dclippy::exit",
+  "-Dclippy::dbg_macro",
+]

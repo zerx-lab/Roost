@@ -1,0 +1,45 @@
+/*
+ * Roost console styles. Tern's own kinds draw almost everything; this sheet only spaces the
+ * regions. Theming contract (override any of these from plugin-data/roost/theme.css):
+ *
+ *   [data-surface='plugin.roost.console']   the block's regions (main, dock, layer)
+ *   [data-role='roost.header']               title row with live badges and tools
+ *   [data-role='roost.tabs']                 page tabs
+ *   [data-role='roost.overview']             overview page
+ *   [data-role='roost.runs']                 runs page (split: list | detail)
+ *   [data-role='roost.run']                  run detail card
+ *   [data-role='roost.log']                  run log scroller (ansi inside)
+ *   [data-role='roost.workflows']            workflows page; each card is [data-role='roost.workflow']
+ *   [data-role='roost.events']               relayed events page
+ *   [data-role='roost.relay']                relay page
+ *   [data-role='roost.config']               config page
+ *   [data-role='roost.form']                 manual-run form overlay
+ *
+ * Nodes also carry data-tone (accent, success, warning, error, pending, muted); `--tc` is the
+ * tone color. Use theme variables (--accent, --t1..--t4, --l1..--l4, --ok, --warn, --bad,
+ * --card, --raise), never fixed colors, so light and dark themes both work.
+ */
+
+[data-surface='plugin.roost.console'] [data-role='roost.header'] {
+	padding: 2px 2px 0;
+}
+
+[data-surface='plugin.roost.console'] [data-role='roost.log'] {
+	border-radius: 6px;
+	background: var(--code-bg, var(--raise));
+	padding: 6px 8px;
+}
+
+[data-surface='plugin.roost.console'] [data-role='roost.workflow'][data-tone='muted'] {
+	opacity: 0.72;
+}
+
+[data-surface='plugin.roost.console'] [data-role='roost.form'] .sf-field {
+	margin-bottom: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	[data-surface='plugin.roost.console'] [data-role='roost.log'] {
+		scroll-behavior: auto;
+	}
+}

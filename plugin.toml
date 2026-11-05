@@ -1,0 +1,14 @@
+schema = 1
+id = "roost"
+name = "Roost"
+version = "0.1.0"
+description = "本地自动化工作台:定时(cron)与 GitHub 事件(经服务器中继)触发,在本机按固定流程运行 omp;中继订阅自动同步,支持远程重载与重启。"
+icon = "flow"
+host = "host.luau"
+window = "window.luau"
+styles = ["roost.css"]
+
+[[blocks]]
+id = "console"
+title = "Roost"
+icon = "flow"

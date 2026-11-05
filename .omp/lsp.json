@@ -1,0 +1,25 @@
+{
+  "servers": {
+    "luau-lsp": {
+      "command": "luau-lsp",
+      "args": ["lsp", "--definitions=@tern=tern.d.luau"],
+      "fileTypes": [".luau"],
+      "languageId": "luau",
+      "rootMarkers": ["plugin.toml", ".luaurc"],
+      "settings": {
+        "luau-lsp": {
+          "platform": { "type": "standard" },
+          "sourcemap": { "enabled": false }
+        }
+      }
+    },
+    "rust-analyzer": {
+      "settings": {
+        "rust-analyzer": {
+          "check": { "command": "clippy", "allTargets": true },
+          "cargo": { "targetDir": "/tmp/roost-cargo-target/ra" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+# roost-agent: the relay node. Copy to /etc/roost/agent.toml (mode 600).
+# Secrets accept a literal, "env:NAME" or "file:/path" (relative to this file).
+# Changes here take a restart (the plugin's "重启中继" button, or systemctl restart).
+
+[server]
+listen = "0.0.0.0:8787"
+# Public base URL GitHub can reach (behind a TLS proxy). The webhook URL is <public_url>/hooks/github.
+public_url = "https://roost.example.com"
+# max_body_bytes = 26214400
+
+[auth]
+# Bearer token the plugin sends. At least 16 characters: `openssl rand -hex 24`.
+token = "env:ROOST_TOKEN"
+
+[github]
+# The secret configured on the GitHub webhook; deliveries without a valid signature are refused.
+webhook_secret = "env:ROOST_WEBHOOK_SECRET"
+# Optional: lets the agent create/update webhooks itself (classic scope admin:repo_hook, or
+# fine-grained "Webhooks: read and write"). Without it, hooks are set up by hand.
+token = "env:GITHUB_TOKEN"
+# api_url = "https://api.github.com"     # GitHub Enterprise: https://HOST/api/v3
+# web_url = "https://github.com"
+# auto_sync_hooks = true                 # sync webhooks after every subscriptions change
+# ignore_bots = true                     # drop events sent by bot accounts (loop guard)
+
+[store]
+# keep_events = 2000
+# max_age = "7d"
+# max_payload_bytes = 2097152            # larger payloads are relayed as info only
+# max_total_bytes = 268435456
+
+[paths]
+# Relative to this file.
+data = "/var/lib/roost"
+subscriptions = "subscriptions.toml"

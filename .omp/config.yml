@@ -1,0 +1,24 @@
+# Roost 项目级 omp 配置(覆盖 ~/.omp/agent/config.yml 的同名键;对象深合并,数组整体替换)
+
+tools:
+  # 全自动执行;bash 关键危险命令、tool 自身 deny 策略仍然生效
+  approvalMode: yolo
+
+# 记忆只用仓库内 .omp/memory/(见 .omp/RULES.md),关闭 omp 用户级记忆:
+# local/sharpshooter/mnemopi/hindsight 都写在 ~/.omp/agent 或远端,不随项目走
+memory:
+  backend: "off"
+autolearn:
+  # 开启会写 ~/.omp/agent/managed-skills(用户级)
+  enabled: false
+
+ttsr:
+  enabled: true
+  # 违规时丢弃已流出的半截输出再重试,避免错误代码留在上下文
+  contextMode: discard
+  # 默认打断;个别规则在 frontmatter 用 interruptMode: never 改为事后提醒
+  interruptMode: always
+  # 长会话里同一规则隔 8 轮可再次触发(默认 once 只触发一次)
+  repeatMode: after-gap
+  repeatGap: 8
+  builtinRules: true

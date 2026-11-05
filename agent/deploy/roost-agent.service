@@ -1,0 +1,24 @@
+[Unit]
+Description=Roost relay agent (GitHub webhooks -> Roost Tern plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roost
+Group=roost
+EnvironmentFile=-/etc/roost/env
+ExecStart=/usr/local/bin/roost-agent serve --config /etc/roost/agent.toml
+# Remote restart re-execs in place (same PID); this only covers crashes and failed execs.
+Restart=on-failure
+RestartSec=2
+ExecReload=/bin/kill -HUP $MAINPID
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/roost /etc/roost
+StateDirectory=roost
+
+[Install]
+WantedBy=multi-user.target
