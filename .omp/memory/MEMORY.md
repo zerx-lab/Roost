@@ -38,6 +38,7 @@
 
 ## 约束与陷阱
 
+- [2026-11-06] Tern 的 `input`/`editor` 只负责绘制,选区要靠 block 的 `features = { "edit" }` 开启原生编辑:开启后 Tern 自己处理 ⌘A、⇧+方向键、拖拽和双击/三击选区,把改动作为 `edit` 事件发来(`from`/`to`/`cursor` 是 UTF-16 偏移,`len` 与当前文本的 UTF-16 长度不符就丢弃),由 `field.edit` 应用;没有选区时的输入和删除仍走 `key`。还要求用户开着 Settings › Terminal › Native composer editing,且字段没有 `mode`/`readonly`。目前没开 `undo`,⌃Z 仍作为按键送达 — 依据:docs.stencil.so/tern/elements/input.md「Native editing」、tern.d.luau BlockDef.features,用户报告无法全选/选择文字
 - [2026-11-06] 控制台只让页面滚动、标题与标签栏固定:`M.view` 的 body 一律是 `roost.fill`(flex + overflow hidden),各页根 col 就地改成同 key 同 role 的 `scroll`(节点 id 不变、每页滚动位置独立),宽运行页仍是 split。无头实例里 `tern ctl tree SEL` 直接给出 rect,`move` + `wheel 0 600` 可验证滚动 — 依据:用户要求「避免整页滚动」,TSP 探针实测(旧结构页面 col 高 1914px,新结构 scroll 限在 624px,滚动后标题/标签栏不动)
 - [2026-11-06] Tern 卡片内建样式:`.sf-card` 不是 flex(`flex: none`,块布局),head `padding: 4px 10px 4px 12px`,body `display:flex; column; gap: var(--sf-inner-gap); padding: 0 12px 10px 36px`(36 = 12 + 16 图标 + 8 间距)。要让卡片里某块贴底,得给卡片设 `display:flex; flex-direction:column`、body `flex:1`,再给该块 `margin-top:auto`(roost.css 的 `roost.wftail`)。`text` 节点有 `lines` 截断、任意节点有 `hovercard`(悬浮富提示);CSS 不支持 `grid-auto-rows`,跨行等高做不到 — 依据:Tern 二进制 `strings` 中的内嵌 CSS、docs.stencil.so/tern/elements/index.md、styles/css.md
 - [2026-11-06] Tern 下拉不会避开 overlay 边缘:`menu` 默认从触发按钮左缘展开(靠右的按钮要 `align = "end"`);`select` 菜单(最小宽度 152px,`left: 0`)只在会超出 pane 时才加 `.end` 右对齐,而 `.sf-ov-body` 设了 `overflow-y: auto`(横向随之变成 auto),菜单超出 overlay 时整个表单会横向滚动、左侧被裁掉。Roost 用 roost.css 把表单 overlay 中 row 字段里的 select 菜单改成右对齐 — 依据:Tern 二进制内嵌 CSS(`strings` 可查)、用户截图
