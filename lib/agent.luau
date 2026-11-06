@@ -10,6 +10,11 @@
 --   s<i>.reply.txt    window: the agent's last message
 --   s<i>.exit         window (host for an unclaimed or abandoned step): the step's exit code
 --   s<i>.session/     omp's --session-dir: the conversation, kept and pruned with the run
+--
+-- While the agent works, the host reads the session file omp writes there and logs what it does
+-- (M.progress), so the run log follows the conversation instead of waiting for the end.
+
+local util = require("./util")
 
 local M = {}
 
@@ -92,6 +97,12 @@ function M.command(omp: string, session_dir: string, args: { string }): string
 		table.insert(words, a)
 	end
 	return join(words)
+end
+
+-- `command` started through sh after sourcing `envfile`: cx.agents:start passes no environment,
+-- so the variables an omp step needs (the GitHub App identity) reach omp this way.
+function M.with_env(envfile: string, command: string): string
+	return join({ "/bin/sh", "-c", '. "$1" || exit 97; shift; exec "$@"', "roost", envfile }) .. " " .. command
 end
 
 -- The command line that reopens a finished step's conversation.
@@ -177,6 +188,124 @@ function M.parse_url(url: string): Route?
 		return { kind = "session", run = run, step = tonumber(step) :: number }
 	end
 	return nil
+end
+
+-- Session file → run log. The tail of a growing JSONL file: complete lines only, so an entry is
+-- read once whole. Tool results are skipped unless they failed (they can be huge); assistant
+-- entries become their text and one dim line per tool call.
+
+-- Most characters of an assistant message kept while the turn goes on; the final answer keeps
+-- up to MAX_REPLY bytes.
+M.MAX_NOTE = 600
+-- Most characters of a tool call's one-line summary.
+M.MAX_TOOL = 120
+
+export type Progress = {
+	lines: { string },
+	used: number, -- bytes of the chunk consumed (whole lines, or the dropped piece of one too long)
+	final: string?, -- the turn's final answer, when the chunk held it
+}
+
+local function one_line(s: string, n: number): string
+	return util.clip(util.trim((string.gsub(util.trim(s), "%s*[\r\n]+%s*", " ⏎ "))), n)
+end
+
+local TOOL_KEYS = { "i", "path", "command", "pattern", "query", "url", "file", "name" }
+
+local function tool_line(call: { [string]: any }): string
+	local name = if type(call.name) == "string" then call.name else "tool"
+	local args = if type(call.arguments) == "table" then call.arguments else {}
+	local what = ""
+	for _, k in TOOL_KEYS do
+		if type(args[k]) == "string" and args[k] ~= "" then
+			what = args[k]
+			break
+		end
+	end
+	return `\27[2m  › {name}{if what ~= "" then "  " .. one_line(what, M.MAX_TOOL) else ""}\27[0m`
+end
+
+local function assistant(msg: { [string]: any }, out: { string }): string?
+	local final = msg.stopReason ~= "toolUse"
+	local texts: { string } = {}
+	local content = if type(msg.content) == "table" then msg.content else {}
+	for _, c in content do
+		if type(c) == "table" and c.type == "text" and type(c.text) == "string" and util.trim(c.text) ~= "" then
+			table.insert(texts, util.trim(c.text))
+		end
+	end
+	local text = table.concat(texts, "\n")
+	if final then
+		if text ~= "" then
+			table.insert(out, string.sub(text, 1, M.MAX_REPLY))
+		end
+		if msg.stopReason == "error" or msg.stopReason == "aborted" then
+			local why = if type(msg.errorMessage) == "string" then one_line(msg.errorMessage, M.MAX_NOTE) else msg.stopReason
+			table.insert(out, `\27[31m[omp] 本轮中止:{why}\27[0m`)
+		end
+		return if text ~= "" then text else nil
+	end
+	if text ~= "" then
+		table.insert(out, util.clip(text, M.MAX_NOTE))
+	end
+	for _, c in content do
+		if type(c) == "table" and c.type == "toolCall" then
+			table.insert(out, tool_line(c))
+		end
+	end
+	return nil
+end
+
+local function failed_tool(msg: { [string]: any }, out: { string })
+	local name = if type(msg.toolName) == "string" then msg.toolName else "tool"
+	local first = ""
+	local content = if type(msg.content) == "table" then msg.content else {}
+	for _, c in content do
+		if type(c) == "table" and type(c.text) == "string" and util.trim(c.text) ~= "" then
+			first = one_line(util.first_line(util.trim(c.text)), M.MAX_TOOL)
+			break
+		end
+	end
+	table.insert(out, `\27[31m  ✗ {name}{if first ~= "" then "  " .. first else ""}\27[0m`)
+end
+
+-- What the complete lines at the start of `chunk` (read from a session file) add to the log.
+-- `full` says the chunk filled the read limit: a chunk without any newline is then one line too
+-- long to keep, and is dropped (the rest of that line fails to decode and is skipped next time).
+function M.progress(chunk: string, full: boolean): Progress
+	local last = 0
+	local pos = string.find(chunk, "\n", 1, true)
+	while pos do
+		last = pos
+		pos = string.find(chunk, "\n", pos + 1, true)
+	end
+	local out: Progress = { lines = {}, used = if last == 0 and full then #chunk else last, final = nil }
+	if last == 0 then
+		return out
+	end
+	for line in string.gmatch(string.sub(chunk, 1, last), "([^\n]*)\n") do
+		local is_assistant = string.find(line, '"role":"assistant"', 1, true) ~= nil
+		local is_error = not is_assistant
+			and string.find(line, '"role":"toolResult"', 1, true) ~= nil
+			and string.find(line, '"isError":true', 1, true) ~= nil
+		if not (is_assistant or is_error) then
+			continue
+		end
+		local ok, v = pcall(tern.json.decode, line)
+		if not ok or type(v) ~= "table" or v.type ~= "message" or type(v.message) ~= "table" then
+			continue
+		end
+		local msg = v.message
+		if msg.role == "assistant" then
+			local final = assistant(msg, out.lines)
+			if final then
+				out.final = final
+			end
+		elseif msg.role == "toolResult" and msg.isError == true then
+			failed_tool(msg, out.lines)
+		end
+	end
+	return out
 end
 
 return M

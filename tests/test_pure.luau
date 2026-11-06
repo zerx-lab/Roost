@@ -82,6 +82,11 @@ do -- people filters: case-insensitive, @me, and naming yourself lets your own a
 	assert(match.mismatch(t, { event = "issue_comment", action = "created", repo = "other/web", association = "MEMBER" }, ME), "owner/* pattern")
 	local assigned = gh('github = "comment"\nassignees = ["@me"]')
 	eq(match.mismatch(assigned, { event = "issue_comment", action = "created", assignees = { "ZERO" }, association = "MEMBER" }, ME), nil)
+	-- What Roost did as the App is your own activity too, even with bots let through.
+	local as_app = { event = "issue_comment", action = "created", repo = "acme/web", sender = "Roost-X[bot]", author = "Roost-X[bot]", sender_is_bot = true, association = "NONE" }
+	local open = gh('github = "comment"\nrepos = ["acme/web"]\nignore_bots = false\nassociations = ["*"]')
+	assert(string.find(match.mismatch(open, as_app, { me = "zero", bot = "roost-x[bot]" }) or "", "App 身份", 1, true), "the App's own comment ignored")
+	eq(match.mismatch(open, as_app, ME), nil, "another bot passes when bots are let through")
 end
 
 do -- user-content events default to trusted authors; "*" opens them up; CI refuses fork code
@@ -280,6 +285,60 @@ do -- roost.toml: relay URL trimmed and checked, runner bounds enforced, Roost-m
 	local _, step_issues = model.parse_workflows('[[workflow]]\nid = "w"\n[[workflow.step]]\nomp = "hi"\nargs = ["--resume", "abc"]\n')
 	eq(#step_issues, 1, "step args can't resume a session either")
 	eq(step_issues[1].path, "workflow.w.step[1].args")
+	eq(cfg.github.identity, "app", "runs act as the GitHub App unless told otherwise")
+	local _, who = model.parse_config('[github]\nidentity = "me"\n')
+	eq(who[1].path, "github.identity")
+	local w = model.parse_workflows('[[workflow]]\nid = "w"\nidentity = "local"\n[[workflow.step]]\nrun = "true"\n') :: model.Workflows
+	eq(w.list[1].identity, "local", "a workflow can override it")
+	local _, wbad = model.parse_workflows('[[workflow]]\nid = "w"\nidentity = "bot"\n[[workflow.step]]\nrun = "true"\n')
+	eq(wbad[1].path, "workflow.w.identity")
+end
+
+do -- `when`, `daily_budget` and `{{out.x}}`: parsed, validated, round-tripped by the encoder
+	local text = table.concat({
+		"[[workflow]]",
+		'id = "w"',
+		"daily_budget = 2.5",
+		"[[workflow.input]]",
+		'name = "dry"',
+		"[[workflow.step]]",
+		'run = "true"',
+		"[[workflow.step]]",
+		'when = "!input.dry"',
+		'omp = "处理 {{out.count}} 条"',
+		"[[workflow.step]]",
+		'when = "out.go"',
+		'run = "true"',
+	}, "\n")
+	local w = model.parse_workflows(text) :: model.Workflows
+	local wf = w.by_id.w
+	eq(wf.daily_budget, 2.5)
+	eq(wf.steps[1].when, nil)
+	local w2 = wf.steps[2].when :: model.When
+	eq(w2.source, "input")
+	eq(w2.key, "dry")
+	eq(w2.negate, true)
+	eq((wf.steps[3].when :: model.When).source, "out")
+	local raw = assert(model.raw_workflow(text, "w"))
+	local again = model.parse_workflows(model.encode_workflow(raw)) :: model.Workflows
+	eq(again.by_id.w.daily_budget, 2.5, "budget survives the editor's encoder")
+	eq((again.by_id.w.steps[2].when :: model.When).key, "dry", "when survives too")
+
+	local function bad(body: string): { model.Issue }
+		local _, issues = model.parse_workflows(`[[workflow]]\nid = "b"\n{body}`)
+		return issues
+	end
+	local i1 = bad('daily_budget = 0\n[[workflow.step]]\nrun = "true"\n')
+	eq(i1[1].path, "workflow.b.daily_budget", "a zero budget is refused")
+	local i2 = bad('[[workflow.step]]\nwhen = "input.nope"\nrun = "true"\n')
+	eq(i2[1].path, "workflow.b.step[1].when", "undeclared input")
+	local i3 = bad('[[workflow.step]]\nwhen = "out.a-b"\nrun = "true"\n')
+	eq(i3[1].path, "workflow.b.step[1].when", "malformed output name")
+	local i4 = bad('[[workflow.step]]\nomp = "{{out.x.y}}"\n')
+	eq(i4[1].path, "workflow.b.step[1].omp", "out takes exactly one name")
+	eq(model.truthy(" 0 "), false)
+	eq(model.truthy("no"), false)
+	eq(model.truthy("2"), true)
 end
 
 do -- agent command lines survive spaces and quotes; roost:// links round-trip
@@ -295,6 +354,54 @@ do -- agent command lines survive spaces and quotes; roost:// links round-trip
 	eq((agent.parse_url(agent.SIDEBAR_URL) :: any).kind, "sidebar")
 end
 
+do -- session progress: whole lines only; a line longer than a read is dropped, its rest skipped
+	local agent = require("../lib/agent")
+	local line = '{"type":"message","message":{"role":"assistant","stopReason":"aborted","errorMessage":"503\\nbusy","content":[]}}\n'
+	local p = agent.progress(line .. '{"type":"mess', false)
+	eq(p.used, #line, "the partial second line is left for the next read")
+	eq(p.final, nil, "no text means no final answer")
+	assert(string.find(p.lines[1], "本轮中止:503 ⏎ busy", 1, true), "an aborted turn says why, on one line")
+	local big = agent.progress(string.rep("x", 64), true)
+	eq(big.used, 64, "a full chunk without a newline is dropped")
+	eq(#big.lines, 0)
+	local rest = agent.progress('xx","role":"assistant"}\n' .. line, false)
+	eq(#rest.lines, 1, "the cut line's rest fails to decode and is skipped")
+end
+
+do -- stats: runs land on their local day; rates skip cancelled runs; percentiles by nearest rank
+	local stats = require("../lib/stats")
+	local now = os.time({ year = 2026, month = 11, day = 6, hour = 9, min = 0, sec = 0 })
+	local yesterday_late = os.time({ year = 2026, month = 11, day = 5, hour = 23, min = 59, sec = 0 })
+	local function run(wf: string, state: string, at: number, took: number?): any
+		return { workflow = wf, state = state, created_at = at, started_at = at, finished_at = if took then at + took else nil }
+	end
+	local runs = {
+		run("a", "success", now - 60, 10),
+		run("a", "failed", now - 120, 30),
+		run("a", "cancelled", now - 180, 5),
+		run("a", "success", yesterday_late, 20),
+		run("b", "running", now - 10, nil),
+		run("a", "success", now - 30 * 86400, 1), -- outside the window
+	}
+	local days = stats.days(runs, now, 3)
+	eq(#days, 3)
+	eq(days[3].label, "11-06", "today is last")
+	eq(days[3].ok, 1)
+	eq(days[3].bad, 1)
+	eq(days[3].other, 2, "cancelled and running count as other")
+	eq(days[2].ok, 1, "23:59 local is still yesterday")
+	eq(days[3].p50, 10, "nearest-rank median of 5, 10, 30")
+	eq(days[3].p95, 30)
+	local h = stats.health(runs, now, 3)
+	eq(h.a.runs, 4)
+	eq(h.a.rate, 2 / 3, "cancelled runs don't count against the rate")
+	eq(h.a.daily[2], 1)
+	eq(h.a.daily[3], 3)
+	eq(h.b.rate, nil, "no finished runs: no rate")
+	eq(stats.percent(h.b.rate), "—")
+	eq(stats.percent(2 / 3), "67%")
+end
+
 do -- util
 	eq(util.duration("1h30m"), 5400)
 	eq(util.duration("90"), 90)
@@ -302,6 +409,43 @@ do -- util
 	eq(util.fmt_duration(5400), "1h30m")
 	eq(util.clip("你好世界", 2), "你好…")
 	eq(util.shq("it's"), "'it'\\''s'")
+	-- Terminal cells of a log line: escapes take none, CJK two, \r restarts (widest pass), tabs align.
+	eq(util.cells("\27[1;36m▶ build\27[0m"), 7, "SGR codes take no cells")
+	eq(util.cells("\27]8;;https://x.dev\7link\27]8;;\27\\"), 4, "OSC 8 links count their text")
+	eq(util.cells("先读 tr"), 7, "wide characters take two cells")
+	eq(util.cells("progress 100%\rdone"), 13, "a carriage return keeps the widest pass")
+	eq(util.cells("a\tb"), 9, "a tab moves to the next multiple of 8")
+	eq(util.cells("ok\255\128"), 2, "bytes that aren't UTF-8 take none")
+end
+
+do -- PR references for a manual PR run; which workflows can take one
+	local function ref(s: string): string
+		local repo, n = match.pr_ref(s)
+		return `{repo or "-"} {n or "-"}`
+	end
+	eq(ref("https://github.com/acme/web/pull/12"), "acme/web 12")
+	eq(ref(" github.com/acme/web.js/pull/12/files#diff "), "acme/web.js 12", "no scheme, trailing path")
+	eq(ref("acme/web#12"), "acme/web 12")
+	eq(ref("#12"), "- 12", "a bare number leaves the repo to the caller")
+	eq(ref("12"), "- 12")
+	eq(ref("0"), "- -", "PR numbers start at 1")
+	eq(ref("acme/web#12x"), "- -")
+	eq(ref("https://github.com/acme/web/issues/12"), "- -", "an issue is not a PR")
+	eq(ref(""), "- -")
+	local long = string.rep("a", 16 * 1024 - 1) .. "é" .. "tail"
+	local info = match.pr_info("acme/web", { number = 3, body = long, base = {}, head = {} }, "manual")
+	eq(info.repo, "acme/web", "the asked repo when the PR lacks base.repo")
+	eq(info.from_fork, false, "unknown head repo is not a fork")
+	eq(string.sub(info.body, -3), "…", "long body clipped")
+	assert(utf8.len(info.body), "clipped on a character boundary")
+	local function kinds(src: string): string?
+		local w = model.parse_workflows(`[[workflow]]\nid = "x"\n{src}[[workflow.step]]\nrun = "true"\n`) :: model.Workflows
+		return model.pr_target(w.by_id.x)
+	end
+	eq(kinds('[[workflow.trigger]]\ngithub = "pr_pushed"\nrepos = ["a/b"]\n'), "only")
+	eq(kinds('[[workflow.trigger]]\ngithub = "review"\nrepos = ["a/b"]\n[[workflow.trigger]]\nschedule = "daily"\ntime = "06:00"\n'), "some")
+	eq(kinds('[[workflow.trigger]]\ngithub = "comment"\nrepos = ["a/b"]\n'), nil, "comments may be on issues")
+	eq(kinds(""), nil)
 end
 
 print("ok")

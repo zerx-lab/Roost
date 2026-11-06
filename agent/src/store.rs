@@ -278,6 +278,41 @@ impl EventStore {
         Ok(ev)
     }
 
+    /// Deletes every retained event, in memory and on disk, and returns how many events were
+    /// dropped and the head. The store id and sequence numbers are untouched: cursors stay valid
+    /// and numbers are never reused. Serialized with `push` by the `writing` lock.
+    pub async fn clear(&self) -> std::io::Result<(usize, u64)> {
+        let _writing = self.writing.lock().await;
+        let (removed, head) = {
+            let mut g = self.lock();
+            let removed = g.events.len();
+            g.events.clear();
+            g.bytes = 0;
+            (removed, g.committed)
+        };
+        // Every event file, including strays left by a push that failed half-way.
+        let mut first_err = None;
+        let mut dir = tokio::fs::read_dir(self.dir.join("events")).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name
+                .strip_suffix(".json")
+                .is_some_and(|s| s.parse::<u64>().is_ok())
+            {
+                continue;
+            }
+            if let Err(e) = tokio::fs::remove_file(entry.path()).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok((removed, head)),
+        }
+    }
+
     pub fn page(&self, after: u64, limit: usize) -> Page {
         let g = self.lock();
         let head = g.committed;
@@ -393,5 +428,52 @@ mod tests {
         assert_eq!(page.head, 1);
         assert!(page.events.is_empty());
         assert!(!page.gap);
+    }
+
+    #[tokio::test]
+    async fn clear_removes_files_but_keeps_ids_and_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().to_path_buf(), limits(10)).unwrap();
+        let id = store.store_id().to_string();
+        for i in 0..3 {
+            let p = RawValue::from_string(format!("{{\"n\":{i}}}")).unwrap();
+            store
+                .push(format!("d{i}"), info("push"), Some(p), false)
+                .await
+                .unwrap();
+        }
+        let events_dir = dir.path().join("events");
+        assert_eq!(std::fs::read_dir(&events_dir).unwrap().count(), 3);
+
+        assert_eq!(store.clear().await.unwrap(), (3, 3));
+        assert_eq!(std::fs::read_dir(&events_dir).unwrap().count(), 0);
+        assert_eq!(store.stats(), (3, 4, 0, 0), "head kept, nothing retained");
+        assert!(!store.has_delivery("d2"));
+        assert_eq!(store.store_id(), id);
+        assert_eq!(
+            store.clear().await.unwrap(),
+            (0, 3),
+            "clearing twice is fine"
+        );
+
+        // A client behind the head sees a gap; one at the head does not.
+        let page = store.page(1, 10);
+        assert!(page.events.is_empty());
+        assert!(page.gap);
+        assert_eq!(page.head, 3);
+        assert!(!store.page(3, 10).gap);
+
+        // Reopening right after a clear must not move the head back.
+        drop(store);
+        let store = EventStore::open(dir.path().to_path_buf(), limits(10)).unwrap();
+        assert_eq!(store.store_id(), id);
+        assert_eq!(store.page(0, 10).head, 3);
+
+        let ev = store
+            .push("d3".into(), info("push"), None, false)
+            .await
+            .unwrap();
+        assert_eq!(ev.seq, 4, "sequence numbers are not reused");
+        assert_eq!(std::fs::read_dir(&events_dir).unwrap().count(), 1);
     }
 }

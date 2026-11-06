@@ -480,4 +480,96 @@ do -- delete asks, then removes the workflow
 	truthy(wfs and wfs.by_id.keep == nil, "keep is gone")
 end
 
+do -- when and daily_budget round-trip; a non-number budget is a validator issue
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "keep"',
+		'name = "保留"',
+		"[[workflow.input]]",
+		'name = "dry_run"',
+		"[[workflow.step]]",
+		'name = "think"',
+		'omp = "hello"',
+		"[[workflow.step]]",
+		'name = "ship"',
+		'run = "echo ship"',
+	}, "\n")
+	local w = world({ [DATA .. "/workflows.toml"] = wf })
+	click(w, "edit=keep")
+	local layer = view(w)
+	local when_fields = 0
+	F.walk(layer.layer, function(x)
+		if x.k == "field" and x.p and x.p.label == "条件(when)" then
+			when_fields += 1
+		end
+	end)
+	eq(when_fields, 2, "the prompt step and the extra step each have a when field")
+	local PROMPT_WHEN = "layer.editor.body.prompt.when.input"
+	local STEP_WHEN = "layer.editor.body.steps.s2.when.input"
+	local BUDGET = "layer.editor.body.advanced.budget.input"
+	focus(w, PROMPT_WHEN)
+	type_text(w, "out.verify")
+	focus(w, STEP_WHEN)
+	type_text(w, "!input.dry_run")
+	click(w, "advanced")
+	layer = view(w)
+	truthy(find(layer.layer, function(x)
+		return x.k == "field" and x.p and x.p.label == "每日预算(美元)"
+	end), "advanced section has the daily budget field")
+	focus(w, BUDGET)
+	type_text(w, "2.5")
+	press(w, "enter")
+	local raw = w.st.editor.raw
+	eq(raw.step[1].when, "out.verify")
+	eq(raw.step[2].when, "!input.dry_run")
+	eq(raw.daily_budget, 2.5)
+	local function roundtrip(): any
+		local text = model.encode_workflow(w.st.editor.raw)
+		local wfs, issues = model.parse_workflows(text)
+		eq(#issues, 0, `round-trip issues: {if issues[1] then issues[1].message else ""}`)
+		truthy(wfs, "parse_workflows returned a catalogue")
+		return (wfs :: any).by_id.keep
+	end
+	local kept = roundtrip()
+	eq(kept.daily_budget, 2.5)
+	local when1 = kept.steps[1].when
+	local when2 = kept.steps[2].when
+	truthy(when1 and when2, "both conditions parsed")
+	eq(when1.source, "out")
+	eq(when1.key, "verify")
+	eq(when1.negate, false)
+	eq(when2.source, "input")
+	eq(when2.key, "dry_run")
+	eq(when2.negate, true)
+
+	focus(w, PROMPT_WHEN)
+	press(w, "backspace", nil, { meta = true })
+	press(w, "enter")
+	eq(w.st.editor.raw.step[1].when, nil, "empty when clears the condition")
+	eq(roundtrip().steps[1].when, nil)
+
+	focus(w, BUDGET)
+	press(w, "backspace", nil, { meta = true })
+	type_text(w, "lots")
+	press(w, "enter")
+	eq(w.st.editor.raw.daily_budget, "lots", "a non-number is kept for the validator")
+	local found = false
+	for _, issue in w.st.editor.issues do
+		if string.find(issue.path, "daily_budget", 1, true) then
+			found = true
+			truthy(string.find(issue.message, "金额", 1, true) ~= nil, issue.message)
+		end
+	end
+	truthy(found, "invalid budget surfaces a validator issue")
+	local text = model.encode_workflow(w.st.editor.raw)
+	local _, issues = model.parse_workflows(text)
+	local hit = false
+	for _, issue in issues do
+		if string.find(issue.path, "daily_budget", 1, true) then
+			hit = true
+		end
+	end
+	truthy(hit, "parse_workflows rejects the non-number budget")
+end
+
 print("ok")

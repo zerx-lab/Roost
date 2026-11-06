@@ -4,7 +4,8 @@
 -- runs remote operations (reload, restart, test event). GitHub App calls go through `request`.
 --
 -- Persistent client state lives in tern.kv, keyed by relay URL so pointing at another agent
--- starts clean: `cursor` = { url, store_id, seq }, `subs` = { url, rev, fp }.
+-- starts clean: `cursor` = { url, store_id, seq }, `subs` = { url, rev, fp, at?, adopted? }
+-- (`adopted`: the server's subscriptions were kept over differing local ones after a conflict).
 
 local util = require("./util")
 
@@ -15,11 +16,16 @@ local POLL_TIMEOUT_MS = 40000
 local STATUS_EVERY_MS = 20000
 local MAX_BACKOFF = 60
 local NOT_READY_RETRY = 3
+-- On first contact, how many already-stored events are fetched for display only.
+local BACKFILL = 20
 
 export type Cfg = { url: string?, token: string?, client_name: string? }
 
 export type Sync = {
-	state: string, -- idle | pushing | ok | conflict | invalid | offline | unconfigured
+	-- idle: not yet checked against the relay | pushing | ok: the relay runs exactly the local
+	-- subscriptions | adopted: it runs its own (kept after a conflict) until the local ones change |
+	-- conflict | invalid | offline | unconfigured
+	state: string,
 	at: number?,
 	revision: string?,
 	error: string?,
@@ -53,6 +59,10 @@ export type Subs = { [string]: { events: { string } } }
 export type Handlers = {
 	-- Handles one relayed event; errors are caught and logged.
 	event: (e: { [string]: any }) -> (),
+	-- Events already read, for display only (no payloads; never run): see `backfill`.
+	history: (list: { { [string]: any } }) -> (),
+	-- Whether the events page has nothing saved yet and wants recent history.
+	wants_history: () -> boolean,
 	changed: () -> (),
 	now: () -> number,
 	client_id: string,
@@ -71,6 +81,7 @@ export type Relay = {
 	state: State,
 	h: Handlers,
 	push_again: { force: boolean }?,
+	backfill_gen: number?, -- a history fetch for this generation is in flight
 }
 
 function M.new(h: Handlers): Relay
@@ -82,6 +93,7 @@ function M.new(h: Handlers): Relay
 		status_timer = nil,
 		h = h,
 		push_again = nil,
+		backfill_gen = nil,
 		state = {
 			configured = false,
 			connected = false,
@@ -224,7 +236,7 @@ function M.push_subs(r: Relay, subs: Subs, force: boolean)
 		st.busy.push = nil
 		local t = r.h.now()
 		if ok and type(resp) == "table" then
-			kv_set("subs", { url = url, rev = resp.revision, fp = fp })
+			kv_set("subs", { url = url, rev = resp.revision, fp = fp, at = t })
 			st.sync = { state = "ok", at = t, revision = resp.revision }
 			M.refresh_status(r)
 		elseif status == 409 and type(resp) == "table" then
@@ -253,15 +265,61 @@ function M.push_subs(r: Relay, subs: Subs, force: boolean)
 	end)
 end
 
--- Pushes the current local subscriptions when they differ from the last push to this relay.
-function M.sync(r: Relay, force: boolean)
+-- Settles the sync state against the relay's last /status. The relay runs the revision we last
+-- pushed (or adopted) and the local subscriptions still match it → ok/adopted. A different
+-- revision on the relay is pushed when `may_push` (a rebuilt, empty agent gets ours outright;
+-- anything else goes through the revision check and may conflict).
+local function reconcile(r: Relay, may_push: boolean)
+	local st = r.state
+	local agent = st.agent
+	local remote = if agent and type(agent.subscriptions) == "table" then agent.subscriptions else nil
+	if remote == nil or st.busy.push or st.sync.state == "conflict" then
+		return
+	end
+	local subs = r.h.subs()
+	if subs == nil then
+		if st.sync.state == "idle" then
+			st.sync.error = "没有有效的 workflows.toml,无法核对订阅"
+		end
+		return
+	end
+	local saved = mine(r, "subs")
+	if saved == nil or saved.rev ~= remote.revision then
+		if may_push then
+			M.push_subs(r, subs, remote.repos == 0)
+		end
+	elseif saved.fp == M.fingerprint(subs) then
+		st.sync = {
+			state = if saved.adopted == true then "adopted" else "ok",
+			at = if type(saved.at) == "number" then saved.at else nil,
+			revision = saved.rev,
+		}
+	end
+end
+
+-- Pushes the current local subscriptions when they differ from the last push to this relay;
+-- otherwise confirms them against the relay's last known state.
+function M.sync(r: Relay)
 	local subs = r.h.subs()
 	if subs == nil or not r.state.configured then
 		return
 	end
-	if force or M.needs_push(r, subs) then
-		M.push_subs(r, subs, force)
+	if M.needs_push(r, subs) then
+		M.push_subs(r, subs, false)
+	else
+		reconcile(r, false)
 	end
+end
+
+-- An explicit push of the current local subscriptions, even when unchanged since the last push.
+function M.push_now(r: Relay, force: boolean)
+	local subs = r.h.subs()
+	if subs == nil then
+		r.state.sync.error = "没有有效的 workflows.toml,无法计算订阅"
+		r.h.changed()
+		return
+	end
+	M.push_subs(r, subs, force)
 end
 
 -- Keeps the server's subscriptions after a conflict: they become the base, and the current local
@@ -276,8 +334,9 @@ function M.adopt_remote(r: Relay)
 	local fp = M.fingerprint(subs :: Subs)
 	local url = r.cfg.url
 	local function keep(rev: string)
-		kv_set("subs", { url = url, rev = rev, fp = fp })
-		st.sync = { state = "idle", at = r.h.now(), revision = rev }
+		local t = r.h.now()
+		kv_set("subs", { url = url, rev = rev, fp = fp, at = t, adopted = true })
+		st.sync = { state = "adopted", at = t, revision = rev }
 		r.h.changed()
 	end
 	if st.sync.unreloaded then
@@ -309,6 +368,37 @@ local function schedule_poll(r: Relay, gen: number, seconds: number)
 	end)
 end
 
+-- Events this client already read, shown as history when it has none saved: on first contact
+-- (everything up to the head) or when the events page has no saved file yet. Only events at or
+-- before `upto` are passed on, so nothing still ahead of the cursor is mistaken for history.
+local function backfill(r: Relay, gen: number, upto: number)
+	r.backfill_gen = gen
+	local after = math.max(0, math.floor(upto) - BACKFILL)
+	M.request(r, "GET", `/api/v1/events?wait=0&payload=false&limit={BACKFILL}&after={after}`, nil, 15000, function(ok, _s, body)
+		if gen ~= r.gen then
+			return
+		end
+		r.backfill_gen = nil
+		if not ok or type(body) ~= "table" or type(body.events) ~= "table" then
+			return
+		end
+		local list: { { [string]: any } } = {}
+		for _, e in body.events do
+			if type(e) == "table" and type(e.seq) == "number" and e.seq <= upto then
+				table.insert(list, e)
+			end
+		end
+		local okh, herr = pcall(function(): string?
+			r.h.history(list)
+			return nil
+		end)
+		if not okh then
+			tern.log.warn("roost: history handler failed", herr)
+		end
+		r.h.changed()
+	end)
+end
+
 function poll(r: Relay, gen: number)
 	if gen ~= r.gen or not r.state.configured then
 		return
@@ -323,11 +413,17 @@ function poll(r: Relay, gen: number)
 		schedule_poll(r, gen, NOT_READY_RETRY)
 		return
 	end
-	st.waiting = false
+	if st.waiting then
+		st.waiting = false
+		r.h.changed()
+	end
 	local cursor = mine(r, "cursor")
 	local q: string
 	if cursor and type(cursor.seq) == "number" then
-		q = `/api/v1/events?wait={POLL_WAIT}&limit=50&after={math.floor(cursor.seq)}`
+		-- Until a poll succeeds (start, reload, outage) don't block: an idle long-poll would
+		-- keep the panel on its stale "not connected" state for up to POLL_WAIT seconds.
+		local wait = if st.connected then POLL_WAIT else 0
+		q = `/api/v1/events?wait={wait}&limit=50&after={math.floor(cursor.seq)}`
 	else
 		-- First contact: learn the head at once; events after it come with the next poll.
 		q = "/api/v1/events?wait=0&limit=1"
@@ -338,11 +434,11 @@ function poll(r: Relay, gen: number)
 			return
 		end
 		if not ok or type(body) ~= "table" then
-			local was = st.connected
+			local was, before = st.connected, st.error
 			st.connected = false
 			st.error = err or "响应无效"
 			r.backoff = math.min(MAX_BACKOFF, r.backoff * 2)
-			if was or st.error ~= err then
+			if was or st.error ~= before then
 				r.h.changed()
 			end
 			schedule_poll(r, gen, r.backoff)
@@ -355,6 +451,15 @@ function poll(r: Relay, gen: number)
 		-- Straight back into the next long-poll, whatever happens below.
 		schedule_poll(r, gen, 0.05)
 
+		local upto = if cursor == nil then body.head elseif cursor.store_id == body.store_id then cursor.seq else nil
+		if
+			(cursor == nil or r.h.wants_history())
+			and type(upto) == "number"
+			and upto > 0
+			and r.backfill_gen ~= gen
+		then
+			backfill(r, gen, upto)
+		end
 		if cursor == nil then
 			kv_set("cursor", { url = url, store_id = body.store_id, seq = body.head })
 		elseif cursor.store_id ~= body.store_id then
@@ -390,7 +495,7 @@ function poll(r: Relay, gen: number)
 		end
 		if fresh then
 			-- Reconnected: catch up on a push that failed while the relay was away.
-			M.sync(r, false)
+			M.sync(r)
 		end
 		r.h.changed()
 	end)
@@ -408,17 +513,7 @@ function M.refresh_status(r: Relay)
 			if st.restarting and body.boot_id ~= st.restarting.from then
 				st.restarting = nil
 			end
-			-- The server's subscriptions aren't the ones we pushed: a rebuilt agent (empty) gets
-			-- ours outright; anything else goes through the revision check (and may conflict).
-			local remote = type(body.subscriptions) == "table" and body.subscriptions or nil
-			local saved = mine(r, "subs")
-			if remote and st.sync.state ~= "conflict" and not st.busy.push and (saved == nil or saved.rev ~= remote.revision) then
-				local empty = remote.repos == 0
-				local subs = r.h.subs()
-				if subs then
-					M.push_subs(r, subs, empty)
-				end
-			end
+			reconcile(r, true)
 		else
 			st.agent_at = nil
 			if not st.connected then
@@ -470,7 +565,7 @@ function M.configure(r: Relay, cfg: Cfg)
 	local gen = r.gen
 	schedule_poll(r, gen, 0.05)
 	status_loop(r, gen)
-	M.sync(r, false)
+	M.sync(r)
 	r.h.changed()
 end
 
@@ -539,8 +634,19 @@ function M.test(r: Relay, repo: string?, cb: (boolean, string, any) -> ())
 	op(r, "test", "POST", "/api/v1/events/test", { repo = repo }, 10000, cb)
 end
 
-function M.deliveries(r: Relay, cb: (boolean, string, any) -> ())
-	op(r, "deliveries", "GET", "/api/v1/deliveries?limit=50", nil, 10000, cb)
+-- Clears the agent's webhook delivery counters and recent list.
+function M.clear_deliveries(r: Relay, cb: (boolean, string, any) -> ())
+	op(r, "clear_deliveries", "DELETE", "/api/v1/deliveries", nil, 10000, cb)
+end
+
+-- Deletes the events the agent keeps for clients (sequence numbers carry on, cursors stay valid).
+function M.clear_events(r: Relay, cb: (boolean, string, any) -> ())
+	op(r, "clear_events", "DELETE", "/api/v1/events", nil, 15000, function(ok, msg, body)
+		if ok then
+			M.refresh_status(r)
+		end
+		cb(ok, msg, body)
+	end)
 end
 
 return M

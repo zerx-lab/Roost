@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+ <!-- Roost: the Tern bird has landed on the prompt. Same bar and palette as Tern's icon. -->
+ <defs>
+  <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512">
+   <stop offset="0" stop-color="#232323"/><stop offset="1" stop-color="#0E0E0E"/>
+  </linearGradient>
+ </defs>
+ <rect width="512" height="512" fill="url(#bg)"/>
+ <g transform="translate(256 254) scale(1.18) translate(-261 -254)">
+  <rect x="128" y="310" width="256" height="22" rx="11" fill="#E5E5E5"/>
+  <path d="M150 356 C 184 282, 222 196, 296 164 C 322 152, 348 158, 358 176 L 394 188 L 358 198 C 360 248, 326 290, 268 298 C 228 300, 196 306, 150 356 Z" fill="#F5F5F5" stroke="url(#bg)" stroke-width="16" stroke-linejoin="round" paint-order="stroke"/>
+  <circle cx="334" cy="182" r="9" fill="url(#bg)"/>
+ </g>
+</svg>

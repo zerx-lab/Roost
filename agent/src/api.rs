@@ -26,6 +26,8 @@ use crate::github::{self, Failure, Github};
 use crate::store::{EventStore, MAX_PAGE, StoredEvent};
 
 const MAX_DELIVERIES: usize = 200;
+/// Upper bound on distinct (outcome, event, repo) rows kept in the delivery summary.
+const MAX_STAT_KEYS: usize = 256;
 const MAX_CLIENTS: usize = 32;
 const MAX_WAIT: Duration = Duration::from_secs(30);
 const ADMIN_BODY_LIMIT: usize = 1024 * 1024;
@@ -57,13 +59,105 @@ pub struct ClientSeen {
     pub cursor: u64,
 }
 
+/// One row of the delivery summary: everything since `since` with the same outcome, event, repo.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatRow {
+    pub outcome: &'static str,
+    pub event: String,
+    pub repo: Option<String>,
+    pub count: u64,
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    /// Reason of the most recent delivery in this row.
+    pub reason: Option<String>,
+}
+
+type StatKey = (&'static str, String, Option<String>);
+
+/// Delivery counters since the process started or the last manual clear. `keys` holds at most
+/// `MAX_STAT_KEYS` rows; `total` and `by_outcome` are never affected by eviction.
+pub struct DeliveryStats {
+    since: DateTime<Utc>,
+    total: u64,
+    by_outcome: BTreeMap<&'static str, u64>,
+    keys: BTreeMap<StatKey, StatRow>,
+}
+
+impl DeliveryStats {
+    pub fn new(since: DateTime<Utc>) -> Self {
+        DeliveryStats {
+            since,
+            total: 0,
+            by_outcome: BTreeMap::new(),
+            keys: BTreeMap::new(),
+        }
+    }
+
+    fn add(&mut self, d: &Delivery) {
+        self.total += 1;
+        *self.by_outcome.entry(d.outcome).or_insert(0) += 1;
+        // A rejected delivery failed verification, so its event header is anyone's choice: they
+        // share one row, and a flood of made-up names can't push real rows out of the table.
+        let (event, repo) = if d.outcome == "rejected" {
+            (String::new(), None)
+        } else {
+            (d.event.clone(), d.repo.clone())
+        };
+        let key: StatKey = (d.outcome, event.clone(), repo.clone());
+        if let Some(row) = self.keys.get_mut(&key) {
+            row.count += 1;
+            row.last_at = d.at;
+            row.reason = d.reason.clone();
+            return;
+        }
+        if self.keys.len() >= MAX_STAT_KEYS {
+            let oldest = self
+                .keys
+                .iter()
+                .min_by_key(|(_, r)| r.last_at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                self.keys.remove(&k);
+            }
+        }
+        self.keys.insert(
+            key,
+            StatRow {
+                outcome: d.outcome,
+                event,
+                repo,
+                count: 1,
+                first_at: d.at,
+                last_at: d.at,
+                reason: d.reason.clone(),
+            },
+        );
+    }
+
+    fn reset(&mut self, since: DateTime<Utc>) {
+        *self = DeliveryStats::new(since);
+    }
+
+    /// Rows by count descending, then most recently seen first.
+    fn summary(&self) -> Vec<StatRow> {
+        let mut rows: Vec<StatRow> = self.keys.values().cloned().collect();
+        rows.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.last_at.cmp(&a.last_at))
+        });
+        rows
+    }
+}
+
 pub struct AppState {
     pub cfg: Arc<AgentConfig>,
     pub subs: RwLock<Arc<Subscriptions>>,
     pub store: Arc<EventStore>,
     pub gh: Arc<Github>,
     pub deliveries: Mutex<VecDeque<Delivery>>,
-    pub delivery_total: Mutex<u64>,
+    /// Lock order: `delivery_stats` before `deliveries`.
+    pub delivery_stats: Mutex<DeliveryStats>,
     pub clients: Mutex<BTreeMap<String, ClientSeen>>,
     pub boot_id: String,
     pub started_at: DateTime<Utc>,
@@ -87,12 +181,20 @@ impl AppState {
 
     fn record(&self, d: Delivery) {
         tracing::info!(delivery = %d.delivery, event = %d.event, outcome = d.outcome, reason = ?d.reason, "webhook");
-        *lock(&self.delivery_total) += 1;
+        let mut stats = lock(&self.delivery_stats);
+        stats.add(&d);
         let mut g = lock(&self.deliveries);
         if g.len() >= MAX_DELIVERIES {
             g.pop_front();
         }
         g.push_back(d);
+    }
+
+    /// Forgets the recent deliveries and all counters; counting restarts now.
+    fn clear_deliveries(&self) {
+        let mut stats = lock(&self.delivery_stats);
+        stats.reset(Utc::now());
+        lock(&self.deliveries).clear();
     }
 
     /// Re-reads `subscriptions.toml` from disk.
@@ -128,10 +230,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/restart", post(restart))
         .route("/github/app", delete(app_forget))
         .route("/github/app/manifest", post(app_manifest))
+        .route("/github/token", post(gh_token))
         .route("/github/{what}", get(gh_list))
-        .route("/events", get(events))
+        .route("/events", get(events).delete(clear_events))
         .route("/events/test", post(test_event))
-        .route("/deliveries", get(deliveries))
+        .route("/deliveries", get(deliveries).delete(clear_deliveries))
         .layer(DefaultBodyLimit::max(ADMIN_BODY_LIMIT))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
@@ -292,8 +395,12 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<Value> {
     let last = lock(&st.deliveries).back().cloned();
     let clients: Vec<ClientSeen> = lock(&st.clients).values().cloned().collect();
     let app = st.gh.info().await;
+    let (total, since) = {
+        let s = lock(&st.delivery_stats);
+        (s.total, s.since)
+    };
     Json(json!({
-        "api": 2,
+        "api": 3,
         "version": env!("CARGO_PKG_VERSION"),
         "boot_id": st.boot_id,
         "started_at": st.started_at,
@@ -317,7 +424,7 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<Value> {
             "count": count,
             "bytes": bytes,
         },
-        "deliveries": { "total": *lock(&st.delivery_total), "last": last },
+        "deliveries": { "total": total, "since": since, "last": last },
         "clients": clients,
     }))
 }
@@ -525,6 +632,22 @@ async fn gh_list(
 }
 
 #[derive(Deserialize)]
+struct TokenBody {
+    repo: String,
+}
+
+/// A token for one run on `repo`, acting as the App (see `Github::app_token`).
+async fn gh_token(State(st): State<Arc<AppState>>, Json(b): Json<TokenBody>) -> Response {
+    match st.gh.app_token(&b.repo).await {
+        Ok(t) => {
+            tracing::info!(repo = %t.repository, protection = t.protection, "issued an App token");
+            Json(t).into_response()
+        }
+        Err(f) => failure(f),
+    }
+}
+
+#[derive(Deserialize)]
 struct EventsQuery {
     after: Option<u64>,
     limit: Option<usize>,
@@ -688,13 +811,41 @@ async fn deliveries(
     Query(q): Query<DeliveriesQuery>,
 ) -> Json<Value> {
     let limit = q.limit.unwrap_or(50).clamp(1, MAX_DELIVERIES);
+    // Same lock order as `record`, so the list and the counters describe one moment.
+    let stats = lock(&st.delivery_stats);
     let list: Vec<Delivery> = lock(&st.deliveries)
         .iter()
         .rev()
         .take(limit)
         .cloned()
         .collect();
-    Json(json!({ "deliveries": list, "total": *lock(&st.delivery_total) }))
+    Json(json!({
+        "deliveries": list,
+        "total": stats.total,
+        "since": stats.since,
+        "by_outcome": stats.by_outcome,
+        "summary": stats.summary(),
+    }))
+}
+
+/// Forgets the recent deliveries and every counter; `since` becomes now.
+async fn clear_deliveries(State(st): State<Arc<AppState>>) -> Json<Value> {
+    st.clear_deliveries();
+    Json(json!({ "ok": true }))
+}
+
+/// Deletes every retained event. Sequence numbers and the store id are kept, so client cursors
+/// stay valid and a client behind the head sees a gap.
+async fn clear_events(State(st): State<Arc<AppState>>) -> Response {
+    match st.store.clear().await {
+        Ok((removed, head)) => {
+            Json(json!({ "ok": true, "removed": removed, "head": head })).into_response()
+        }
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot clear events: {e}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -751,7 +902,7 @@ mod tests {
             store: Arc::new(store),
             gh,
             deliveries: Mutex::new(VecDeque::new()),
-            delivery_total: Mutex::new(0),
+            delivery_stats: Mutex::new(DeliveryStats::new(Utc::now())),
             clients: Mutex::new(BTreeMap::new()),
             boot_id: "boot".into(),
             started_at: Utc::now(),
@@ -1073,5 +1224,444 @@ mod tests {
         assert!(!st.cfg.app_path.exists());
         let (c, _) = call(&app, signed("issues", "d3", ISSUE, "fresh")).await;
         assert_eq!(c, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// What the guard fake saw: rulesets created, scoped token requests (their bodies).
+    #[derive(Default)]
+    struct Seen {
+        rulesets: Vec<Value>,
+        scoped: Vec<Value>,
+    }
+
+    /// A fake GitHub for run tokens: no rules on any default branch; creating a ruleset fails on
+    /// `acme/private` (as on a plan without rulesets).
+    async fn fake_github_guard(seen: Arc<Mutex<Seen>>) -> String {
+        use axum::extract::Path as P;
+        let perms = json!({ "administration": "write", "contents": "write", "issues": "write", "metadata": "read" });
+        let (p1, p2) = (perms.clone(), perms);
+        let (s1, s2) = (seen.clone(), seen);
+        let gh = Router::new()
+            .route(
+                "/app/installations",
+                get(move || {
+                    let p = p1.clone();
+                    async move { Json(json!([{ "id": 7, "permissions": p }])) }
+                }),
+            )
+            .route(
+                "/repos/{o}/{r}/installation",
+                get(move || {
+                    let p = p2.clone();
+                    async move { Json(json!({ "id": 7, "permissions": p })) }
+                }),
+            )
+            .route(
+                "/app/installations/{id}/access_tokens",
+                post(move |body: Option<Json<Value>>| {
+                    let s = s1.clone();
+                    async move {
+                        let token = match body {
+                            Some(Json(b)) => {
+                                s.lock().unwrap().scoped.push(b);
+                                "run-tok"
+                            }
+                            None => "inst-tok",
+                        };
+                        Json(json!({
+                            "token": token,
+                            "expires_at": (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                            "permissions": { "contents": "write", "issues": "write", "metadata": "read" },
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/repos/{o}/{r}",
+                get(|| async { Json(json!({ "default_branch": "main" })) }),
+            )
+            .route(
+                "/repos/{o}/{r}/rules/branches/{b}",
+                get(|P((_, _, b)): P<(String, String, String)>| async move {
+                    assert_eq!(b, "main");
+                    Json(json!([{ "type": "required_signatures" }]))
+                }),
+            )
+            .route(
+                "/repos/{o}/{r}/rulesets",
+                get(|| async { Json(json!([])) }).post(
+                    move |P((_, r)): P<(String, String)>, h: HeaderMap, Json(b): Json<Value>| {
+                        let s = s2.clone();
+                        async move {
+                            assert_eq!(header(&h, "authorization"), Some("Bearer inst-tok"));
+                            if r == "private" {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    Json(json!({ "message": "Upgrade to GitHub Pro" })),
+                                )
+                                    .into_response();
+                            }
+                            s.lock().unwrap().rulesets.push(b);
+                            (StatusCode::CREATED, Json(json!({ "id": 1 }))).into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/users/{login}",
+                get(|P(l): P<String>| async move {
+                    assert_eq!(l, "roost-test[bot]");
+                    Json(json!({ "id": 77 }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, gh).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn run_tokens_need_a_guarded_default_branch_and_stay_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let api = fake_github_guard(seen.clone()).await;
+        let st = state_with(dir.path(), Some(&api), true);
+        let app = router(st.clone());
+
+        let (c, v) = call(
+            &app,
+            admin(
+                "POST",
+                "/api/v1/github/token",
+                Some(json!({ "repo": "acme/web" })),
+            ),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["token"], "run-tok");
+        assert_eq!(v["login"], "roost-test[bot]");
+        assert_eq!(v["email"], "77+roost-test[bot]@users.noreply.github.com");
+        assert_eq!(v["branch"], "main");
+        assert_eq!(v["protection"], "created");
+        assert!(v["expires_in"].as_u64().unwrap() > 3000);
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.rulesets.len(), 1, "the missing guard was added");
+            let rs = &s.rulesets[0];
+            assert_eq!(rs["name"], github::GUARD_NAME);
+            assert_eq!(rs["enforcement"], "active");
+            assert_eq!(
+                rs["conditions"]["ref_name"]["include"],
+                json!(["~DEFAULT_BRANCH"])
+            );
+            assert_eq!(
+                rs["rules"],
+                json!([{ "type": "non_fast_forward" }, { "type": "deletion" }])
+            );
+            assert_eq!(
+                s.scoped,
+                vec![json!({
+                    "repositories": ["web"],
+                    "permissions": { "contents": "write", "issues": "write", "metadata": "read" },
+                })],
+                "one repository, without the relay's administration permission"
+            );
+        }
+
+        // The check is reused; after it lapses, two runs starting together still add one ruleset.
+        let req = || {
+            admin(
+                "POST",
+                "/api/v1/github/token",
+                Some(json!({ "repo": "acme/web" })),
+            )
+        };
+        let (c, _) = call(&app, req()).await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().rulesets.len(),
+            1,
+            "the guard check is reused"
+        );
+        st.gh.forget_installs();
+        let ((c1, _), (c2, _)) = tokio::join!(call(&app, req()), call(&app, req()));
+        assert_eq!((c1, c2), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(
+            seen.lock().unwrap().rulesets.len(),
+            2,
+            "one check per repository at a time"
+        );
+
+        let (c, v) = call(
+            &app,
+            admin(
+                "POST",
+                "/api/v1/github/token",
+                Some(json!({ "repo": "acme/private" })),
+            ),
+        )
+        .await;
+        assert_eq!(c, StatusCode::CONFLICT, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("Upgrade to GitHub Pro")
+        );
+        assert_eq!(
+            seen.lock().unwrap().scoped.len(),
+            4,
+            "no token without a guard"
+        );
+
+        let (c, _) = call(
+            &app,
+            admin(
+                "POST",
+                "/api/v1/github/token",
+                Some(json!({ "repo": "../x" })),
+            ),
+        )
+        .await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+
+        let (_, v) = call(&app, admin("GET", "/api/v1/status", None)).await;
+        let a = &v["github"]["app"];
+        assert_eq!(a["bot"], "roost-test[bot]");
+        assert_eq!(
+            a["settings_url"],
+            "https://github.com/settings/apps/roost-test"
+        );
+        assert_eq!(
+            a["missing"],
+            json!([
+                "actions:write",
+                "checks:write",
+                "deployments:write",
+                "discussions:write",
+                "pull_requests:write",
+                "statuses:write",
+                "workflows:write"
+            ])
+        );
+    }
+
+    fn delivery(
+        outcome: &'static str,
+        event: &str,
+        repo: Option<&str>,
+        reason: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Delivery {
+        Delivery {
+            delivery: format!("{event}-{}", at.timestamp_millis()),
+            at,
+            event: event.into(),
+            action: None,
+            repo: repo.map(Into::into),
+            outcome,
+            reason: reason.map(Into::into),
+            seq: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_summary_counts_by_outcome_event_and_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let app = router(st.clone());
+        let t0 = Utc::now();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let fd = Some("zerx-lab/FluxDown");
+        st.record(delivery("ignored", "workflow_run", fd, Some("old"), at(0)));
+        st.record(delivery(
+            "ignored",
+            "workflow_run",
+            fd,
+            Some("older"),
+            at(1),
+        ));
+        st.record(delivery(
+            "ignored",
+            "workflow_run",
+            fd,
+            Some("newest"),
+            at(2),
+        ));
+        // Same event and repo but another outcome, another event, another repo: separate rows.
+        st.record(delivery("relayed", "workflow_run", fd, None, at(3)));
+        st.record(delivery("ignored", "push", fd, Some("p"), at(4)));
+        st.record(delivery("ignored", "workflow_run", None, Some("n"), at(5)));
+        st.record(delivery(
+            "relayed",
+            "roost_test",
+            Some("acme/web"),
+            None,
+            at(6),
+        ));
+        st.record(delivery("rejected", "", None, Some("bad signature"), at(7)));
+        st.record(delivery("ignored", "push", fd, None, at(8)));
+
+        let (c, v) = call(&app, admin("GET", "/api/v1/deliveries?limit=2", None)).await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["total"], 9);
+        assert_eq!(
+            v["by_outcome"],
+            json!({ "ignored": 6, "relayed": 2, "rejected": 1 })
+        );
+        assert_eq!(v["since"], json!(lock(&st.delivery_stats).since));
+        assert_eq!(
+            v["deliveries"].as_array().unwrap().len(),
+            2,
+            "limit applies to the list only"
+        );
+        assert_eq!(v["deliveries"][0]["event"], "push", "newest first");
+
+        let rows: Vec<(String, String, Value, u64)> = v["summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["outcome"].as_str().unwrap().to_string(),
+                    r["event"].as_str().unwrap().to_string(),
+                    r["repo"].clone(),
+                    r["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let fd_v = json!("zerx-lab/FluxDown");
+        let row = |o: &str, e: &str, repo: Value, n: u64| (o.to_string(), e.to_string(), repo, n);
+        assert_eq!(
+            rows,
+            vec![
+                row("ignored", "workflow_run", fd_v.clone(), 3),
+                row("ignored", "push", fd_v.clone(), 2),
+                // count 1 each: most recently seen first
+                row("rejected", "", Value::Null, 1),
+                row("relayed", "roost_test", json!("acme/web"), 1),
+                row("ignored", "workflow_run", Value::Null, 1),
+                row("relayed", "workflow_run", fd_v, 1),
+            ]
+        );
+        let top = &v["summary"][0];
+        assert_eq!(top["reason"], "newest", "reason of the latest delivery");
+        assert_eq!(top["first_at"], json!(at(0)));
+        assert_eq!(top["last_at"], json!(at(2)));
+        assert_eq!(
+            v["summary"][1]["reason"],
+            Value::Null,
+            "latest push had no reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_summary_is_bounded_and_totals_survive_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let t0 = Utc::now();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let ev = |i: usize| format!("e{i}");
+        for i in 0..MAX_STAT_KEYS {
+            st.record(delivery("ignored", &ev(i), None, None, at(i as i64)));
+        }
+        // Seen again: e0 is no longer the stalest, e1 is.
+        st.record(delivery("ignored", &ev(0), None, None, at(1000)));
+        st.record(delivery("relayed", "fresh", None, None, at(1001)));
+
+        let g = lock(&st.delivery_stats);
+        assert_eq!(g.keys.len(), MAX_STAT_KEYS);
+        assert!(
+            !g.keys.contains_key(&("ignored", ev(1), None)),
+            "stalest key evicted"
+        );
+        assert!(g.keys.contains_key(&("ignored", ev(0), None)));
+        assert!(g.keys.contains_key(&("ignored", ev(2), None)));
+        assert!(g.keys.contains_key(&("relayed", "fresh".to_string(), None)));
+        assert_eq!(g.total, MAX_STAT_KEYS as u64 + 2);
+        assert_eq!(
+            g.by_outcome.get("ignored"),
+            Some(&(MAX_STAT_KEYS as u64 + 1))
+        );
+        assert_eq!(g.by_outcome.get("relayed"), Some(&1));
+        assert_eq!(g.summary().len(), MAX_STAT_KEYS);
+        assert_eq!(g.summary()[0].event, "e0", "count 2 sorts first");
+    }
+
+    #[tokio::test]
+    async fn delete_deliveries_resets_counters_and_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let app = router(st.clone());
+        st.record(delivery("ignored", "push", Some("a/b"), None, Utc::now()));
+        let (_, before) = call(&app, admin("GET", "/api/v1/deliveries", None)).await;
+        assert_eq!(before["total"], 1);
+        let (_, s) = call(&app, admin("GET", "/api/v1/status", None)).await;
+        assert_eq!(s["api"], 3);
+        assert_eq!(s["deliveries"]["since"], before["since"]);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let (c, v) = call(&app, admin("DELETE", "/api/v1/deliveries", None)).await;
+        assert_eq!((c, v), (StatusCode::OK, json!({ "ok": true })));
+        let (_, after) = call(&app, admin("GET", "/api/v1/deliveries", None)).await;
+        assert_eq!(after["total"], 0);
+        assert_eq!(after["deliveries"], json!([]));
+        assert_eq!(after["by_outcome"], json!({}));
+        assert_eq!(after["summary"], json!([]));
+        let parse = |v: &Value| v.as_str().unwrap().parse::<DateTime<Utc>>().unwrap();
+        assert!(parse(&after["since"]) > parse(&before["since"]));
+        let (_, s) = call(&app, admin("GET", "/api/v1/status", None)).await;
+        assert_eq!(s["deliveries"]["since"], after["since"]);
+        assert_eq!(s["deliveries"]["total"], 0);
+        assert_eq!(s["deliveries"]["last"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn delete_events_keeps_cursors_and_both_deletes_need_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let app = router(st.clone());
+        for uri in ["/api/v1/events", "/api/v1/deliveries"] {
+            let anon = Request::delete(uri).body(Body::empty()).unwrap();
+            let (c, _) = call(&app, anon).await;
+            assert_eq!(c, StatusCode::UNAUTHORIZED, "{uri}");
+            let wrong = Request::delete(uri)
+                .header("authorization", "Bearer nope")
+                .body(Body::empty())
+                .unwrap();
+            let (c, _) = call(&app, wrong).await;
+            assert_eq!(c, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        for i in 0..2 {
+            let (c, _) = call(&app, signed("issues", &format!("d{i}"), ISSUE, "hush")).await;
+            assert_eq!(c, StatusCode::ACCEPTED);
+        }
+        let (_, before) = call(&app, admin("GET", "/api/v1/status", None)).await;
+        assert_eq!(before["store"]["count"], 2);
+        assert_eq!(
+            st.delivery_stats.lock().unwrap().total,
+            2,
+            "401s were not recorded"
+        );
+
+        let (c, v) = call(&app, admin("DELETE", "/api/v1/events", None)).await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v, json!({ "ok": true, "removed": 2, "head": 2 }));
+        let (_, after) = call(&app, admin("GET", "/api/v1/status", None)).await;
+        assert_eq!(after["store"]["count"], 0);
+        assert_eq!(after["store"]["bytes"], 0);
+        assert_eq!(after["store"]["head"], 2);
+        assert_eq!(after["store"]["store_id"], before["store"]["store_id"]);
+        assert_eq!(
+            after["deliveries"]["total"], 2,
+            "deliveries are cleared separately"
+        );
+
+        let (_, v) = call(&app, admin("GET", "/api/v1/events?after=0", None)).await;
+        assert_eq!(v["gap"], true, "a client behind the head sees the gap");
+        assert_eq!(v["events"], json!([]));
+        let (_, v) = call(&app, admin("GET", "/api/v1/events?after=2", None)).await;
+        assert_eq!(v["gap"], false);
+        let (_, v) = call(&app, signed("issues", "d9", ISSUE, "hush")).await;
+        assert_eq!(v["seq"], 3, "sequence numbers are not reused");
     }
 }

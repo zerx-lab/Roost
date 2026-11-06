@@ -7,11 +7,14 @@
  *   [data-role='roost.tabs']                 page tabs
  *   [data-role='roost.overview']             overview page
  *   [data-role='roost.runs']                 runs page (split: list | detail)
- *   [data-role='roost.run']                  run detail card
+ *   [data-role='roost.fill']                 the runs page's body when it is the split: fills the block below the tabs
+ *   [data-role='roost.runlist']              runs list pane (filter bar, then the scrolling table)
+ *   [data-role='roost.run']                  run detail pane (right of the runs list)
  *   [data-role='roost.log']                  run log scroller (ansi inside)
- *   [data-role='roost.workflows']            workflows page; each card is [data-role='roost.workflow']
+ *   [data-role='roost.workflows']            workflows page (list | selected workflow [data-role='roost.workflow'])
  *   [data-role='roost.events']               relayed events page
  *   [data-role='roost.relay']                relay page
+ *   [data-role='roost.deliveries']           relay page: webhook delivery counts
  *   [data-role='roost.config']               config page
  *   [data-role='roost.form']                 manual-run form overlay
  *   [data-role='roost.editor']               automation editor overlay
@@ -32,10 +35,51 @@
 	padding: 2px 2px 0;
 }
 
+/* The wide runs page fills the block below the tabs: page body → split → panes → the run list's
+ * table and the run's log, which take what is left and scroll inside it. A height counted in
+ * lines can't match the pixels above, so this is done here. */
+.sf-main[data-surface='plugin.roost.console'] > [data-role='roost.fill'],
+[data-surface='plugin.roost.console'] [data-role='roost.fill'] > .sf-split[data-role='roost.runs'],
+[data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.runlist'],
+[data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.run'] {
+	flex: 1 1 0;
+	min-height: 0;
+}
+/* Tern's layout keeps the page body as tall as its content despite min-height: 0 (a headless
+ * render measured it at the log's full height, the region scrolling past it); a body that clips
+ * takes the room the region has, and the levels below follow. */
+.sf-main[data-surface='plugin.roost.console'] > [data-role='roost.fill'] {
+	overflow: hidden;
+}
+[data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.runlist'] > *,
+[data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.run'] > * {
+	flex: none;
+}
+[data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.runlist'] > .sf-scroll {
+	flex: 1 1 0;
+	min-height: 0;
+}
+[data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.run'] > [data-role='roost.log'] {
+	flex: 1 1 0;
+	min-height: 96px;
+}
+
+/* Tern's tables reach 7px past their box on both sides (their cells' padding lines the text up
+ * with the rest); in the detail pane that sliver made the whole pane scroll sideways. */
+[data-surface='plugin.roost.console'] [data-role='roost.run'] {
+	overflow-x: clip;
+}
+
 [data-surface='plugin.roost.console'] [data-role='roost.log'] {
 	border-radius: 6px;
 	background: var(--code-bg, var(--raise));
 	padding: 6px 8px;
+}
+
+/* With 自动换行 off the log's terminal is as wide as its widest line; the log's own view scrolls
+ * it sideways (Tern's scroll view only scrolls vertically), so the pane never does. */
+[data-surface='plugin.roost.console'] [data-role='roost.log'] > .sf-scroll-view {
+	overflow-x: auto;
 }
 
 [data-surface='plugin.roost.console'] [data-role='roost.workflow'][data-tone='muted'] {
@@ -52,9 +96,6 @@
 	}
 }
 
-[data-surface='plugin.roost.console'] [data-role='roost.editor'] {
-	max-width: 72ch;
-}
 [data-surface='plugin.roost.console'] [data-role='roost.trigger'] {
 	border-radius: 6px;
 	background: var(--card);

@@ -16,6 +16,7 @@ local template = require("./template")
 local util = require("./util")
 local match = require("./match")
 local agent = require("./agent")
+local stats = require("./stats")
 
 local M = {}
 
@@ -25,6 +26,8 @@ type Workflow = model.Workflow
 -- The wrapper: `sh -c WRAPPER roost LOG PIDFILE EXITFILE CWD PROG ARGS...`. `set -m` gives the
 -- command its own process group, so cancel can signal everything it started. The wrapper's own
 -- pid goes to PIDFILE.w so a later VM can tell whether anyone is left to write the exit file.
+-- Anything but a regular file at $ROOST_OUTPUT is removed before the exit file appears, so the
+-- host's read of it can't block on a FIFO or device.
 M.WRAPPER = [[
 log=$1; pidf=$2; exitf=$3; cwd=$4; shift 4
 echo "$$" >"$pidf.w"
@@ -36,6 +39,10 @@ child=$!
 echo "$child" >"$pidf"
 wait "$child"
 code=$?
+if [ -n "$ROOST_OUTPUT" ] && { [ -e "$ROOST_OUTPUT" ] || [ -L "$ROOST_OUTPUT" ]; } && { [ -L "$ROOST_OUTPUT" ] || [ ! -f "$ROOST_OUTPUT" ]; }; then
+	rm -rf -- "$ROOST_OUTPUT"
+	echo "[roost] \$ROOST_OUTPUT is not a regular file: ignored" >>"$log"
+fi
 echo "$code" >"$exitf.tmp" && mv "$exitf.tmp" "$exitf"
 exit "$code"
 ]]
@@ -67,6 +74,65 @@ local MAX_PAYLOAD = 8 * 1024 * 1024
 local SAVE_DELAY_MS = 250
 -- How long a window may hold an agent step's claim without recording a pane.
 local CLAIM_GRACE = 30
+-- How often a working agent's session file is read into the run log, and how much at a time.
+local TAIL_EVERY = 2
+local TAIL_CHUNK = 512 * 1024
+-- How long the relay gets to hand out a run's App token, and when a held one is renewed
+-- (installation tokens live an hour).
+local AUTH_TIMEOUT = 90
+local TOKEN_RENEW = 900
+local RENEW_RETRY = 60
+
+-- What an agent step cost: every *.jsonl under its session dir (subagents are files one level
+-- down), summing each usage record's `cost.total` and `totalTokens`. Text inside JSON strings has
+-- its quotes escaped, so the patterns only meet real usage objects. Prints "COST TOKENS".
+M.TALLY = [[
+find "$1" -type f -name '*.jsonl' -exec cat {} + 2>/dev/null |
+	grep -oE '"cost":\{[^}]*\}|"totalTokens":[0-9]+' |
+	awk '/^"totalTokens"/ { split($0, a, ":"); t += a[2]; next }
+		{ if (match($0, /"total":[-0-9.eE+]+/)) c += substr($0, RSTART + 8, RLENGTH - 8) }
+		END { printf "%.6f %d\n", c, t }'
+]]
+local TALLY_TIMEOUT_MS = 20000
+-- Most of $ROOST_OUTPUT read after a shell step, and most outputs a run keeps.
+local MAX_OUTPUT_FILE = 64 * 1024
+local MAX_OUTPUTS = 64
+local MAX_OUTPUT_VALUE = 4096
+
+-- `gh` for runs acting as the GitHub App, installed as <data>/bin/gh, which such runs put first on
+-- PATH: reads the run's current token (renewed while the run lasts), then runs the next gh.
+M.GH_SHIM = [[
+#!/bin/sh
+# Roost: gh as the GitHub App. Reads the run's current token, then runs the next gh on PATH.
+if [ -n "$ROOST_GH_TOKEN_FILE" ]; then
+	GH_TOKEN=$(cat "$ROOST_GH_TOKEN_FILE") || exit 4
+	export GH_TOKEN
+fi
+self=$(dirname "$0")
+set -f
+IFS=:
+for d in $PATH; do
+	[ "$d" = "$self" ] && continue
+	[ -x "$d/gh" ] && exec "$d/gh" "$@"
+done
+echo "roost: gh not found on PATH" >&2
+exit 127
+]]
+
+-- `sh -c SAVE_TOKEN roost FILE SHIM SHIM_TEXT`, the token on stdin: owner-only, replaced whole.
+-- The shim (shared by every App run) is replaced through a rename too, and only when it changed,
+-- so a gh started meanwhile never runs a half-written script.
+M.SAVE_TOKEN = [[
+umask 077
+cat >"$1.tmp" && mv "$1.tmp" "$1" || exit 1
+mkdir -p "${2%/*}" || exit 1
+if [ ! -x "$2" ] || [ "$(cat "$2" 2>/dev/null)" != "$(printf '%s' "$3")" ]; then
+	printf '%s' "$3" >"$2.$$" && chmod 755 "$2.$$" && mv "$2.$$" "$2"
+fi
+]]
+
+-- git's credential helper for github.com while acting as the App: the run's current token.
+M.GIT_CREDENTIAL = '!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$(cat "$ROOST_GH_TOKEN_FILE")"; }; f'
 
 export type Request = {
 	trigger: { kind: string, detail: string, delivery: string? },
@@ -78,6 +144,17 @@ export type Request = {
 	rerun_of: string?,
 }
 
+-- An installation token the relay handed out for one run (POST /api/v1/github/token).
+export type AppToken = {
+	token: string,
+	expires_in: number,
+	login: string,
+	email: string,
+	branch: string?,
+	protection: string?,
+	permissions: { [string]: any }?,
+}
+
 export type Env = {
 	data: string,
 	home: string?,
@@ -87,6 +164,8 @@ export type Env = {
 	workflows: () -> model.Workflows?,
 	changed: () -> (),
 	now: () -> number,
+	-- Asks the relay for an App token for one repository (core.app_token).
+	app_token: (repo: string, cb: (AppToken?, string?) -> ()) -> (),
 }
 
 -- Per-run state that isn't persisted.
@@ -98,6 +177,14 @@ type Live = {
 	probe_at: { [number]: number }, -- step index -> last liveness probe
 	claim_at: { [number]: number }, -- step index -> when a claim without a pane was first seen
 	exit_bad: { [number]: number }, -- step index -> when its exit file was first found unreadable
+	tail_at: { [number]: number }, -- agent step -> last read of its session file
+	tailing: { [number]: boolean }, -- agent step -> a read or its log append is in flight
+	tail_done: { [number]: boolean }, -- agent step -> read to the end after its exit file appeared
+	tally: { [number]: string }, -- agent step -> "running" | "done": its cost read from the session files
+	note: { [number]: string }, -- step index -> why it failed, for the run's reason (auth steps)
+	renewing: boolean?, -- the run's App token is being renewed
+	renew_at: number?, -- last renewal attempt
+	renew_failed: boolean?, -- a renewal failure was logged (said once until one succeeds)
 }
 
 export type Runner = {
@@ -115,6 +202,14 @@ end
 
 local function dir_of(r: Runner, id: string): string
 	return store.run_dir(r.env.store, id)
+end
+
+local function token_path(r: Runner, id: string): string
+	return `{dir_of(r, id)}/app-token`
+end
+
+local function bin_dir(r: Runner): string
+	return `{r.env.data}/bin`
 end
 
 -- Lists the running agent steps for the windows (kv `agent_jobs`), when that list changed.
@@ -158,8 +253,14 @@ local function persist(r: Runner, now_: boolean?)
 	r.env.changed()
 end
 
--- Appends `lines` (then the file at `tail`, when given) to a run's log.
-local function append_log(r: Runner, id: string, lines: { string }, tail: string?)
+-- Saves runs.json now (after the index changed outside a run, e.g. a cleanup).
+function M.save(r: Runner)
+	persist(r, true)
+end
+
+-- Appends `lines` (then the file at `tail`, when given) to a run's log; `done` runs once the
+-- append finished (or could not start), so later appends keep their order.
+local function append_log(r: Runner, id: string, lines: { string }, tail: string?, done: (() -> ())?)
 	local argv = {
 		"/bin/sh",
 		"-c",
@@ -172,18 +273,65 @@ local function append_log(r: Runner, id: string, lines: { string }, tail: string
 		table.insert(argv, l)
 	end
 	local ok, err = pcall(function(): string?
-		tern.process.run(argv, { timeout_ms = 5000 }, function(_res) end)
+		tern.process.run(argv, { timeout_ms = 5000 }, function(_res)
+			if done then
+				done()
+			end
+		end)
 		return nil
 	end)
 	if not ok then
 		tern.log.warn("roost: cannot append to log", err)
+		if done then
+			done()
+		end
+	end
+end
+
+-- Reads up to `limit` bytes of `path` from `offset` (0-based) without loading the whole file;
+-- nil when the read failed.
+local function read_chunk(path: string, offset: number, limit: number, cb: (string?) -> ())
+	local ok, err = pcall(function(): string?
+		tern.process.run({
+			"/bin/sh",
+			"-c",
+			'tail -c +"$1" "$2" | head -c "$3"',
+			"roost",
+			tostring(math.floor(offset) + 1),
+			path,
+			tostring(math.floor(limit)),
+		}, { timeout_ms = 10000 }, function(res)
+			if res.status ~= 0 or res.timed_out then
+				cb(nil)
+			else
+				cb(res.stdout)
+			end
+		end)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot read", path, err)
+		cb(nil)
 	end
 end
 
 local function live(r: Runner, id: string): Live
 	local l = r.live[id]
 	if not l then
-		l = { spawned = {}, exited = {}, killed = {}, kill_at = {}, probe_at = {}, claim_at = {}, exit_bad = {} }
+		l = {
+			spawned = {},
+			exited = {},
+			killed = {},
+			kill_at = {},
+			probe_at = {},
+			claim_at = {},
+			exit_bad = {},
+			tail_at = {},
+			tailing = {},
+			tail_done = {},
+			tally = {},
+			note = {},
+		}
 		r.live[id] = l
 	end
 	return l
@@ -269,7 +417,7 @@ local function workspace(r: Runner, wf: Workflow, req: Request, id: string): (st
 	end
 	if mode == "worktree" then
 		local ref = req.ref or (repo and repo.branch) or "HEAD"
-		return "worktree", `{r.env.data}/worktrees/{id}`, path, ref
+		return "worktree", store.worktree_dir(r.env.store, id), path, ref
 	elseif mode == "repo" then
 		return "repo", path :: string, path, nil
 	end
@@ -314,7 +462,12 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 	end
 	local id = new_id(r)
 	local mode, cwd, repo_path, fetch_ref = workspace(r, wf, req, id)
+	local identity = wf.identity or r.env.config().github.identity
+	local as_app = identity == "app" and req.repo ~= nil
 	local steps: { store.StepRec } = {}
+	if as_app then
+		table.insert(steps, { name = "获取 App 令牌", kind = "auth", state = "pending" })
+	end
 	if mode == "worktree" then
 		table.insert(steps, { name = "准备 worktree", kind = "prepare", state = "pending" })
 	end
@@ -343,6 +496,7 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 		fetch_ref = fetch_ref,
 		event = slim(req.event),
 		rerun_of = req.rerun_of,
+		identity = if as_app then "app" else nil,
 	}
 	local others = busy(r, wf.id)
 	if #others > 0 and wf.concurrency == "skip" then
@@ -364,8 +518,11 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 		if req.event then
 			pcall(tern.fs.write, `{d}/info.json`, tern.json.encode(req.event))
 		end
+		if identity == "app" and not as_app and run.state ~= "skipped" then
+			append_log(r, id, { "[roost] 这次运行没有关联仓库,GitHub 操作使用本机 gh 身份" })
+		end
 	end
-	store.prune(r.env.store)
+	store.prune(r.env.store, now(r))
 	-- Saved at once: the relay cursor moves past this event as soon as we return.
 	persist(r, true)
 	M.pump(r)
@@ -403,6 +560,9 @@ local function finish(r: Runner, run: Run, state: string, reason: string?)
 	end
 	if run.workspace == "temp" and run.cwd then
 		pcall(tern.fs.remove, run.cwd)
+	end
+	if run.identity == "app" then
+		pcall(tern.fs.remove, token_path(r, run.id))
 	end
 	r.live[run.id] = nil
 end
@@ -506,6 +666,7 @@ local function template_ctx(r: Runner, run: Run, wf: Workflow, needs_payload: bo
 		run_id = run.id,
 		trigger = run.trigger.kind,
 		input = run.inputs,
+		out = run.outputs or {},
 		payload = payload,
 	}
 end
@@ -554,15 +715,186 @@ local function step_env(r: Runner, run: Run, wf: Workflow): { [string]: string }
 	for k, v in run.inputs do
 		env["ROOST_INPUT_" .. string.upper((string.gsub(k, "[^%w]", "_")))] = v
 	end
+	for k, v in run.outputs or ({} :: { [string]: string }) do
+		env["ROOST_OUT_" .. string.upper(k)] = v
+	end
 	return env
+end
+
+-- What a step acting as the App runs with besides PATH and GH_TOKEN: the token file, git's
+-- credentials for github.com (ssh remotes go over https) and the bot as commit author.
+local function app_vars(r: Runner, run: Run): { [string]: string }
+	local a = run.app :: { login: string, email: string, expires: number }
+	local v: { [string]: string } = {
+		ROOST_IDENTITY = "app",
+		ROOST_GH_TOKEN_FILE = token_path(r, run.id),
+		GIT_TERMINAL_PROMPT = "0",
+		GIT_AUTHOR_NAME = a.login,
+		GIT_AUTHOR_EMAIL = a.email,
+		GIT_COMMITTER_NAME = a.login,
+		GIT_COMMITTER_EMAIL = a.email,
+	}
+	local git = {
+		-- The empty helper first drops the user's own (osxkeychain, gh) for github.com.
+		{ "credential.https://github.com.helper", "" },
+		{ "credential.https://github.com.helper", M.GIT_CREDENTIAL },
+		{ "url.https://github.com/.insteadOf", "git@github.com:" },
+		{ "url.https://github.com/.insteadOf", "ssh://git@github.com/" },
+	}
+	v.GIT_CONFIG_COUNT = tostring(#git)
+	for i, kv in git do
+		v[`GIT_CONFIG_KEY_{i - 1}`] = kv[1]
+		v[`GIT_CONFIG_VALUE_{i - 1}`] = kv[2]
+	end
+	return v
+end
+
+-- Adds the App identity to a shell step's environment.
+local function with_app(r: Runner, run: Run, env: { [string]: string })
+	for k, v in app_vars(r, run) do
+		env[k] = v
+	end
+	env.PATH = if env.PATH and env.PATH ~= "" then `{bin_dir(r)}:{env.PATH}` else bin_dir(r)
+	local ok, tok = pcall(tern.fs.read, token_path(r, run.id), 8192)
+	if ok then
+		env.GH_TOKEN = util.trim(tok :: string)
+	end
+end
+
+-- The file an omp step acting as the App sources (agent.with_env); the token stays in its own file.
+local function app_script(r: Runner, run: Run): string
+	local v = app_vars(r, run)
+	local lines = { "# Roost: this step's GitHub App identity (the token itself stays in ROOST_GH_TOKEN_FILE)." }
+	for _, k in util.keys(v) do
+		table.insert(lines, `export {k}={util.shq(v[k])}`)
+	end
+	table.insert(lines, `export PATH={util.shq(bin_dir(r))}:"$PATH"`)
+	-- No token, no start: an inherited GH_TOKEN would otherwise act as someone else.
+	table.insert(lines, 'GH_TOKEN=$(cat "$ROOST_GH_TOKEN_FILE") || exit 97')
+	table.insert(lines, "export GH_TOKEN")
+	return table.concat(lines, "\n") .. "\n"
+end
+
+-- A run meant to act as the App whose identity or token is gone (a reload at the wrong moment, a
+-- deleted file): its steps must fail rather than run as you.
+local function app_missing(r: Runner, run: Run): boolean
+	return run.identity == "app" and (run.app == nil or not tern.fs.exists(token_path(r, run.id)))
+end
+
+-- Asks the relay for an App token for `repo`; `cb` gets it or why not.
+local function request_token(r: Runner, repo: string, cb: (AppToken?, string?) -> ())
+	local ok, err = pcall(function(): string?
+		r.env.app_token(repo, cb)
+		return nil
+	end)
+	if not ok then
+		cb(nil, tostring(err))
+	end
+end
+
+-- Saves run `id`'s token (owner-only) and the gh shim; `cb` gets nil or what went wrong.
+local function save_token(r: Runner, id: string, token: string, cb: (string?) -> ())
+	local bin = bin_dir(r)
+	local ok, err = pcall(function(): string?
+		tern.process.run(
+			{ "/bin/sh", "-c", M.SAVE_TOKEN, "roost", token_path(r, id), `{bin}/gh`, M.GH_SHIM },
+			{ stdin = token, timeout_ms = 10000 },
+			function(res)
+				if res.status == 0 and not res.timed_out then
+					cb(nil)
+				else
+					cb(`无法保存 App 令牌:{util.trim(res.stderr or "")}`)
+				end
+			end
+		)
+		return nil
+	end)
+	if not ok then
+		cb(`无法保存 App 令牌:{err}`)
+	end
+end
+
+local function token_lines(run: Run, tok: AppToken): { string }
+	local perms: { string } = {}
+	local p = tok.permissions or {}
+	for _, k in util.keys(p) do
+		table.insert(perms, `{k}:{tostring(p[k])}`)
+	end
+	local guard = if tok.protection == "created"
+		then "中继刚为它加上了规则集"
+		elseif tok.protection == "updated" then "中继重新启用了它的规则集"
+		else "已有规则"
+	return {
+		`[roost] 以 GitHub App {tok.login} 的身份操作 {run.repo or "?"},令牌 {util.fmt_duration(tok.expires_in)} 后到期,运行期间自动续期`,
+		`[roost] 默认分支 {tok.branch or "?"} 禁止强推与删除({guard})`,
+		`[roost] 令牌权限:{if #perms > 0 then table.concat(perms, " ") else "—"}`,
+	}
+end
+
+-- Renews a running App run's token shortly before it expires; failures are logged and retried.
+local function renew(r: Runner, run: Run)
+	local a = run.app
+	local repo = run.repo
+	if a == nil or repo == nil or now(r) < a.expires - TOKEN_RENEW then
+		return
+	end
+	local l = live(r, run.id)
+	if l.renewing or now(r) - (l.renew_at or -math.huge) < RENEW_RETRY then
+		return
+	end
+	l.renewing, l.renew_at = true, now(r)
+	local id = run.id
+	local function still(): Run?
+		local cur = r.env.store.by_id[id]
+		return if cur and cur.state == "running" then cur else nil
+	end
+	request_token(r, repo, function(tok, err)
+		if still() == nil then
+			l.renewing = nil
+			return
+		end
+		if tok == nil then
+			l.renewing = nil
+			-- Said once; retried every RENEW_RETRY until it works or the token runs out.
+			if not l.renew_failed then
+				l.renew_failed = true
+				append_log(r, id, { `[roost] App 令牌续期失败,稍后重试:{err or "?"}` })
+			end
+			return
+		end
+		save_token(r, id, tok.token, function(serr)
+			l.renewing = nil
+			local cur = still()
+			if cur == nil then
+				pcall(tern.fs.remove, token_path(r, id))
+				return
+			end
+			if serr then
+				if not l.renew_failed then
+					l.renew_failed = true
+					append_log(r, id, { `[roost] App 令牌续期失败,稍后重试:{serr}` })
+				end
+				return
+			end
+			l.renew_failed = nil
+			if cur.app then
+				cur.app.expires = now(r) + tok.expires_in
+			end
+			persist(r)
+			append_log(r, id, { `[roost] App 令牌已续期,{util.fmt_duration(tok.expires_in)} 后到期` })
+		end)
+	end)
 end
 
 local check: (Runner, Run) -> ()
 local next_step: (Runner, Run, Workflow) -> ()
 
--- The definition of user step `i` (prepare/cleanup have none), matched by name and kind.
+-- The definition of user step `i` (auth/prepare/cleanup have none), matched by name and kind.
 local function definition(run: Run, wf: Workflow, i: number): model.Step?
-	local offset = if run.steps[1] and run.steps[1].kind == "prepare" then 1 else 0
+	local offset = 0
+	while run.steps[offset + 1] and (run.steps[offset + 1].kind == "auth" or run.steps[offset + 1].kind == "prepare") do
+		offset += 1
+	end
 	local def = wf.steps[i - offset]
 	if def and def.name == run.steps[i].name and def.kind == run.steps[i].kind then
 		return def
@@ -578,6 +910,7 @@ local function start_agent(r: Runner, run: Run, i: number, job: agent.Job)
 	end
 	pcall(tern.fs.mkdir, f.session)
 	run.steps[i].agent = true
+	run.steps[i].opened, run.steps[i].tail_file, run.steps[i].tail, run.steps[i].replied = nil, nil, nil, nil
 	local ok, err = pcall(function(): string?
 		tern.fs.write(f.job, tern.json.encode(job))
 		return nil
@@ -594,7 +927,132 @@ local function start_agent(r: Runner, run: Run, i: number, job: agent.Job)
 	M.schedule(r, 1000)
 end
 
+-- Logs what the agent did since the last look: "the tab is open" once, then each new entry of
+-- its session file (agent.progress). One read and its append at a time, so lines keep their
+-- order. `final` (the exit file is there) reads to the end, then checks the run again, so the
+-- outcome line comes after the agent's last words.
+local tail_agent: (Runner, Run, number, boolean) -> ()
+function tail_agent(r: Runner, run: Run, i: number, final: boolean)
+	local l = live(r, run.id)
+	if l.tailing[i] then
+		return
+	end
+	local t = now(r)
+	if not final and t - (l.tail_at[i] or -math.huge) < TAIL_EVERY then
+		return
+	end
+	l.tail_at[i] = t
+	local s = run.steps[i]
+	local id = run.id
+	local f = agent.files(dir_of(r, id), i)
+	local function done()
+		l.tailing[i] = nil
+		if final then
+			l.tail_done[i] = true
+			local cur = r.env.store.by_id[id]
+			if cur and cur.state == "running" and cur.step == i then
+				check(r, cur)
+			end
+		end
+	end
+	local head: { string } = {}
+	if not s.opened and tern.fs.exists(f.pane) then
+		s.opened = true
+		table.insert(head, `[roost] agent 已在 Tern 标签页中运行(会话「{r.env.config().runner.session}」)`)
+	end
+	local file = agent.session_file(f.session)
+	l.tailing[i] = true
+	if not file then
+		if #head > 0 then
+			persist(r)
+			append_log(r, id, head, nil, done)
+		else
+			done()
+		end
+		return
+	end
+	local name = string.match(file, "([^/]+)$")
+	if s.tail_file ~= name then
+		s.tail_file, s.tail = name, 0
+	end
+	read_chunk(file, s.tail or 0, TAIL_CHUNK, function(chunk)
+		local cur = r.env.store.by_id[id]
+		if not cur or cur.state ~= "running" or cur.step ~= i or chunk == nil then
+			if #head > 0 then
+				-- Not logged: say it with the next read.
+				s.opened = nil
+			end
+			done()
+			return
+		end
+		local text = chunk :: string
+		local full = #text >= TAIL_CHUNK
+		local p = agent.progress(text, full)
+		s.tail = (s.tail or 0) + p.used
+		if p.final then
+			s.replied = true
+		end
+		for _, line in p.lines do
+			table.insert(head, line)
+		end
+		if p.used > 0 or #head > 0 then
+			persist(r)
+		end
+		local more = full and p.used > 0
+		local function after()
+			if final and more then
+				l.tailing[i] = nil
+				tail_agent(r, cur, i, true)
+			else
+				done()
+			end
+		end
+		if #head > 0 then
+			append_log(r, id, head, nil, after)
+		else
+			after()
+		end
+	end)
+end
+
+-- Reads what an ended agent step cost (M.TALLY over its session dir) into the step record, then
+-- checks the run again. A failed read leaves the step without a cost.
+local function tally_agent(r: Runner, run: Run, i: number)
+	local l = live(r, run.id)
+	if l.tally[i] == "running" then
+		return
+	end
+	l.tally[i] = "running"
+	local id = run.id
+	local function done()
+		l.tally[i] = "done"
+		local cur = r.env.store.by_id[id]
+		if cur and cur.state == "running" and cur.step == i then
+			check(r, cur)
+		end
+	end
+	local session = agent.files(dir_of(r, id), i).session
+	local ok, err = pcall(function(): string?
+		tern.process.run({ "/bin/sh", "-c", M.TALLY, "roost", session }, { timeout_ms = TALLY_TIMEOUT_MS }, function(res)
+			local cur = r.env.store.by_id[id]
+			local c, t = string.match(res.stdout or "", "^%s*([%d%.]+)%s+(%d+)")
+			local s = if cur then cur.steps[i] else nil
+			if s and c and t and res.status == 0 and not res.timed_out then
+				s.cost, s.tokens = tonumber(c), tonumber(t)
+				persist(r)
+			end
+			done()
+		end)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot read agent usage", err)
+		done()
+	end
+end
+
 -- An agent step nobody else will finish: unclaimed when stopping, or claimed but never started.
+-- Once its tab is open, follows the conversation into the log.
 local function watch_agent(r: Runner, run: Run, i: number)
 	local f = agent.files(dir_of(r, run.id), i)
 	local l = live(r, run.id)
@@ -608,6 +1066,7 @@ local function watch_agent(r: Runner, run: Run, i: number)
 	if tern.fs.exists(f.pane) then
 		-- The window that opened it stops it, and records how it ended.
 		l.claim_at[i] = nil
+		tail_agent(r, run, i, false)
 		return
 	end
 	local t = now(r)
@@ -618,11 +1077,134 @@ local function watch_agent(r: Runner, run: Run, i: number)
 	end
 end
 
+-- Gets the run's App token from the relay and saves it for the steps after it; the exit file
+-- (written once the log says how it went) ends the step.
+local function start_auth(r: Runner, run: Run, i: number)
+	local s = run.steps[i]
+	local d = dir_of(r, run.id)
+	local id = run.id
+	run.step_deadline = now(r) + AUTH_TIMEOUT
+	s.state = "running"
+	s.started_at = now(r)
+	s.exit_code = nil
+	pcall(tern.fs.mkdir, d)
+	pcall(tern.fs.remove, `{d}/s{i}.exit`)
+	persist(r, true)
+	local l = live(r, id)
+	l.spawned[i] = true
+	l.note[i] = nil
+	-- Nil once the run stopped or moved on (check then ends the step).
+	local function current(): Run?
+		local cur = r.env.store.by_id[id]
+		return if cur and cur.state == "running" and cur.step == i and cur.stop == nil then cur else nil
+	end
+	local function done(code: number, lines: { string }, note: string?)
+		if note then
+			l.note[i] = note
+		end
+		table.insert(lines, 1, `\27[1;36m▶ {s.name}\27[0m`)
+		append_log(r, id, lines, nil, function()
+			pcall(tern.fs.write, `{d}/s{i}.exit`, tostring(code))
+			local cur = r.env.store.by_id[id]
+			if cur then
+				check(r, cur)
+			end
+		end)
+	end
+	request_token(r, run.repo or "", function(tok, err)
+		if current() == nil then
+			return
+		end
+		if tok == nil then
+			local why = err or "中继没有给出令牌"
+			done(1, { `[roost] 无法获取 GitHub App 令牌:{why}` }, why)
+			return
+		end
+		save_token(r, id, tok.token, function(serr)
+			local cur = current()
+			if cur == nil then
+				pcall(tern.fs.remove, token_path(r, id))
+				return
+			end
+			if serr then
+				done(1, { `[roost] {serr}` }, serr)
+				return
+			end
+			cur.app = { login = tok.login, email = tok.email, expires = now(r) + tok.expires_in }
+			-- Saved before the exit file: after a reload the next step must still see the identity.
+			persist(r, true)
+			done(0, token_lines(cur, tok))
+		end)
+	end)
+	M.schedule(r, 1000)
+end
+
+-- Why user step `step` doesn't start: its `when` is off (the run goes on), or it is an omp step
+-- and the workflow already spent its daily budget today (true: the run ends as skipped).
+local function held(r: Runner, run: Run, wf: Workflow, step: model.Step): (string?, boolean)
+	local w = step.when
+	if w then
+		local v = if w.source == "out" then (run.outputs or {})[w.key] else run.inputs[w.key]
+		if model.truthy(v) == w.negate then
+			return `条件 when = "{if w.negate then "!" else ""}{w.source}.{w.key}" 不满足,跳过`, false
+		end
+	end
+	local budget = wf.daily_budget
+	if step.kind == "omp" and budget then
+		local spent = stats.cost_since(r.env.store.runs, wf.id, stats.day_start(now(r)))
+		if spent >= budget then
+			return string.format("今日费用约 $%.2f,已达预算 $%.2f,不再运行 omp 步骤", spent, budget), true
+		end
+	end
+	return nil, false
+end
+
+-- Merges the `key=value` lines step `i` appended to $ROOST_OUTPUT into the run's outputs;
+-- returns the step's `stop` value (end the run as skipped) when it set one.
+local function take_outputs(r: Runner, run: Run, i: number): string?
+	local path = `{dir_of(r, run.id)}/s{i}.out`
+	local ok, text = pcall(tern.fs.read, path, MAX_OUTPUT_FILE)
+	if not ok or type(text) ~= "string" then
+		if tern.fs.exists(path) then
+			append_log(r, run.id, { `[roost] $ROOST_OUTPUT 读不出(超过 {MAX_OUTPUT_FILE // 1024} KiB?),本步骤的输出已忽略` })
+		end
+		return nil
+	end
+	local outs = run.outputs or {}
+	local count = 0
+	for _ in outs :: { [string]: string } do
+		count += 1
+	end
+	local stop: string? = nil
+	for line in string.gmatch(text, "[^\n]+") do
+		local k, v = string.match(line, "^%s*([%w_]+)=(.*)$")
+		if k and v and model.valid_output_key(k) then
+			v = string.sub((string.gsub(v, "\r$", "")), 1, MAX_OUTPUT_VALUE)
+			if outs[k] == nil then
+				if count >= MAX_OUTPUTS then
+					continue
+				end
+				count += 1
+			end
+			outs[k] = v
+			if k == "stop" then
+				stop = if model.truthy(v) then util.clip(util.trim(v), 200) else nil
+			end
+		end
+	end
+	run.outputs = if next(outs) then outs else nil
+	return stop
+end
+
 local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	local s = run.steps[i]
 	local d = dir_of(r, run.id)
 	local cfg = r.env.config().runner
 	run.step = i
+	if s.kind == "auth" then
+		start_auth(r, run, i)
+		return
+	end
 	local argv: { string } = {}
 	local job: agent.Job? = nil
 	local cwd = run.cwd or d
@@ -645,6 +1227,18 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 			return
 		end
 		local step = def :: model.Step
+		local why, stop = held(r, run, wf, step)
+		if why then
+			s.state = "skipped"
+			if stop then
+				run.final = run.final or "skipped"
+				run.reason = why
+			end
+			append_log(r, run.id, { `\27[2m▷ {s.name}:{why}\27[0m` })
+			persist(r)
+			next_step(r, run, wf)
+			return
+		end
 		if step.kind == "omp" and step.prompt then
 			local args = table.clone(cfg.omp_args)
 			for _, a in step.args do
@@ -654,18 +1248,31 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 				table.insert(args, "--model")
 				table.insert(args, step.model)
 			end
-			job = {
-				run = run.id,
-				step = i,
-				cwd = cwd,
-				omp = cfg.omp,
-				command = agent.command(cfg.omp, agent.files(d, i).session, args),
-				prompt = template.render(step.prompt, template_ctx(r, run, wf, uses_payload(step.prompt))),
-				title = `{run.workflow_name} · {s.name}`,
-				session = cfg.session,
-			}
+			local command: string? = if app_missing(r, run) then nil else agent.command(cfg.omp, agent.files(d, i).session, args)
+			if command and run.app then
+				-- cx.agents:start passes no environment: the identity goes through a sourced file.
+				local envf = `{d}/s{i}.env`
+				local ok = pcall(tern.fs.write, envf, app_script(r, run))
+				command = if ok then agent.with_env(envf, command :: string) else nil
+			end
+			if command then
+				job = {
+					run = run.id,
+					step = i,
+					cwd = cwd,
+					omp = cfg.omp,
+					command = command,
+					prompt = template.render(step.prompt, template_ctx(r, run, wf, uses_payload(step.prompt))),
+					title = `{run.workflow_name} · {s.name}`,
+					session = cfg.session,
+				}
+			else
+				argv = { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌或身份文件,omp 步骤未启动' >&2; exit 1" }
+			end
 		else
-			argv = { cfg.shell, "-c", step.script or "true" }
+			argv = if app_missing(r, run)
+				then { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌,步骤未以 App 身份启动' >&2; exit 1" }
+				else { cfg.shell, "-c", step.script or "true" }
 		end
 	end
 	local deadline = run.deadline or (now(r) + cfg.default_timeout)
@@ -693,6 +1300,13 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	pcall(tern.fs.remove, `{d}/s{i}.pid.w`)
 	local log = `{d}/log.txt`
 	local env = step_env(r, run, wf)
+	if def then
+		env.ROOST_OUTPUT = `{d}/s{i}.out`
+		pcall(tern.fs.remove, env.ROOST_OUTPUT)
+	end
+	if run.app and s.kind ~= "prepare" and s.kind ~= "cleanup" then
+		with_app(r, run, env)
+	end
 	env.ROOST_BANNER = `\27[1;36m▶ {s.name}\27[0m`
 	local full = { cfg.shell, "-c", M.WRAPPER, "roost", log, `{d}/s{i}.pid`, `{d}/s{i}.exit`, cwd }
 	for _, a in argv do
@@ -750,7 +1364,7 @@ local function step_done(r: Runner, run: Run, wf: Workflow, code: number)
 	s.exit_code = code
 	s.finished_at = now(r)
 	s.state = if code == 0 then "success" else "failed"
-	local def = if s.kind == "prepare" or s.kind == "cleanup" then nil else definition(run, wf, run.step)
+	local def = if s.kind == "prepare" or s.kind == "cleanup" or s.kind == "auth" then nil else definition(run, wf, run.step)
 	if run.stop == "cancel" then
 		run.final = run.final or "cancelled"
 	elseif run.stop == "timeout" then
@@ -759,11 +1373,28 @@ local function step_done(r: Runner, run: Run, wf: Workflow, code: number)
 	elseif code ~= 0 and s.kind ~= "cleanup" and not (def and def.continue_on_error) then
 		if run.final == nil then
 			run.final = "failed"
-			run.reason = if s.agent then `{s.name}:{agent.describe(code)}` else `{s.name} 退出码 {code}`
+			run.reason = if s.agent
+				then `{s.name}:{agent.describe(code)}`
+				elseif s.kind == "auth" then `{s.name}:{live(r, run.id).note[run.step] or `退出码 {code}`}`
+				else `{s.name} 退出码 {code}`
+		end
+	end
+	if def and def.kind == "run" and code >= 0 then
+		-- The wrapper wrote the exit file, so $ROOST_OUTPUT is a regular file or gone.
+		local stop = take_outputs(r, run, run.step)
+		if stop and code == 0 and run.final == nil then
+			run.final = "skipped"
+			run.reason = stop
+			append_log(r, run.id, { `[roost] {s.name} 结束了这次运行:{stop}` })
 		end
 	end
 	if s.agent then
-		append_log(r, run.id, { `[roost] agent 结束:{agent.describe(code)}` }, agent.files(dir_of(r, run.id), run.step).reply)
+		-- The final answer is already in the log when the session file held it.
+		local reply = if s.replied then nil else agent.files(dir_of(r, run.id), run.step).reply
+		local spent = if s.tokens and s.tokens > 0
+			then string.format("(约 $%.4f,%d tokens)", s.cost or 0, s.tokens)
+			else ""
+		append_log(r, run.id, { `[roost] agent 结束:{agent.describe(code)}{spent}` }, reply)
 	end
 	run.stop = nil
 	next_step(r, run, wf)
@@ -835,6 +1466,16 @@ function check(r: Runner, run: Run)
 	local exitf = `{d}/s{i}.exit`
 	if tern.fs.exists(exitf) then
 		if wf then
+			if cur.agent and not l.tail_done[i] then
+				-- Log the agent's last entries first; the read's end checks again.
+				tail_agent(r, run, i, true)
+				return
+			end
+			if cur.agent and l.tally[i] ~= "done" then
+				-- Then what it cost; the tally's end checks again.
+				tally_agent(r, run, i)
+				return
+			end
 			local code = agent.read_number(exitf)
 			if code == nil then
 				-- Still being written (agent exit files are written in place): give it a moment.
@@ -851,6 +1492,16 @@ function check(r: Runner, run: Run)
 	if run.stop == nil and run.step_deadline and t >= run.step_deadline then
 		run.stop = "timeout"
 		persist(r)
+	end
+	if cur.kind == "auth" then
+		if run.stop or not l.spawned[i] then
+			-- Stopped, or begun by an earlier VM: its relay request died with it.
+			if not run.stop then
+				l.note[i] = "插件重载打断了令牌获取"
+			end
+			pcall(tern.fs.write, exitf, if run.stop then "130" else "1")
+		end
+		return
 	end
 	if cur.agent then
 		watch_agent(r, run, i)
@@ -922,6 +1573,7 @@ function M.tick(r: Runner)
 	local active = false
 	for _, run in table.clone(r.env.store.runs) do
 		if run.state == "running" then
+			renew(r, run)
 			check(r, run)
 		end
 	end
@@ -965,19 +1617,11 @@ function M.read_log(r: Runner, id: string, offset: number, limit: number, cb: (s
 		cb("", true)
 		return
 	end
-	tern.process.run({
-		"/bin/sh",
-		"-c",
-		'tail -c +"$1" "$2" | head -c "$3"',
-		"roost",
-		tostring(math.floor(offset) + 1),
-		path,
-		tostring(math.floor(limit)),
-	}, { timeout_ms = 10000 }, function(res)
-		if res.status ~= 0 or res.timed_out then
+	read_chunk(path, offset, limit, function(text)
+		if text == nil then
 			cb(nil, false)
 		else
-			cb(res.stdout, #res.stdout < limit)
+			cb(text, #text < limit)
 		end
 	end)
 end

@@ -483,7 +483,16 @@ function F.new(opts: { [string]: any }?)
 			run = function(argv: { string }, opts: any, cb: ((any, any) -> ())?)
 				assert(type(opts) == "table" and type(opts.timeout_ms) == "number", "process.run needs timeout_ms")
 				table.insert(env.calls, { argv = argv, opts = opts })
-				local r = env.process(argv, opts)
+				local r: any
+				if argv[1] == "/bin/rm" and argv[2] == "-rf" and argv[3] == "--" then
+					-- store.drain deletes directories out of process.
+					for i = 4, #argv do
+						env.tern.fs.remove(argv[i])
+					end
+					r = { status = 0, stdout = "", stderr = "", timed_out = false }
+				else
+					r = env.process(argv, opts)
+				end
 				if cb then
 					table.insert(env.queue, function()
 						if r ~= false then

@@ -234,7 +234,7 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
         store: Arc::new(store),
         gh: Arc::new(gh),
         deliveries: Mutex::new(VecDeque::new()),
-        delivery_total: Mutex::new(0),
+        delivery_stats: Mutex::new(api::DeliveryStats::new(started_at)),
         clients: Mutex::new(BTreeMap::new()),
         boot_id: boot_id.clone(),
         started_at,

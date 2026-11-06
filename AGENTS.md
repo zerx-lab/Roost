@@ -34,10 +34,13 @@ Roost 是一个 **Tern 插件**,目标是做成一个**可自升级、可自我�
 
 - `host.luau` 在 daemon worker 启动时创建唯一的 `lib/core.luau` 运行时:每 3 s 读取 plugin-data 下的 `roost.toml`/`workflows.toml`(`lib/model.luau` 校验,出错保留上一份有效配置);每分钟边界检查定时触发器(`schedule`,编译成 cron;`once` 按 `at` 只触发一次);`lib/relay.luau` 对中继长轮询 `/api/v1/events`,游标存 `tern.kv` 的 `cursor`;`lib/runner.luau` 执行运行。
 - 自动化编辑器(`lib/editor.luau`,Grok 式表单):`core.workflow_raw` 取原始表 → 表单编辑 → `core.check_workflow`/`save_workflow`(`model.encode_workflow` + `model.splice_workflow` 只替换该 `[[workflow]]` 块,写前备份 `.bak`,`model.parse_workflows` 校验);建议项经 `core.gh` 走中继的 GitHub App 接口。完成的运行经 kv `status.done` 让 window 弹 toast(`notify`)。
-- 运行引擎:shell 步骤经 `runner.WRAPPER`(`sh -c`,`set -m` 独立进程组)启动,pid/退出码写入 `runs/<id>/s<i>.pid|.exit`;omp 步骤走 agent 协议(`lib/agent.luau`):host 写 `s<i>.job.json` 并把活跃步骤发布到 kv `agent_jobs`,window(`lib/launcher.luau`)用 `mkdir s<i>.claim` 认领,在固定会话(默认 `Roost`)新开标签页 `cx.agents:start`,记 `s<i>.pane`,本轮结束(或关闭/停止)后写 `s<i>.exit` 与 `s<i>.reply.txt` 并关闭 agent;omp 会话存于 `s<i>.session/`(`--session-dir`),随运行目录被 `keep_runs` 清理。两类步骤的进度都靠读文件推进,因此插件重载后能接管。历史在 `runs.json`(先写 `.bak` 再写主文件)。
+- 运行引擎:shell 步骤经 `runner.WRAPPER`(`sh -c`,`set -m` 独立进程组)启动,pid/退出码写入 `runs/<id>/s<i>.pid|.exit`;omp 步骤走 agent 协议(`lib/agent.luau`):host 写 `s<i>.job.json` 并把活跃步骤发布到 kv `agent_jobs`,window(`lib/launcher.luau`)用 `mkdir s<i>.claim` 认领,在固定会话(默认 `Roost`)新开标签页 `cx.agents:start`,记 `s<i>.pane`,本轮结束(或关闭/停止)后写 `s<i>.exit` 与 `s<i>.reply.txt` 并关闭 agent;omp 会话存于 `s<i>.session/`(`--session-dir`),随运行目录按 `[retention]` 清理。agent 运行中 host 每 2 s 按字节偏移读会话 JSONL(`agent.progress`,只处理完整行,偏移存 StepRec `tail`),把说明、工具调用、失败结果和最终回复追加进 `log.txt`;exit 出现后先读到末尾再结束该步,日志已含最终回复(`replied`)时不再追加 `reply.txt`。两类步骤的进度都靠读文件推进,因此插件重载后能接管。历史在 `runs.json`(先写 `.bak` 再写主文件)。
+- 步骤编排与费用:shell 步骤拿 `ROOST_OUTPUT=runs/<id>/s<i>.out`,wrapper 结束时删掉非普通文件,host 在 `step_done` 读入 `run.outputs`(`take_outputs`:≤64 KiB、≤64 键、值 ≤4 KiB),之后的步骤用 `{{out.x}}` / `ROOST_OUT_X`;`stop=<原因>` 让运行以 `skipped` 结束(`core` 不为 skipped 弹 toast)。`start_step` 先过 `held`:`when`(`model.When`,out/input,可取反)为假则跳过该步,omp 步骤遇到工作流 `daily_budget` 用尽(`stats.cost_since` 按本机日)则以 skipped 结束运行。agent 步骤 exit 后、`step_done` 前跑 `tally_agent`(`runner.TALLY`:find + grep + awk 汇总会话目录全部 JSONL 的 `"cost":{…"total"}` 与 `totalTokens`,JSON 字符串里的引号已转义所以不会误计),写 StepRec `cost`/`tokens`。
+- GitHub 身份:`[github] identity`(默认 `app`)/ 工作流 `identity`。有仓库的 App 运行在最前插入 `auth` 步骤(`runner.start_auth`):经 `core.app_token` 调 `POST /api/v1/github/token`,令牌经 stdin 写入 `runs/<id>/app-token`(umask 077),同时装 `<data>/bin/gh` 包装(`runner.GH_SHIM`,每次读当前令牌);`run.app` 记 bot 与到期时间,`M.tick` 内 `renew` 在到期前 15 分钟续期;`finish` 删令牌。用户步骤(非 prepare/cleanup)拿 `app_vars`:`GIT_CONFIG_*`(github.com 凭据助手清空后换成读令牌文件、ssh→https)、bot 作者;shell 步骤另有 `GH_TOKEN` 与 PATH 前置;omp 步骤经 `agent.with_env` 用 `/bin/sh` source `s<i>.env`(无令牌)后 exec omp。`match` 的 ignore_self 也忽略 `ctx.bot`。
+- 保留与清理:`roost.toml [retention]`(`runs`/`run_age`/`events`/`event_age`;`runs` 只计已结束的运行)。`core.housekeep` 在启动、每小时、策略首次生效或变化后与手动时执行;拿到有效 roost.toml 之前(`store.policy` 为 false)不按策略删除任何东西(事件页只按 2000 条硬上限裁剪)。`store.prune` 只丢弃已结束的运行(索引立即更新,`runs/<id>` 与 `worktrees/<id>` 进 `store.trash`),`store.sweep` 把无主目录也放进 trash(runs.json 读不出或 `runs.json.unreadable` 存在时停用);`store.drain` 每批 8 个路径用一次 `/bin/rm -rf --` 在进程外删除(不占调用预算、不跟随符号链接,只接受绝对数据目录下的 `runs/<名>`、`worktrees/<名>`),仍存在的路径最多重试 3 次。事件页历史在 `events.json`(`lib/eventlog.luau`,同样先写 `.bak`);去重集 `seen`(2000)在启动时由 runs.json 的 `trigger.delivery` 与 events.json 回填;首次连接中继或还没有 `events.json` 时,`relay` 拉取游标之前(含游标)的最近 20 条作为 `history` 行,只展示不运行,并按 `trigger.delivery` 关联已有运行。手动操作(删除运行、清空事件、清空中继缓存/统计、忘记 App 凭据)在 UI 中都要两次独立点击(间隔 0.8–5 s,`st.confirm`/`confirm_at`),按键和选择会取消。
 - 订阅同步:`model.subscriptions(workflows)`(仓库筛选为空 → `"*"`)→ `PUT /api/v1/subscriptions`(`base_revision` 乐观并发,上次版本存 kv `subs`);失败时 UI 给出 `model.subscriptions_toml` 手动回退。
 - host → window 只经 kv:`status`(window 每 2 s 读取,刷新状态栏)与 `agent_jobs`(window 每 1 s 读取);window → host 只经运行目录里的文件。host block 通过 `cx:open("roost://…")` 让 window 的 `tern.route.link` 打开会话侧栏或会话。window 同时把 plugin-data 下的 `theme.css` 经 `tern.css` 注入。
-- `agent/`:axum 服务,以 GitHub App 运行(`github.rs`:manifest 注册、RS256 JWT、只读安装令牌、凭据 `<data>/github-app.json`);`/hooks/github` 用 App 密钥验签 → 按 `subscriptions.toml` 过滤 → `store.rs` 持久化事件(按数量/时间/字节上限淘汰);`/api/v1/*` Bearer 鉴权;`restart` 优雅关闭后 `exec` 自身。
+- `agent/`:axum 服务,以 GitHub App 运行(`github.rs`:manifest 注册(`APP_PERMISSIONS`,含 administration)、RS256 JWT、中继自用安装令牌、凭据 `<data>/github-app.json`);`POST /api/v1/github/token` 为单次运行签发只限一个仓库、去掉 administration 的令牌,签发前 `guard` 确认默认分支禁止强推与删除(没有就建规则集 `GUARD_NAME`,建不了则 409 拒绝,结果缓存 10 分钟);`/hooks/github` 用 App 密钥验签 → 按 `subscriptions.toml` 过滤 → `store.rs` 持久化事件(按数量/时间/字节上限淘汰,`DELETE /api/v1/events` 手动清空且不回退序号);每次投递按 (outcome, event, repo) 计数(内存,256 组上限,未验签的 rejected 合为一组),`GET|DELETE /api/v1/deliveries` 查看/清空;`/api/v1/*` Bearer 鉴权;`restart` 优雅关闭后 `exec` 自身。
 
 平台层面已有的约束:
 
@@ -68,8 +71,9 @@ lib/agent.luau       # omp agent 步骤的 host↔window 文件协议(主会话�
 lib/launcher.luau    # window 侧:认领/打开/结束 agent 步骤,会话侧栏与 roost:// 链接(主会话维护)
 lib/relay.luau       # 中继客户端(wire 协议,主会话维护)
 lib/model.luau      # 两个配置文件的解析与校验、订阅计算
-lib/store.luau       # runs.json 历史
-lib/match.luau lib/template.luau lib/cron.luau lib/toml.luau lib/util.luau   # 纯函数
+lib/store.luau       # runs.json 历史、保留策略与分批删除(高风险:持久化,主会话维护)
+lib/eventlog.luau    # events.json:事件页历史(高风险:持久化,主会话维护)
+lib/match.luau lib/template.luau lib/cron.luau lib/toml.luau lib/util.luau lib/stats.luau   # 纯函数(stats:概览的按日统计与工作流健康度)
 lib/ui.luau lib/editor.luau lib/sidebar.luau lib/field.luau  # 面板视图、自动化编辑器、会话侧栏与文本输入
 tests/               # run.py + fake_tern.luau + harness.luau + test_*.luau
 agent/               # roost-agent(Rust):src/{api,store,github,event,config,secret}.rs,deploy/
@@ -87,7 +91,7 @@ agent/               # roost-agent(Rust):src/{api,store,github,event,config,secr
 | `.luaurc` | Luau strict 模式,lint/类型错误一律按错误处理 |
 | `.cargo/config.toml` | 任何 crate 都生效:clippy 的 deny 规则(防 panic、防内存失控),`target-dir=/tmp/roost-cargo-target` |
 | `clippy.toml` | 测试代码豁免 unwrap/expect/panic/下标;栈上大数组、大 future 的阈值 16 KiB |
-| `scripts/check.sh` | 统一检查入口 |
+| `scripts/check.sh` | 统一检查入口;Rust 检查在 `/tmp/roost-rust` 镜像中执行(本机 cargo 忽略 target-dir) |
 
 运行时路径(macOS):
 
@@ -127,7 +131,7 @@ STENCIL_LOG=warn,stencil=info,tern::plugin=debug
 - 命名规则:block kind 为 `<plugin-id>.<block-id>`;surface 为 `plugin.<id>.<block>`;命令 action 为 `plugin.<id>.<cmd-id>`。manifest 里的 `id` 必须满足 `^[a-z][a-z0-9-]{0,31}$`。
 - 点击事件:`p.actions = { click = "act=value" }`,在 `event` 中收到的是 `ev.ev == "action"` 加上 `ev.act` / `ev.value`。列表/标签页触发的是 `ev.ev == "select" | "activate"`。
 - 样式:**不允许内联 style**。CSS 是子集,所有 styles 合计不超过 256 KiB。用 `[data-surface='plugin.<id>.<block>']` 限定作用域;主题变量用 `--accent --t1..--t4 --l1..--l4 --ok --warn --bad --card --raise --live`;节点的 `p.role` 会映射为 `[data-role=…]`。
-- 图片走 `cx:blob(bytes, mime)` 再交给 `ui.node("image", {blob=…})`;`assets/` 目录只放 README 截图。
+- 图片走 `cx:blob(bytes, mime)` 再交给 `ui.node("image", {blob=…})`;`assets/` 目录只放 README 截图与 GitHub App 头像(`app-logo.svg` 源文件 → `rsvg-convert -w 512` 生成 `app-logo.png`)。
 - 没有 i18n API,UI 文案直接硬编码。README 采用 `README.md`(英文)+ `README.zh-CN.md` 双份。
 - `plugin.toml` 出现未知字段会直接报错;声明的每个 `[[blocks]]` / `[[lenses]]` 都必须在 host 里 define。
 
@@ -146,7 +150,7 @@ STENCIL_LOG=warn,stencil=info,tern::plugin=debug
 
 - 语言:Luau(Tern 内置 VM,每个 VM 内存上限 256 MiB)。不需要包管理器,也不能引入外部 Luau 依赖。
 - 需要原生能力时,参考 `office预览` 的 sidecar 模式:Rust 二进制构建到 `plugin-data/<id>/bin`,通过 `tern.process.run` 调用。
-- 构建输出不得落在插件目录内,否则会触发重载风暴。Rust 默认输出到 `/tmp/roost-cargo-target`(`.cargo/config.toml`);不要设置 `RUSTFLAGS`,否则会覆盖其中的 clippy 规则。
+- 构建输出不得落在插件目录内,否则会触发重载风暴。本机 cargo(huacnlee/cargo 分支)忽略 `.cargo/config.toml` 的 `target-dir`、总写 `./target`,所以 Rust 构建一律在仓库外的镜像里做(`scripts/check.sh` 用 `/tmp/roost-rust`);不要设置 `RUSTFLAGS`,否则会覆盖其中的 clippy 规则。
 - link 开发期间,`.omp/memory/` 或其他仓库文件的写入同样会触发 Tern 重载全部插件。这是预期行为,不要为了避开它把记忆移出仓库。
 - omp 在本项目使用 yolo 模式(`.omp/config.yml`)。TTSR 违规时丢弃已流出的输出后重试;同一规则隔 8 轮后可再次触发。`luau-budget`、`rust-*` 是事后提醒(`interruptMode: never`),`luau-sandbox`、`memory-no-secrets` 会直接打断。
 - 全局配置禁用了 `typesafe` 这个 provider,所以 `question` 类(由模型判定的)TTSR 规则不会生效;新规则只用 `condition`/`astCondition`,并先用 `omp ttsr test --rule .omp/rules/<名>.md --source tool --path <文件> '<片段>'` 验证。

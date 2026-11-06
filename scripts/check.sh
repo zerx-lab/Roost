@@ -42,15 +42,32 @@ if [ -f tests/run.py ]; then
 fi
 
 # ---------- Rust ----------
+# 在插件目录外的镜像里构建:本机 cargo(huacnlee/cargo 分支)会忽略 target-dir,总是写 ./target,
+# 而插件目录内的任何写入都会让 Tern 重载全部插件。镜像带上 .cargo/config.toml 与 clippy.toml,
+# lint 规则不变;cargo 按 cwd 查找配置,所以每条命令都在镜像目录里执行。
 manifests=$(find . \( $prune \) -prune -o -name Cargo.toml -print)
-for m in $manifests; do
+mirror=/tmp/roost-rust
+if [ -n "$manifests" ]; then
 	need cargo "安装 rustup"
+	need rsync "macOS 自带"
+	mkdir -p "$mirror/.cargo"
+	cp .cargo/config.toml "$mirror/.cargo/config.toml"
+	cp clippy.toml "$mirror/clippy.toml"
+fi
+for m in $manifests; do
+	d=$(dirname "$m")
+	mkdir -p "$mirror/$d"
+	rsync -a --delete --exclude target "$d/" "$mirror/$d/"
 	step "cargo fmt --check ($m)"
-	cargo fmt --manifest-path "$m" --check || fail=1
+	(cd "$mirror/$d" && cargo fmt --check) || fail=1
 	step "cargo clippy ($m)"
-	cargo clippy --manifest-path "$m" --all-targets -- -D warnings || fail=1
+	(cd "$mirror/$d" && cargo clippy --all-targets -- -D warnings) || fail=1
 	step "cargo test ($m)"
-	cargo test --manifest-path "$m" || fail=1
+	(cd "$mirror/$d" && cargo test) || fail=1
+	if [ -d "$d/target" ]; then
+		echo "$d/target 出现在插件目录内(会触发 Tern 重载):删除它,并改在 $mirror 中构建" >&2
+		fail=1
+	fi
 done
 
 # ---------- 项目记忆 ----------

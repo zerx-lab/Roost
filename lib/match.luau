@@ -23,8 +23,9 @@ M.USER_CONTENT = {
 	discussion_comment = true,
 }
 
--- What a match needs besides the event: `me` is the user's GitHub login (`@me`, ignore_self).
-export type Ctx = { me: string? }
+-- What a match needs besides the event: `me` is the user's GitHub login (`@me`, ignore_self);
+-- `bot` is the App's account (`<slug>[bot]`): what runs did as the App counts as your own activity.
+export type Ctx = { me: string?, bot: string? }
 
 local PR_OPEN = { opened = true, reopened = true, ready_for_review = true }
 
@@ -235,8 +236,13 @@ function M.mismatch(t: model.GithubTrigger, info: { [string]: any }, ctx: Ctx): 
 	if t.ignore_bots and info.sender_is_bot and not person_in(t.authors, info.sender, ctx) then
 		return `机器人 {info.sender or "?"} 的活动`
 	end
-	if t.ignore_self and ctx.me and info.sender and string.lower(info.sender) == string.lower(ctx.me) and not person_in(t.authors, info.sender, ctx) then
-		return "你自己的活动"
+	if t.ignore_self and info.sender and not person_in(t.authors, info.sender, ctx) then
+		local who = string.lower(info.sender)
+		if ctx.bot and who == string.lower(ctx.bot) then
+			return "Roost 以 App 身份做的操作"
+		elseif ctx.me and who == string.lower(ctx.me) then
+			return "你自己的活动"
+		end
 	end
 	local allowed = t.associations
 	if allowed == nil and M.USER_CONTENT[info.event] then
@@ -275,6 +281,94 @@ function M.summary(info: { [string]: any }): string
 		out ..= " " .. t
 	end
 	return out
+end
+
+-- A pull request as `https://github.com/owner/name/pull/12` (scheme optional, any trailing
+-- path), `owner/name#12`, `#12` or `12`. The repo is nil for the last two; nil number = not a PR.
+function M.pr_ref(text: string): (string?, number?)
+	local s = string.match(text, "^%s*(.-)%s*$") or ""
+	s = string.gsub(s, "^https?://", "")
+	local repo, n = string.match(s, "^github%.com/([%w%-_%.]+/[%w%-_%.]+)/pull/(%d+)")
+	if not repo then
+		repo, n = string.match(s, "^([%w%-_%.]+/[%w%-_%.]+)#(%d+)$")
+	end
+	if not repo then
+		n = string.match(s, "^#?(%d+)$")
+	end
+	local num = tonumber(n or "")
+	if num == nil or num < 1 or num ~= math.floor(num) then
+		return nil, nil
+	end
+	return repo, num
+end
+
+-- Longest text field kept, as the relay clips it (agent/src/event.rs MAX_TEXT).
+local MAX_TEXT = 16 * 1024
+
+local function str(v: any): string?
+	return if type(v) == "string" then v else nil
+end
+
+local function obj(v: any): { [string]: any }
+	return if type(v) == "table" then v else {}
+end
+
+local function logins(list: any, key: string): { string }
+	local out: { string } = {}
+	if type(list) == "table" then
+		for _, x in list do
+			local v = if type(x) == "table" then str(x[key]) else nil
+			if v then
+				table.insert(out, v)
+			end
+		end
+	end
+	return out
+end
+
+-- A pull request from `GET /repos/{repo}/pulls/{n}` as the relay's info for a `pull_request`
+-- event with `action` (agent/src/event.rs from_github): what a PR workflow run on demand sees.
+function M.pr_info(repo: string, pr: { [string]: any }, action: string): { [string]: any }
+	local base, head = obj(pr.base), obj(pr.head)
+	local full = str(obj(base.repo).full_name) or repo
+	local head_repo = str(obj(head.repo).full_name)
+	local number = if type(pr.number) == "number" then pr.number else nil
+	local body = str(pr.body)
+	if body and #body > MAX_TEXT then
+		-- Cut on a character boundary: step back over UTF-8 continuation bytes.
+		local cut = MAX_TEXT
+		while cut > 0 do
+			local b = string.byte(body, cut + 1) or 0
+			if b < 0x80 or b >= 0xC0 then
+				break
+			end
+			cut -= 1
+		end
+		body = string.sub(body, 1, cut) .. "…"
+	end
+	return {
+		event = "pull_request",
+		action = action,
+		repo = full,
+		default_branch = str(obj(base.repo).default_branch),
+		author = str(obj(pr.user).login),
+		assignees = logins(pr.assignees, "login"),
+		draft = pr.draft == true,
+		merged = pr.merged == true,
+		deleted = false,
+		number = number,
+		title = str(pr.title),
+		body = body,
+		url = str(pr.html_url),
+		branch = str(base.ref),
+		sha = str(head.sha),
+		fetch_ref = if number then `refs/pull/{number}/head` else nil,
+		labels = logins(pr.labels, "name"),
+		association = str(pr.author_association),
+		is_pr = true,
+		head_repo = head_repo,
+		from_fork = head_repo ~= nil and string.lower(head_repo) ~= string.lower(full),
+	}
 end
 
 return M

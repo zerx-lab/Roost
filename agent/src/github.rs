@@ -5,10 +5,14 @@
 //! App's id, private key and webhook secret and keeps them in `github-app.json` (mode 0600, never
 //! synced). Webhooks of every repository the App is installed on then arrive at `/hooks/github`,
 //! signed with the App's webhook secret, with no per-repository hook to manage. The private key
-//! signs short JWTs that buy read-only installation tokens, used to list repositories, people,
-//! labels, branches and workflow names for the plugin's automation editor.
+//! signs short JWTs that buy installation tokens: the relay's own (editor suggestions, the
+//! default-branch guard) and, per run, a token scoped to one repository that the plugin's runs
+//! act on GitHub with. Before handing one out, the relay makes sure the repository's default
+//! branch can't be force-pushed or deleted (a ruleset of its own when nothing else forbids it);
+//! the Administration permission that takes stays with the relay.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -40,6 +44,26 @@ const TOKEN_MARGIN: Duration = Duration::from_secs(300);
 /// Most names one list returns (repos, people, labels, …).
 const MAX_ITEMS: usize = 1000;
 const PER_PAGE: usize = 100;
+/// Repository permissions the App asks for. `administration` stays with the relay: it adds the
+/// default-branch guard and is never put in a token the relay hands out.
+pub const APP_PERMISSIONS: &[(&str, &str)] = &[
+    ("actions", "write"),
+    ("administration", "write"),
+    ("checks", "write"),
+    ("contents", "write"),
+    ("deployments", "write"),
+    ("discussions", "write"),
+    ("issues", "write"),
+    ("metadata", "read"),
+    ("pull_requests", "write"),
+    ("statuses", "write"),
+    ("workflows", "write"),
+];
+const RELAY_ONLY: &[&str] = &["administration"];
+/// The ruleset the relay adds when a repository's default branch can still be force-pushed.
+pub const GUARD_NAME: &str = "Roost: protect default branch";
+/// How long a repository's checked protection is trusted before it is looked at again.
+const GUARD_TTL: Duration = Duration::from_secs(600);
 
 /// Events the App subscribes to: everything the plugin's trigger kinds listen for.
 pub const APP_EVENTS: &[&str] = &[
@@ -100,7 +124,38 @@ pub struct AppInfo {
     pub owner_type: String,
     pub html_url: String,
     pub install_url: String,
+    /// The App's settings page on GitHub (logo, permissions).
+    pub settings_url: String,
+    /// The account the App acts as: `<slug>[bot]`.
+    pub bot: String,
     pub installations: Option<usize>,
+    /// Wanted permissions (`name:level`) some installation hasn't granted yet; None when unknown.
+    pub missing: Option<Vec<String>>,
+}
+
+/// A token for one repository, as `/api/v1/github/token` hands it to the plugin. No `Debug`: it
+/// holds a live credential.
+#[derive(Serialize)]
+pub struct AppToken {
+    pub token: String,
+    pub expires_at: String,
+    /// Seconds until it expires.
+    pub expires_in: u64,
+    pub repository: String,
+    pub permissions: Value,
+    /// Git author/committer for commits made as the App.
+    pub login: String,
+    pub email: String,
+    /// The default branch and how it is kept from force pushes: `existing`, `created` or `updated`.
+    pub branch: String,
+    pub protection: &'static str,
+}
+
+/// An installation: its id and the permissions it granted.
+#[derive(Clone)]
+struct Install {
+    id: u64,
+    permissions: Value,
 }
 
 struct Pending {
@@ -129,8 +184,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The last `/app/installations` answer: the ids, or the failure's status and message.
-type InstallationsAnswer = Result<Vec<u64>, (u16, String)>;
+/// The last `/app/installations` answer, or the failure's status and message.
+type InstallationsAnswer = Result<Vec<Install>, (u16, String)>;
+/// A repository's default branch and how it was found protected (`existing`, `created`, `updated`).
+type Guarded = (String, &'static str);
 
 pub struct Github {
     api_url: String,
@@ -141,9 +198,72 @@ pub struct Github {
     rng: SystemRandom,
     app: RwLock<Option<Arc<App>>>,
     tokens: Mutex<HashMap<u64, (String, Instant)>>,
-    installs: Mutex<HashMap<String, (u64, Instant)>>,
+    installs: Mutex<HashMap<String, (Install, Instant)>>,
     installations: Mutex<Option<(InstallationsAnswer, Instant)>>,
+    guards: Mutex<HashMap<String, (Guarded, Instant)>>,
+    /// Repository → the lock its guard check runs under.
+    guard_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// (App id, the user id of its bot account).
+    bot: Mutex<Option<(u64, u64)>>,
     pending: Mutex<HashMap<String, Pending>>,
+}
+
+fn rank(level: &str) -> u8 {
+    match level {
+        "read" => 1,
+        "write" => 2,
+        "admin" => 3,
+        _ => 0,
+    }
+}
+
+fn grants(perms: &Value, name: &str, level: &str) -> bool {
+    rank(perms.get(name).and_then(Value::as_str).unwrap_or("")) >= rank(level)
+}
+
+fn has_rule(rules: &Value, kind: &str) -> bool {
+    rules.as_array().is_some_and(|a| {
+        a.iter()
+            .any(|r| r.get("type").and_then(Value::as_str) == Some(kind))
+    })
+}
+
+/// The default-branch guard: no force pushes, no deletion. Repository admins may still bypass it;
+/// the App is not one of them.
+fn guard_ruleset() -> Value {
+    json!({
+        "name": GUARD_NAME,
+        "target": "branch",
+        "enforcement": "active",
+        "bypass_actors": [{ "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }],
+        "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+        "rules": [{ "type": "non_fast_forward" }, { "type": "deletion" }],
+    })
+}
+
+/// A path segment (a branch name keeps its slashes).
+fn path_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// How long a token answer (`expires_at`) has left; an hour when GitHub didn't say.
+fn time_left(v: &Value) -> Duration {
+    str_of(v, "expires_at")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .and_then(|t| {
+            (t.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                .to_std()
+                .ok()
+        })
+        .unwrap_or(Duration::from_secs(3600))
 }
 
 /// The DER bytes of a PEM private key: PKCS#1 (`RSA PRIVATE KEY`, what GitHub issues) or PKCS#8.
@@ -283,6 +403,9 @@ impl Github {
             tokens: Mutex::new(HashMap::new()),
             installs: Mutex::new(HashMap::new()),
             installations: Mutex::new(None),
+            guards: Mutex::new(HashMap::new()),
+            guard_locks: Mutex::new(HashMap::new()),
+            bot: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
         })
     }
@@ -295,12 +418,17 @@ impl Github {
         *self.app.write().unwrap_or_else(|p| p.into_inner()) = app.map(Arc::new);
         self.forget_installs();
         lock(&self.tokens).clear();
+        lock(&self.guards).clear();
+        *lock(&self.bot) = None;
     }
 
-    /// Drops cached installation lookups (installations changed on GitHub).
+    /// Drops cached installation lookups and the tokens and guard checks made under them
+    /// (installations or their granted permissions changed on GitHub).
     pub fn forget_installs(&self) {
         lock(&self.installs).clear();
         *lock(&self.installations) = None;
+        lock(&self.tokens).clear();
+        lock(&self.guards).clear();
     }
 
     pub fn webhook_secret(&self) -> Option<String> {
@@ -330,6 +458,7 @@ impl Github {
         method: reqwest::Method,
         path: &str,
         bearer: Option<&str>,
+        body: Option<&Value>,
     ) -> Result<Value, Failure> {
         let mut req = self
             .client
@@ -338,6 +467,9 @@ impl Github {
             .header("X-GitHub-Api-Version", "2022-11-28");
         if let Some(b) = bearer {
             req = req.bearer_auth(b);
+        }
+        if let Some(b) = body {
+            req = req.json(b);
         }
         let mut resp = req
             .send()
@@ -381,9 +513,9 @@ impl Github {
             .ok_or_else(|| Failure::new(409, "GitHub App 未创建:在 Roost「中继」页创建"))
     }
 
-    /// Ids of the App's installations (accounts it is installed on). Answers, failures included,
-    /// are reused for a minute, so a slow or failing GitHub can't stall every status poll.
-    async fn installation_ids(&self) -> Result<Vec<u64>, Failure> {
+    /// The App's installations (accounts it is installed on). Answers, failures included, are
+    /// reused for a minute, so a slow or failing GitHub can't stall every status poll.
+    async fn installations(&self) -> Result<Vec<Install>, Failure> {
         if let Some((answer, at)) = lock(&self.installations).as_ref()
             && at.elapsed() < INSTALLATIONS_TTL
         {
@@ -398,14 +530,20 @@ impl Github {
                 reqwest::Method::GET,
                 "/app/installations?per_page=100",
                 Some(&jwt),
+                None,
             )
             .await
             .map(|v| {
                 v.as_array()
                     .map(|a| {
                         a.iter()
-                            .filter_map(|i| i.get("id").and_then(Value::as_u64))
-                            .collect::<Vec<u64>>()
+                            .filter_map(|i| {
+                                Some(Install {
+                                    id: i.get("id").and_then(Value::as_u64)?,
+                                    permissions: i.get("permissions").cloned().unwrap_or_default(),
+                                })
+                            })
+                            .collect::<Vec<Install>>()
                     })
                     .unwrap_or_default()
             })
@@ -414,7 +552,7 @@ impl Github {
         answer.map_err(|(status, message)| Failure { status, message })
     }
 
-    /// A read-only token for installation `id`, reused until shortly before it expires.
+    /// The relay's own token for installation `id`, reused until shortly before it expires.
     async fn token(&self, id: u64) -> Result<String, Failure> {
         if let Some((t, until)) = lock(&self.tokens).get(&id)
             && Instant::now() < *until
@@ -428,17 +566,11 @@ impl Github {
                 reqwest::Method::POST,
                 &format!("/app/installations/{id}/access_tokens"),
                 Some(&jwt),
+                None,
             )
             .await?;
         let token = str_of(&v, "token").ok_or_else(|| Failure::new(502, "GitHub gave no token"))?;
-        let left = str_of(&v, "expires_at")
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-            .and_then(|t| {
-                (t.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                    .to_std()
-                    .ok()
-            })
-            .unwrap_or(Duration::from_secs(3600));
+        let left = time_left(&v);
         let until = Instant::now() + left.saturating_sub(TOKEN_MARGIN);
         let mut g = lock(&self.tokens);
         if g.len() >= MAX_INSTALLS {
@@ -448,45 +580,250 @@ impl Github {
         Ok(token)
     }
 
-    /// The installation token for `repo` (the App must be installed on it).
-    async fn repo_token(&self, repo: &str) -> Result<String, Failure> {
+    /// The installation that covers `repo` (the App must be installed on it).
+    async fn installation(&self, repo: &str) -> Result<Install, Failure> {
         let key = repo.to_ascii_lowercase();
         let cached = lock(&self.installs)
             .get(&key)
             .filter(|(_, at)| at.elapsed() < INSTALL_TTL)
-            .map(|(id, _)| *id);
-        let id = match cached {
-            Some(id) => id,
-            None => {
-                let app = self.need_app()?;
-                let jwt = self.jwt(&app)?;
-                let v = self
-                    .call(
-                        reqwest::Method::GET,
-                        &format!("/repos/{repo}/installation"),
-                        Some(&jwt),
-                    )
-                    .await
-                    .map_err(|f| {
-                        if f.status == 404 {
-                            Failure::new(404, format!("GitHub App 没有安装到 {repo}"))
-                        } else {
-                            f
-                        }
-                    })?;
-                let id = v
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| Failure::new(502, "GitHub gave no installation id"))?;
-                let mut g = lock(&self.installs);
-                if g.len() >= MAX_INSTALLS {
-                    g.clear();
+            .map(|(i, _)| i.clone());
+        if let Some(i) = cached {
+            return Ok(i);
+        }
+        let app = self.need_app()?;
+        let jwt = self.jwt(&app)?;
+        let v = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/repos/{repo}/installation"),
+                Some(&jwt),
+                None,
+            )
+            .await
+            .map_err(|f| {
+                if f.status == 404 {
+                    Failure::new(404, format!("GitHub App 没有安装到 {repo}"))
+                } else {
+                    f
                 }
-                g.insert(key, (id, Instant::now()));
-                id
+            })?;
+        let install = Install {
+            id: v
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Failure::new(502, "GitHub gave no installation id"))?,
+            permissions: v.get("permissions").cloned().unwrap_or_default(),
+        };
+        let mut g = lock(&self.installs);
+        if g.len() >= MAX_INSTALLS {
+            g.clear();
+        }
+        g.insert(key, (install.clone(), Instant::now()));
+        Ok(install)
+    }
+
+    /// The relay's installation token for `repo`.
+    async fn repo_token(&self, repo: &str) -> Result<String, Failure> {
+        let install = self.installation(repo).await?;
+        self.token(install.id).await
+    }
+
+    /// The guard check for `key` while it is still trusted.
+    fn cached_guard(&self, key: &str) -> Option<Guarded> {
+        lock(&self.guards)
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < GUARD_TTL)
+            .map(|(g, _)| g.clone())
+    }
+
+    /// `repo`'s default branch, after making sure it can't be force-pushed or deleted: by rules
+    /// already in place, else by the relay's own ruleset. Fails when neither can be had.
+    async fn guard(&self, repo: &str, token: &str) -> Result<Guarded, Failure> {
+        let key = repo.to_ascii_lowercase();
+        if let Some(g) = self.cached_guard(&key) {
+            return Ok(g);
+        }
+        // One check per repository at a time: two runs starting together would otherwise both
+        // create the ruleset, and GitHub refuses the second (names are unique).
+        let gate = {
+            let mut m = lock(&self.guard_locks);
+            if m.len() >= MAX_INSTALLS {
+                m.retain(|_, l| Arc::strong_count(l) > 1);
+            }
+            m.entry(key.clone()).or_default().clone()
+        };
+        let _held = gate.lock().await;
+        if let Some(g) = self.cached_guard(&key) {
+            return Ok(g);
+        }
+        let info = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/repos/{repo}"),
+                Some(token),
+                None,
+            )
+            .await?;
+        let branch = str_of(&info, "default_branch")
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| Failure::new(502, format!("GitHub 没有给出 {repo} 的默认分支")))?;
+        let rules = self
+            .call(
+                reqwest::Method::GET,
+                &format!(
+                    "/repos/{repo}/rules/branches/{}?per_page=100",
+                    path_escape(&branch)
+                ),
+                Some(token),
+                None,
+            )
+            .await?;
+        let source = if has_rule(&rules, "non_fast_forward") && has_rule(&rules, "deletion") {
+            "existing"
+        } else {
+            self.add_guard(repo, &branch, token).await?
+        };
+        let g = (branch, source);
+        let mut m = lock(&self.guards);
+        if m.len() >= MAX_INSTALLS {
+            m.clear();
+        }
+        m.insert(key, (g.clone(), Instant::now()));
+        Ok(g)
+    }
+
+    /// Puts the relay's ruleset on `repo` (or turns its earlier one back on).
+    async fn add_guard(
+        &self,
+        repo: &str,
+        branch: &str,
+        token: &str,
+    ) -> Result<&'static str, Failure> {
+        let refuse = |f: Failure| {
+            Failure::new(
+                409,
+                format!(
+                    "{repo} 的默认分支 {branch} 仍可被强推或删除,Roost 也无法加上保护规则集({}),因此不签发 App 令牌。\
+                     常见原因:安装还没接受 App 新增的 Administration 权限,或私有仓库所在账号的套餐不支持规则集。\
+                     也可以在 GitHub 上为默认分支手动添加禁止强推与删除的规则",
+                    f.message
+                ),
+            )
+        };
+        let list = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/repos/{repo}/rulesets?includes_parents=false&per_page=100"),
+                Some(token),
+                None,
+            )
+            .await
+            .map_err(refuse)?;
+        let ours = list
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find(|r| r.get("name").and_then(Value::as_str) == Some(GUARD_NAME))
+            })
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_u64);
+        let body = guard_ruleset();
+        let (method, path, source) = match ours {
+            Some(id) => (
+                reqwest::Method::PUT,
+                format!("/repos/{repo}/rulesets/{id}"),
+                "updated",
+            ),
+            None => (
+                reqwest::Method::POST,
+                format!("/repos/{repo}/rulesets"),
+                "created",
+            ),
+        };
+        self.call(method, &path, Some(token), Some(&body))
+            .await
+            .map_err(refuse)?;
+        tracing::info!(%repo, %branch, source, "default branch guard in place");
+        Ok(source)
+    }
+
+    /// The user id of the App's bot account (for commit e-mail addresses GitHub attributes).
+    async fn bot_id(&self, app: &App, token: &str) -> Result<u64, Failure> {
+        if let Some((aid, uid)) = *lock(&self.bot)
+            && aid == app.file.id
+        {
+            return Ok(uid);
+        }
+        let v = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/users/{}%5Bbot%5D", path_escape(&app.file.slug)),
+                Some(token),
+                None,
+            )
+            .await?;
+        let uid = v
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Failure::new(502, "GitHub gave no id for the App's bot account"))?;
+        *lock(&self.bot) = Some((app.file.id, uid));
+        Ok(uid)
+    }
+
+    /// A token for one run on `repo`: only that repository, every permission its installation
+    /// granted except the relay's own, and only once its default branch is guarded.
+    pub async fn app_token(&self, repo: &str) -> Result<AppToken, Failure> {
+        if !valid_repo_name(repo) {
+            return Err(Failure::new(400, "repo=owner/name is required"));
+        }
+        let app = self.need_app()?;
+        let install = self.installation(repo).await?;
+        let own = self.token(install.id).await?;
+        let guarded = self.guard(repo, &own).await;
+        let (branch, protection) = match guarded {
+            Ok(g) => g,
+            Err(f) => {
+                // The relay's token may predate a permission just granted: mint a fresh one next time.
+                lock(&self.tokens).remove(&install.id);
+                return Err(f);
             }
         };
-        self.token(id).await
+        let uid = self.bot_id(&app, &own).await?;
+        let mut perms = serde_json::Map::new();
+        for (name, _) in APP_PERMISSIONS {
+            if RELAY_ONLY.contains(name) {
+                continue;
+            }
+            if let Some(level) = install.permissions.get(*name) {
+                perms.insert((*name).to_string(), level.clone());
+            }
+        }
+        let short = repo.split_once('/').map_or(repo, |(_, n)| n);
+        let jwt = self.jwt(&app)?;
+        let v = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/app/installations/{}/access_tokens", install.id),
+                Some(&jwt),
+                Some(&json!({ "repositories": [short], "permissions": perms })),
+            )
+            .await?;
+        let token = str_of(&v, "token").ok_or_else(|| Failure::new(502, "GitHub gave no token"))?;
+        let login = format!("{}[bot]", app.file.slug);
+        Ok(AppToken {
+            token,
+            expires_at: str_of(&v, "expires_at").unwrap_or_default(),
+            expires_in: time_left(&v).as_secs(),
+            repository: repo.to_string(),
+            permissions: v
+                .get("permissions")
+                .cloned()
+                .unwrap_or(Value::Object(perms)),
+            email: format!("{uid}+{login}@users.noreply.github.com"),
+            login,
+            branch,
+            protection,
+        })
     }
 
     /// Names from a paginated list: `array` is the key holding the list (None: the body is it).
@@ -505,6 +842,7 @@ impl Github {
                     reqwest::Method::GET,
                     &format!("{path}{sep}per_page={PER_PAGE}&page={page}"),
                     Some(token),
+                    None,
                 )
                 .await?;
             let list = match array {
@@ -534,11 +872,11 @@ impl Github {
     pub async fn list(&self, what: &str, repo: Option<&str>) -> Result<Vec<String>, Failure> {
         let mut out = Vec::new();
         if what == "repos" {
-            for id in self.installation_ids().await? {
+            for install in self.installations().await? {
                 if out.len() >= MAX_ITEMS {
                     break;
                 }
-                let token = self.token(id).await?;
+                let token = self.token(install.id).await?;
                 self.collect(
                     &token,
                     "/installation/repositories",
@@ -574,8 +912,23 @@ impl Github {
     /// The App as `/api/v1/status` reports it, or None before one is created.
     pub async fn info(&self) -> Option<AppInfo> {
         let app = self.app()?;
-        let installations = self.installation_ids().await.ok().map(|v| v.len());
+        let installs = self.installations().await.ok();
+        let missing = installs.as_ref().map(|list| {
+            APP_PERMISSIONS
+                .iter()
+                .filter(|(name, level)| list.iter().any(|i| !grants(&i.permissions, name, level)))
+                .map(|(name, level)| format!("{name}:{level}"))
+                .collect::<Vec<String>>()
+        });
         let f = &app.file;
+        let settings_url = if f.owner_type == "Organization" {
+            format!(
+                "{}/organizations/{}/settings/apps/{}",
+                self.web_url, f.owner, f.slug
+            )
+        } else {
+            format!("{}/settings/apps/{}", self.web_url, f.slug)
+        };
         Some(AppInfo {
             id: f.id,
             slug: f.slug.clone(),
@@ -584,7 +937,10 @@ impl Github {
             owner_type: f.owner_type.clone(),
             html_url: f.html_url.clone(),
             install_url: format!("{}/installations/new", f.html_url),
-            installations,
+            settings_url,
+            bot: format!("{}[bot]", f.slug),
+            installations: installs.map(|v| v.len()),
+            missing,
         })
     }
 
@@ -650,14 +1006,10 @@ impl Github {
             "redirect_url": format!("{public}/github/app/callback"),
             "setup_url": format!("{public}/github/app/installed"),
             "public": false,
-            "default_permissions": {
-                "metadata": "read",
-                "contents": "read",
-                "issues": "read",
-                "pull_requests": "read",
-                "checks": "read",
-                "actions": "read",
-            },
+            "default_permissions": APP_PERMISSIONS
+                .iter()
+                .map(|(name, level)| ((*name).to_string(), Value::from(*level)))
+                .collect::<serde_json::Map<String, Value>>(),
             "default_events": APP_EVENTS,
         })
     }
@@ -674,8 +1026,8 @@ impl Github {
         Some(page(
             "创建 Roost GitHub App",
             &format!(
-                "<p>即将在 GitHub {who}下创建一个只读的 GitHub App「{name}」,用来把仓库事件转给 Roost。\
-                 GitHub 会让你确认名称,创建后再选择要安装的仓库。</p>\
+                "<p>即将在 GitHub {who}下创建 GitHub App「{name}」:它把仓库事件转给 Roost,并让 Roost 的运行以 App 身份评论、审查与推送\
+                 (默认分支会加上禁止强推与删除的规则)。GitHub 会让你确认名称,创建后再选择要安装的仓库。</p>\
                  <form id=\"f\" method=\"post\" action=\"{action}?state={state}\">\
                  <input type=\"hidden\" name=\"manifest\" value=\"{manifest}\">\
                  <button type=\"submit\">前往 GitHub 创建</button></form>\
@@ -716,6 +1068,7 @@ impl Github {
             .call(
                 reqwest::Method::POST,
                 &format!("/app-manifests/{code}/conversions"),
+                None,
                 None,
             )
             .await?;

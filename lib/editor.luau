@@ -4,7 +4,7 @@
 -- Node ids under layer.editor are the contract the key handler and tests share:
 --   body.head.name.input, body.head.icon, body.triggers.add, body.triggers.tN.sentence.*,
 --   body.triggers.tN.card.*, body.prompt.stack.input, body.prompt.bar.pmodel,
---   body.steps.sN.*, body.notify.sw, body.advanced.*, foot.save, foot.del, layer.discard.
+--   body.steps.sN.*, body.prompt.when.input, body.notify.sw, body.advanced.*, foot.save, foot.del, layer.discard.
 
 local field = require("./field")
 local model = require("./model")
@@ -19,6 +19,8 @@ local PROMPT_ID = ROOT .. ".body.prompt.stack.input"
 local DESC_ID = ROOT .. ".body.advanced.desc.input"
 local ID_ID = ROOT .. ".body.advanced.id.input"
 local TIMEOUT_ID = ROOT .. ".body.advanced.timeout.input"
+local PROMPT_WHEN_ID = ROOT .. ".body.prompt.when.input"
+local BUDGET_ID = ROOT .. ".body.advanced.budget.input"
 local CHECK_MS = 300
 
 type Issue = model.Issue
@@ -292,6 +294,52 @@ local function sync_text_field(ed: Editor, id: string, key: string)
 	ed.raw[key] = if text == "" then nil else text
 end
 
+local function when_text_of(step: any): string
+	local w = step.when
+	if type(w) == "string" then
+		return w
+	end
+	return ""
+end
+
+-- Empty clears the condition; a missing buffer leaves a hand-written `when` alone.
+local function apply_when(ed: Editor, step: any, id: string)
+	if type(step) ~= "table" then
+		return
+	end
+	local f = ed.buf[id]
+	if not f then
+		return
+	end
+	local text = util.trim(f.text)
+	step.when = if text == "" then nil else text
+end
+
+local function budget_text(raw: any): string
+	local v = raw.daily_budget
+	if type(v) == "number" then
+		return tostring(v)
+	elseif type(v) == "string" then
+		return v
+	end
+	return ""
+end
+
+-- A non-number stays a string so parse_workflows reports it; empty is "no budget".
+local function sync_budget(ed: Editor)
+	local f = ed.buf[BUDGET_ID]
+	if not f then
+		return
+	end
+	local text = util.trim(f.text)
+	if text == "" then
+		ed.raw.daily_budget = nil
+		return
+	end
+	local n = tonumber(text)
+	ed.raw.daily_budget = if n ~= nil then n else text
+end
+
 local function sync_steps(ed: Editor)
 	local steps = steps_of(ed.raw)
 	local prompt_at = prompt_index(ed)
@@ -312,17 +360,21 @@ local function sync_steps(ed: Editor)
 					step.run = nil
 				end
 			end
+			apply_when(ed, step, sid(i, "when", "input"))
 		end
 	end
 end
 
 local function sync_prompt(ed: Editor)
 	local f = ed.buf[PROMPT_ID]
-	if not f then
-		return
-	end
 	local steps = steps_of(ed.raw)
 	local idx = prompt_index(ed)
+	if not f then
+		if idx then
+			apply_when(ed, steps[idx], PROMPT_WHEN_ID)
+		end
+		return
+	end
 	if f.text == "" then
 		local step = if idx then steps[idx] else nil
 		if idx and ed.prompt_inserted and step.model == nil then
@@ -332,6 +384,7 @@ local function sync_prompt(ed: Editor)
 			drop_prefix(ed, ROOT .. ".body.steps.")
 		elseif step then
 			step.omp = ""
+			apply_when(ed, step, PROMPT_WHEN_ID)
 		end
 		return
 	end
@@ -340,11 +393,13 @@ local function sync_prompt(ed: Editor)
 		table.insert(steps, 1, step)
 		ed.prompt, ed.prompt_inserted = step, true
 		drop_prefix(ed, ROOT .. ".body.steps.")
+		apply_when(ed, step, PROMPT_WHEN_ID)
 		return
 	end
 	local step = steps[idx]
 	step.omp = f.text
 	step.run = nil
+	apply_when(ed, step, PROMPT_WHEN_ID)
 end
 
 local function sync_triggers(ed: Editor)
@@ -382,6 +437,7 @@ local function sync_all(ed: Editor)
 	sync_prompt(ed)
 	sync_text_field(ed, DESC_ID, "description")
 	sync_text_field(ed, TIMEOUT_ID, "timeout")
+	sync_budget(ed)
 	sync_id(ed)
 	sync_triggers(ed)
 end
@@ -588,6 +644,7 @@ local function swap_steps(ed: Editor, i: number, j: number)
 	end
 	swap_buf(sid(i, "name", "input"), sid(j, "name", "input"))
 	swap_buf(sid(i, "text", "input"), sid(j, "text", "input"))
+	swap_buf(sid(i, "when", "input"), sid(j, "when", "input"))
 	touch(ed)
 end
 
@@ -618,6 +675,8 @@ local function seed_open(ed: Editor)
 	seed(ed, DESC_ID, if type(raw.description) == "string" then raw.description else "")
 	local timeout = raw.timeout
 	seed(ed, TIMEOUT_ID, if type(timeout) == "string" then timeout elseif type(timeout) == "number" then tostring(timeout) else "")
+	seed(ed, BUDGET_ID, budget_text(raw))
+	seed(ed, PROMPT_WHEN_ID, if prompt then when_text_of(prompt) else "")
 end
 
 function M.close(st: any)
@@ -940,7 +999,7 @@ local function schedule_sentence(ed: Editor, i: number, tr: any): (any, string?)
 		end)
 		else nil
 	-- The error is the row's sibling, so the row (and its selects' ids) never moves.
-	return N("row", { key = "sentence", role = "roost.trigger", gap = "xs", align = "center" }, children), err
+	return N("row", { key = "sentence", role = "roost.trigger", gap = "sm", align = "center" }, children), err
 end
 
 local PEOPLE = { people = true, labels = true, branches = true, workflows = true }
@@ -1087,7 +1146,7 @@ local function choice_row(i: number, tr: any, f: KeyedFilter): any
 	end
 	return N("row", { key = f.key, gap = "xs", align = "center", wrap = true }, {
 		txt(f.label, "lab", "muted"),
-		N("row", { key = "opts", gap = "xs", wrap = true }, buttons),
+		N("row", { key = "opts", gap = "sm", wrap = true }, buttons),
 	})
 end
 
@@ -1231,41 +1290,70 @@ local function icon_menu(ed: Editor): any
 	})
 end
 
-local function model_options(current: string?): { any }
-	local opts = {
-		{ value = "auto", label = "Auto" },
-		{ value = "opus", label = "opus" },
-		{ value = "sonnet", label = "sonnet" },
-		{ value = "haiku", label = "haiku" },
-	}
-	if type(current) == "string" and current ~= "" and current ~= "auto" then
+-- Auto (omp's default role), then omp's roles (`@<role>`, resolved by `--model`) and its chat
+-- models, read from the local omp; a value from the file that neither lists stays first.
+local function model_options(st: any, current: string): { any }
+	local cat = core.omp_models(st.core)
+	local default: string? = nil
+	for _, r in cat.roles do
+		if r.name == "default" then
+			default = r.model
+		end
+	end
+	local opts: { any } = { { value = "auto", label = "Auto", detail = default } }
+	for _, r in cat.roles do
+		if r.name ~= "default" then
+			table.insert(opts, { value = `@{r.name}`, label = `@{r.name}`, detail = r.model, group = "角色" })
+		end
+	end
+	for _, m in cat.models do
+		table.insert(opts, { value = m.selector, label = m.selector, group = m.provider })
+	end
+	if cat.loading and #cat.roles == 0 and #cat.models == 0 then
+		table.insert(opts, { value = "\0loading", label = "正在读取 omp 的角色与模型…", disabled = true })
+	elseif cat.error then
+		table.insert(opts, { value = "\0error", label = cat.error, disabled = true })
+	end
+	if current ~= "" and current ~= "auto" then
 		return with_current(opts, current, current)
 	end
 	return opts
 end
 
-local function prompt_section(ed: Editor): any
+local function prompt_section(st: any, ed: Editor): any
 	local step = prompt_step(ed)
 	local model_id = if step and type(step.model) == "string" then step.model else "auto"
 	seed(ed, PROMPT_ID, if step then step_text(step) else "", true)
+	seed(ed, PROMPT_WHEN_ID, if step then when_text_of(step) else "")
 	local idx = prompt_index(ed)
 	local err = field_error(ed, function(path)
-		return idx ~= nil and string.find(path, `.step[{idx}]`, 1, true) ~= nil
+		return idx ~= nil and string.find(path, `.step[{idx}]`, 1, true) ~= nil and string.find(path, ".when", 1, true) == nil
+	end)
+	local when_err = field_error(ed, function(path)
+		return idx ~= nil and string.find(path, `.step[{idx}].when`, 1, true) ~= nil
 	end)
 	return N("col", { key = "prompt", gap = "xs" }, {
 		txt("指令", "h"),
 		N("field", { key = "stack", error = err }, {
 			editor_node(ed, PROMPT_ID, { key = "input", placeholder = "让 Roost 做什么", lines = true }),
 		}),
-		N("row", { key = "bar", gap = "xs" }, {
+		N("row", { key = "bar", gap = "sm" }, {
 			N("select", {
 				key = "pmodel",
 				value = model_id,
-				options = model_options(model_id),
+				options = model_options(st, model_id),
 				title = "模型",
 				disabled = if step then false else "先写指令,再选模型",
 				open = ed.opens[ROOT .. ".body.prompt.bar.pmodel"] == true,
 			}),
+		}),
+		N("field", {
+			key = "when",
+			label = "条件(when)",
+			hint = "out.<输出名> 或 input.<输入名>,可加 ! 取反;为空则总是运行",
+			error = when_err,
+		}, {
+			input_node(ed, PROMPT_WHEN_ID, { key = "input", placeholder = "out.verify" }),
 		}),
 	})
 end
@@ -1281,13 +1369,18 @@ local function steps_section(ed: Editor): any
 			local kind = step_kind(step)
 			local name_id = sid(i, "name", "input")
 			local text_id = sid(i, "text", "input")
+			local when_id = sid(i, "when", "input")
 			seed(ed, name_id, if type(step.name) == "string" then step.name else "")
 			seed(ed, text_id, step_text(step))
+			seed(ed, when_id, when_text_of(step))
 			local err = field_error(ed, function(path)
-				return string.find(path, `.step[{i}]`, 1, true) ~= nil
+				return string.find(path, `.step[{i}]`, 1, true) ~= nil and string.find(path, ".when", 1, true) == nil
+			end)
+			local when_err = field_error(ed, function(path)
+				return string.find(path, `.step[{i}].when`, 1, true) ~= nil
 			end)
 			table.insert(rows, N("col", { key = `s{i}`, gap = "xs", role = "roost.steps" }, {
-				N("row", { key = "bar", gap = "xs", align = "center" }, {
+				N("row", { key = "bar", gap = "sm", align = "center" }, {
 					N("select", {
 						key = "kind",
 						value = kind,
@@ -1303,6 +1396,14 @@ local function steps_section(ed: Editor): any
 				}),
 				N("field", { key = "text", error = err }, {
 					input_node(ed, text_id, { key = "input", placeholder = if kind == "run" then "shell 脚本" else "提示词" }),
+				}),
+				N("field", {
+					key = "when",
+					label = "条件(when)",
+					hint = "out.<输出名> 或 input.<输入名>,可加 ! 取反;为空则总是运行",
+					error = when_err,
+				}, {
+					input_node(ed, when_id, { key = "input", placeholder = "out.verify" }),
 				}),
 			}))
 		end
@@ -1363,6 +1464,7 @@ local function advanced_section(st: any, ed: Editor): any
 	seed(ed, DESC_ID, if type(raw.description) == "string" then raw.description else "")
 	local timeout = raw.timeout
 	seed(ed, TIMEOUT_ID, if type(timeout) == "string" then timeout elseif type(timeout) == "number" then tostring(timeout) else "")
+	seed(ed, BUDGET_ID, budget_text(raw))
 	table.insert(children, N("field", {
 		key = "id",
 		label = "id",
@@ -1390,6 +1492,19 @@ local function advanced_section(st: any, ed: Editor): any
 			open = ed.opens[ROOT .. ".body.advanced.ws.sel"] == true,
 		}),
 	}))
+	local who = if raw.identity == "app" or raw.identity == "local" then raw.identity else ""
+	table.insert(children, N("field", { key = "who", label = "GitHub 身份", hint = "评论、审查、推送以谁的身份进行" }, {
+		N("select", {
+			key = "sel",
+			value = who,
+			options = with_current({
+				{ value = "", label = "跟随 roost.toml" },
+				{ value = "app", label = "GitHub App" },
+				{ value = "local", label = "本机 gh" },
+			}, who, who),
+			open = ed.opens[ROOT .. ".body.advanced.who.sel"] == true,
+		}),
+	}))
 	local conc = if type(raw.concurrency) == "string" then raw.concurrency else "queue"
 	table.insert(children, N("field", { key = "conc", label = "并发" }, {
 		N("select", {
@@ -1405,6 +1520,17 @@ local function advanced_section(st: any, ed: Editor): any
 	}))
 	table.insert(children, N("field", { key = "timeout", label = "超时", hint = "如 20m" }, {
 		input_node(ed, TIMEOUT_ID, { key = "input", placeholder = "20m" }),
+	}))
+	local budget_err = field_error(ed, function(path)
+		return path == "daily_budget" or string.sub(path, -13) == ".daily_budget"
+	end)
+	table.insert(children, N("field", {
+		key = "budget",
+		label = "每日预算(美元)",
+		hint = "达到后今日不再启动 omp 步骤",
+		error = budget_err,
+	}, {
+		input_node(ed, BUDGET_ID, { key = "input", placeholder = "5" }),
 	}))
 	local tz_opts = {
 		{ value = "", label = "本机时区" },
@@ -1498,6 +1624,32 @@ function M.templates(st: any): any
 	})
 end
 
+-- The workflows page's 「从模板」 dropdown: one rich row per template, grouped. Choosing one
+-- sends `act = "tpl:<id>"`.
+function M.template_menu(): any
+	local items: { any } = {}
+	for gi, g in templates_groups() do
+		if g == "全部" then
+			continue
+		end
+		if gi > 2 then
+			table.insert(items, "-")
+		end
+		table.insert(items, { header = g })
+		for _, tpl in model.TEMPLATES do
+			if (tpl.group or "其他") == g then
+				table.insert(items, {
+					id = `tpl:{tpl.id}`,
+					label = tpl.name,
+					detail = tpl.description,
+					icon = tpl.icon or "sparkle",
+				})
+			end
+		end
+	end
+	return N("menu", { key = "templates", text = "从模板", icon = "sparkle", caret = true, items = items })
+end
+
 local function discard_overlay(): any
 	return N("overlay", {
 		key = "discard",
@@ -1507,7 +1659,7 @@ local function discard_overlay(): any
 		foot = "layer.discard.foot",
 	}, {
 		txt("关闭后,这次编辑不会写入 workflows.toml。", "msg", "muted"),
-		N("row", { key = "foot", gap = "xs", justify = "end" }, {
+		N("row", { key = "foot", gap = "sm", justify = "end" }, {
 			N("button", { key = "stay", text = "继续编辑", actions = { click = "discard-stay" } }),
 			N("button", { key = "go", text = "放弃", variant = "danger", actions = { click = "discard-go" } }),
 		}),
@@ -1561,7 +1713,7 @@ function M.view(st: any): any?
 			}),
 		}),
 		N("col", { key = "triggers", gap = "sm" }, triggers),
-		prompt_section(ed),
+		prompt_section(st, ed),
 		steps_section(ed),
 		N("field", { key = "notify", label = "通知" }, {
 			N("switch", { key = "sw", variant = "compact", label = "应用通知", on = raw.notify ~= false }),
@@ -1586,7 +1738,7 @@ function M.view(st: any): any?
 			foot = ROOT .. ".foot",
 		}, {
 			body,
-			N("row", { key = "foot", gap = "xs", justify = "end" }, foot),
+			N("row", { key = "foot", gap = "sm", justify = "end" }, foot),
 		}),
 	}
 	if ed.discard then
@@ -1688,6 +1840,9 @@ local function on_select(st: any, ed: Editor, id: string, value: string)
 		end
 	elseif string.find(id, ".advanced.ws", 1, true) then
 		ed.raw.workspace = value
+		touch(ed)
+	elseif string.find(id, ".advanced.who", 1, true) then
+		ed.raw.identity = if value == "" then nil else value
 		touch(ed)
 	elseif string.find(id, ".advanced.conc", 1, true) then
 		ed.raw.concurrency = value

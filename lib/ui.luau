@@ -6,7 +6,7 @@
 --
 -- Theming contract (roost.css, the user's theme.css): data-role hooks `roost.header`,
 -- `roost.tabs`, `roost.overview`, `roost.runs`, `roost.run`, `roost.log`, `roost.workflows`,
--- `roost.workflow`, `roost.events`, `roost.relay`, `roost.config`, `roost.form`.
+-- `roost.workflow`, `roost.events`, `roost.relay`, `roost.deliveries`, `roost.config`, `roost.form`.
 
 local core = require("./core")
 local store = require("./store")
@@ -15,6 +15,7 @@ local field = require("./field")
 local util = require("./util")
 local agent = require("./agent")
 local editor = require("./editor")
+local stats = require("./stats")
 
 local ui = tern.ui
 local N = ui.node
@@ -38,9 +39,15 @@ local LOG_CHUNK = 256 * 1024
 local LOG_MAX = 512 * 1024
 local LOG_POLL_MS = 1000
 local MAX_RUN_ROWS = 200
+-- A destructive button's second click counts between these many ms after the first: above a
+-- slow double click (macOS's default interval is about 500 ms), within a deliberate retry.
+local CONFIRM_MIN_MS = 800
+local CONFIRM_MAX_MS = 5000
 
-export type FormField = field.Field & { label: string, hint: string?, required: boolean }
-export type Form = { workflow: string, title: string, fields: { FormField }, focus: number, error: string? }
+-- `pr`: the pull request to run on (PR workflows), not one of the workflow's inputs.
+export type FormField = field.Field & { label: string, hint: string?, required: boolean, pr: boolean? }
+-- `busy`: a PR run is reading its pull request.
+export type Form = { workflow: string, title: string, fields: { FormField }, focus: number, error: string?, busy: boolean? }
 export type Log = {
 	id: string?,
 	text: string,
@@ -51,6 +58,8 @@ export type Log = {
 	busy: boolean,
 	timer: any?,
 	cut: boolean, -- older output dropped to stay under LOG_MAX
+	measured: number, -- bytes of `text` whose complete lines `width` covers
+	width: number, -- widest complete line in terminal cells (unwrapped view)
 }
 
 export type State = {
@@ -61,9 +70,11 @@ export type State = {
 	unsubscribe: (() -> ())?,
 	tab: string,
 	run_id: string?,
+	wf_id: string?, -- the workflow shown beside the list on the workflows page
 	filter: string, -- all | active | failed
 	form: Form?,
 	log: Log,
+	log_wrap: boolean, -- the run log wraps at the pane's width; off, long lines scroll sideways
 	cols: number,
 	rows: number,
 	editor: any, -- lib/editor.luau's state while the automation editor is open
@@ -71,7 +82,8 @@ export type State = {
 	app_org: field.Field?, -- organization typed for a new GitHub App
 	app_focus: boolean,
 	app_busy: boolean,
-	app_confirm: boolean, -- 忘记本地凭据 armed by a first click
+	confirm: string?, -- the destructive action armed by a first click (delete, clear, forget)
+	confirm_at: number?, -- tern.now() of that click
 }
 
 -- ---------------------------------------------------------------------------------------------
@@ -101,11 +113,12 @@ local STATE_TONE: { [string]: string } = {
 }
 local TRIGGER_LABEL: { [string]: string } = { github = "GitHub", cron = "定时", manual = "手动", rerun = "重跑" }
 local TRIGGER_ICON: { [string]: string } = { github = "branch", cron = "clock", manual = "user", rerun = "redo" }
-local STEP_ICON: { [string]: string } = { omp = "omp", run = "terminal", prepare = "folder-plus", cleanup = "trash" }
+local STEP_ICON: { [string]: string } = { auth = "plug", omp = "omp", run = "terminal", prepare = "folder-plus", cleanup = "trash" }
 local SYNC_LABEL: { [string]: string } = {
-	idle = "待同步",
+	idle = "待核对",
 	pushing = "推送中",
 	ok = "已同步",
+	adopted = "沿用云端",
 	conflict = "冲突",
 	invalid = "被拒绝",
 	offline = "推送失败",
@@ -115,6 +128,7 @@ local SYNC_TONE: { [string]: string } = {
 	idle = "muted",
 	pushing = "pending",
 	ok = "success",
+	adopted = "warning",
 	conflict = "warning",
 	invalid = "error",
 	offline = "error",
@@ -156,6 +170,21 @@ local function btn(text: string, act: string, props: { [string]: any }?): Node
 	return ui.button(text, p)
 end
 
+-- A destructive button that takes two clicks: the first arms it (st.confirm, new label), the
+-- second runs `what` (see `confirmed`); any other action in between disarms it.
+local function confirm_btn(st: State, text: string, armed: string, what: string, props: { [string]: any }?): Node
+	local p: { [string]: any } = {}
+	local extra: { [string]: any } = props or {}
+	for k, v in extra do
+		p[k] = v
+	end
+	if st.confirm == what then
+		p.variant = "danger"
+		p.title = "5 秒内再点一次确认;按键或其他操作会取消"
+	end
+	return btn(if st.confirm == what then armed else text, `confirm={what}`, p)
+end
+
 -- A heterogeneous list (table cells), typed loosely for the checker.
 local function list_of(...: any): { any }
 	return { ... }
@@ -177,31 +206,28 @@ local function duration(a: number?, b: number?): string
 	return util.fmt_duration((b or now()) - a)
 end
 
--- Agent timestamps are RFC 3339 (UTC); returns epoch seconds.
-local function rfc3339(s: any): number?
-	if type(s) ~= "string" then
-		return nil
+-- `$0.42`. Estimates stay at cents; the log keeps the finer tally.
+local function fmt_usd(n: number): string
+	return string.format("$%.2f", n)
+end
+
+-- `128k` / `1.5m`; under 1000 the count itself.
+local function fmt_tokens(n: number): string
+	local function compact(div: number, suffix: string): string
+		local s = string.format("%.1f", n / div)
+		return (string.gsub(s, "%.0$", "")) .. suffix
 	end
-	local y, mo, d, h, mi, se = string.match(s, "^(%d+)%-(%d+)%-(%d+)T(%d+):(%d+):(%d+)")
-	if not y then
-		return nil
+	if n >= 1000000 then
+		return compact(1000000, "m")
+	elseif n >= 1000 then
+		return compact(1000, "k")
 	end
-	local Y, Mo, D = tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number
-	-- Days from civil (proleptic Gregorian), UTC.
-	local yy = if Mo <= 2 then Y - 1 else Y
-	local era = math.floor(yy / 400)
-	local yoe = yy - era * 400
-	local mp = (Mo + 9) % 12
-	local doy = math.floor((153 * mp + 2) / 5) + D - 1
-	local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
-	local days = era * 146097 + doe - 719468
-	local t = days * 86400 + (tonumber(h) :: number) * 3600 + (tonumber(mi) :: number) * 60 + (tonumber(se) :: number)
-	local sign, oh, om = string.match(s, "([%+%-])(%d%d):?(%d%d)$")
-	if sign and oh and om then
-		local off = (tonumber(oh) :: number) * 3600 + (tonumber(om) :: number) * 60
-		t = if sign == "+" then t - off else t + off
-	end
-	return t
+	return string.format("%d", math.floor(n + 0.5))
+end
+
+-- `条件 out.verify` / `条件 !input.dry_run`.
+local function when_label(w: model.When): string
+	return `条件 {if w.negate then "!" else ""}{w.source}.{w.key}`
 end
 
 local function runs_list(st: State): { store.Run }
@@ -258,6 +284,8 @@ local function reset_log(st: State, id: string?)
 		busy = false,
 		timer = nil,
 		cut = false,
+		measured = 0,
+		width = 0,
 	}
 	if id then
 		pull(st)
@@ -274,8 +302,32 @@ local function append_log(st: State, chunk: string)
 		local nl = string.find(text, "\n", start, true)
 		text = string.sub(text, (nl or start) + (if nl then 1 else 0))
 		lg.cut = true
+		-- The kept text starts elsewhere: measure it again.
+		lg.measured, lg.width = 0, 0
 	end
 	lg.text = text
+end
+
+-- Widest line the log can hold unwrapped, in cells: a terminal this wide (a `min.w`) stays bounded
+-- even when a program prints one huge line; longer lines wrap.
+local LOG_MAX_CELLS = 1000
+
+-- The log's widest line in terminal cells. Complete lines are measured once as the log grows
+-- (`measured`, `width`); only the unfinished last line is measured on every call.
+local function log_cells(lg: Log): number
+	local text = lg.text
+	local i = lg.measured + 1
+	-- Bounded by the text: every pass moves `i` past a newline.
+	while true do
+		local nl = string.find(text, "\n", i, true)
+		if nl == nil then
+			break
+		end
+		lg.width = math.max(lg.width, util.cells(string.sub(text, i, nl - 1)))
+		i = nl + 1
+	end
+	lg.measured = i - 1
+	return math.min(LOG_MAX_CELLS, math.max(lg.width, util.cells(string.sub(text, i))))
 end
 
 function pull(st: State)
@@ -333,9 +385,23 @@ function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
 		unsubscribe = nil,
 		tab = if type(s.tab) == "string" and TAB_IDS[s.tab] then s.tab else "overview",
 		run_id = if type(s.run_id) == "string" then s.run_id else nil,
+		wf_id = if type(s.wf_id) == "string" then s.wf_id else nil,
 		filter = if s.filter == "active" or s.filter == "failed" then s.filter else "all",
 		form = nil,
-		log = { id = nil, text = "", offset = 0, eof = false, done = false, gen = 0, busy = false, timer = nil, cut = false },
+		log = {
+			id = nil,
+			text = "",
+			offset = 0,
+			eof = false,
+			done = false,
+			gen = 0,
+			busy = false,
+			timer = nil,
+			cut = false,
+			measured = 0,
+			width = 0,
+		},
+		log_wrap = s.log_wrap ~= false,
 		cols = cx.cols,
 		rows = cx.rows,
 		editor = nil,
@@ -343,7 +409,8 @@ function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
 		app_org = nil,
 		app_focus = false,
 		app_busy = false,
-		app_confirm = false,
+		confirm = nil,
+		confirm_at = nil,
 	}
 	if st.run_id and c.store.by_id[st.run_id] == nil then
 		st.run_id = nil
@@ -386,7 +453,7 @@ function M.title(st: State): string?
 end
 
 function M.save(st: State): any
-	return { tab = st.tab, run_id = st.run_id, filter = st.filter }
+	return { tab = st.tab, run_id = st.run_id, wf_id = st.wf_id, filter = st.filter, log_wrap = st.log_wrap }
 end
 
 function M.resize(st: State, cols: number, rows: number)
@@ -395,6 +462,7 @@ end
 
 local function select_run(st: State, id: string?)
 	st.run_id = id
+	st.confirm = nil
 	if id ~= st.log.id then
 		reset_log(st, id)
 	end
@@ -431,30 +499,44 @@ local function header(st: State): Node
 	if issues > 0 then
 		table.insert(badges, keyed(with(ui.badge(`{issues} 个配置错误`, "error"), { actions = { click = "tab=config" } }), "issues"))
 	end
-	return N("row", { key = "head", role = "roost.header", justify = "between", align = "center", gap = "md" }, {
-		N("row", { key = "title", gap = "sm", align = "center" }, {
-			ui.text({ ui.span("Roost", "title"), ui.span(`  v{core.VERSION}`, "muted") }),
-			N("row", { key = "badges", gap = "xs" }, badges),
-		}),
-		N("row", { key = "tools", gap = "xs" }, {
-			btn("", "sidebar", { icon = "omp", variant = "quiet", title = "会话侧栏:Roost 运行过的 omp 会话", key = "sidebar" }),
-			btn("", "reload_files", { icon = "repeat", variant = "quiet", title = "重新读取配置文件", key = "reload" }),
-			btn("", "open=workflows", { icon = "file-code", variant = "quiet", title = "编辑 workflows.toml", key = "edit" }),
-		}),
+	local meta = `   v{core.VERSION}`
+	if c.workflows then
+		meta ..= ` · {#c.workflows.list} 个工作流`
+	end
+	local host = string.match(c.config.relay.url or "", "^%a+://([^/]+)")
+	if host then
+		meta ..= ` · {host}`
+	end
+	local tools: { Node } = badges
+	table.insert(tools, btn("", "sidebar", { icon = "omp", variant = "quiet", size = "md", title = "会话侧栏:Roost 运行过的 omp 会话", key = "sidebar" }))
+	table.insert(tools, btn("", "reload_files", { icon = "repeat", variant = "quiet", size = "md", title = "重新读取配置文件", key = "reload" }))
+	return N("row", { key = "head", role = "roost.header", justify = "between", align = "center" }, {
+		ui.text({ ui.span("Roost", "title"), ui.span(meta, "muted") }),
+		N("row", { key = "end", gap = "sm", align = "center" }, tools),
 	})
 end
 
 -- ---------------------------------------------------------------------------------------------
 -- Overview
 
+-- What a run was about beyond its workflow: the event's summary; manual and scheduled runs
+-- have none (their title only repeats the workflow and trigger).
+local function run_subject(r: store.Run): string?
+	return if r.event then r.title else nil
+end
+
 local function run_row(r: store.Run, t: number): any
 	local trig = r.trigger.kind
+	local subject = run_subject(r)
+	local name: { any } = { ui.span(r.workflow_name) }
+	if subject then
+		table.insert(name, ui.span(`  {subject}`, "muted"))
+	end
 	return {
 		id = r.id,
 		cells = list_of(
-			{ badge = { text = STATE_LABEL[r.state] or r.state, tone = STATE_TONE[r.state] or "muted" } },
-			r.workflow_name,
-			r.title,
+			{ text = STATE_LABEL[r.state] or r.state, dot = STATE_TONE[r.state] or "muted" },
+			{ text = name },
 			{ text = TRIGGER_LABEL[trig] or trig, icon = TRIGGER_ICON[trig] or "dot" },
 			util.ago(r.created_at, t),
 			duration(r.started_at, r.finished_at)
@@ -464,53 +546,183 @@ local function run_row(r: store.Run, t: number): any
 end
 
 local RUN_COLS: { Col } = {
-	{ id = "state", head = "状态" },
-	{ id = "workflow", head = "工作流", priority = 2 },
-	{ id = "title", head = "标题", grow = 1, truncate = "end" },
-	{ id = "trigger", head = "触发", priority = 1 },
-	{ id = "at", head = "创建", priority = 1 },
-	{ id = "took", head = "耗时", align = "end", mono = true, priority = 3 },
+	{ id = "state", head = "状态", priority = 8 },
+	{ id = "run", head = "运行", grow = 1, truncate = "end", priority = 9 },
+	{ id = "trigger", head = "触发", priority = 3 },
+	{ id = "at", head = "创建", align = "end", priority = 5 },
+	{ id = "took", head = "耗时", align = "end", mono = true, priority = 7 },
 }
+
+-- Days the overview's trends cover.
+local TREND_DAYS = 14
+
+-- A section's title on the page: the name, then muted facts.
+local function heading(key: string, title: string, sub: string?): Node
+	return keyed(ui.text({ ui.span(title, "strong"), ui.span(if sub then `   {sub}` else "", "muted") }), key)
+end
+
+local function secs(v: number?): string
+	return if v then util.fmt_duration(v) else "—"
+end
+
+local function trend_charts(st: State, days: { stats.Day }): Node
+	local labels, ok, bad, p50, p95 = {}, {}, {}, {}, {}
+	local any = false
+	for i, d in days do
+		labels[i] = d.label
+		ok[i] = { value = d.ok, title = `{d.label} · 成功 {d.ok}` }
+		bad[i] = { value = d.bad, title = `{d.label} · 失败 {d.bad}` }
+		-- A day without finished runs is a gap in the duration lines.
+		p50[i] = if d.p50 then { value = d.p50, title = `{d.label} · P50 {secs(d.p50)}` } else { title = `{d.label} · 无运行` }
+		p95[i] = if d.p95 then { value = d.p95, title = `{d.label} · P95 {secs(d.p95)}` } else { title = `{d.label} · 无运行` }
+		any = any or d.ok + d.bad + d.other > 0
+	end
+	if not any then
+		return N("empty", {
+			key = "trends",
+			variant = "inline",
+			icon = "activity",
+			title = `近 {TREND_DAYS} 天没有运行`,
+			text = "到「工作流」手动运行一次,或等待定时 / GitHub 事件。",
+		})
+	end
+	local runs_chart = N("col", { key = "runs", gap = "sm", grow = 1, basis = 0 }, {
+		heading("h", "运行次数", `近 {TREND_DAYS} 天`),
+		N("chart", {
+			key = "chart",
+			kind = "line",
+			labels = labels,
+			series = {
+				{ label = "成功", token = "success", values = ok },
+				{ label = "失败", token = "error", values = bad },
+			},
+		}),
+	})
+	local took_chart = N("col", { key = "took", gap = "sm", grow = 1, basis = 0 }, {
+		heading("h", "运行耗时", "P50 / P95"),
+		N("chart", {
+			key = "chart",
+			kind = "line",
+			unit = "s",
+			labels = labels,
+			series = {
+				{ label = "P50", token = "accent", values = p50 },
+				{ label = "P95", token = "warning", values = p95 },
+			},
+		}),
+	})
+	if st.cols < 110 then
+		return N("col", { key = "trends", gap = "lg" }, { runs_chart, took_chart })
+	end
+	return N("row", { key = "trends", gap = "lg", align = "stretch" }, { runs_chart, took_chart })
+end
+
+-- One row per workflow: how it has been doing (the services table of an APM).
+local function health_table(st: State, t: number): Node
+	local c = st.core
+	local w = c.workflows
+	local health = stats.health(c.store.runs, t, TREND_DAYS)
+	local latest = store.latest(c.store)
+	local rows = {}
+	local list: { model.Workflow } = if w then w.list else {}
+	for _, wf in list do
+		local h = health[wf.id]
+		local last = latest[wf.id]
+		local spark: { number } = if h then h.daily else table.create(TREND_DAYS, 0)
+		local nxt: number? = nil
+		for _, row in c.crons do
+			if row.workflow == wf.id and row.next and (nxt == nil or row.next < (nxt :: number)) then
+				nxt = row.next
+			end
+		end
+		local rate_cell: any = stats.percent(h and h.rate)
+		if h and h.bad > 0 then
+			rate_cell = { ui.span(rate_cell, if (h.rate or 0) < 0.8 then "error" else "warning") }
+		end
+		table.insert(rows, {
+			id = wf.id,
+			title = wf.description,
+			cells = list_of(
+				{
+					text = { ui.span(wf.name), ui.span(if wf.enabled then "" else "  已停用", "muted") },
+					dot = if last then STATE_TONE[last.state] or "muted" else "muted",
+				},
+				if h then tostring(h.runs) else "0",
+				rate_cell,
+				secs(h and h.p50),
+				secs(h and h.p95),
+				{ spark = { values = spark, tone = if h and h.bad > 0 then "warning" else "accent", title = `近 {TREND_DAYS} 天每日运行次数` } },
+				{ ui.span(if last then util.ago(last.created_at, t) else "—", "muted") },
+				{ ui.span(if nxt then util.until_(nxt, t) else "—", "muted") }
+			),
+		})
+	end
+	return keyed(
+		ui.table({
+			{ id = "name", head = "工作流", grow = 1, truncate = "end", priority = 9 },
+			{ id = "runs", head = "运行", align = "end", mono = true, priority = 7 },
+			{ id = "rate", head = "成功率", align = "end", mono = true, priority = 8 },
+			{ id = "p50", head = "P50", align = "end", mono = true, priority = 5 },
+			{ id = "p95", head = "P95", align = "end", mono = true, priority = 4 },
+			{ id = "trend", head = "趋势", priority = 2 },
+			{ id = "last", head = "最近运行", align = "end", priority = 3 },
+			{ id = "next", head = "下次", align = "end", priority = 1 },
+		}, rows :: any, { selectable = true, selected = st.wf_id, empty = "还没有工作流" }),
+		"health"
+	)
+end
 
 local function overview(st: State): Node
 	local c = st.core
 	local t = now()
-	local running, queued, ok, bad = 0, 0, 0, 0
+	local running, queued, ok, bad, total = 0, 0, 0, 0, 0
 	for _, r in c.store.runs do
 		if r.state == "running" then
 			running += 1
 		elseif r.state == "queued" then
 			queued += 1
-		elseif (r.finished_at or 0) >= t - 86400 then
-			if r.state == "success" then
+		end
+		if r.created_at >= t - 86400 then
+			total += 1
+			if stats.OK[r.state] then
 				ok += 1
-			elseif r.state == "failed" or r.state == "timed_out" then
+			elseif stats.BAD[r.state] then
 				bad += 1
 			end
 		end
 	end
-	local rate = if ok + bad > 0 then `{math.floor(ok * 100 / (ok + bad) + 0.5)}%` else "—"
 	local next_row = c.crons[1]
-	local next_txt = if next_row and next_row.next then util.until_(next_row.next, t) else "—"
-	local stats = ui.stats({
-		{ label = "运行中", value = tostring(running), tone = if running > 0 then "accent" else nil },
-		{ label = "排队", value = tostring(queued) },
-		{ label = "24 小时成功率", value = rate, sub = `{ok} 成功 · {bad} 失败`, tone = if bad > 0 then "warning" else nil },
-		{ label = "下一次定时", value = next_txt, sub = if next_row and next_row.next then next_row.name else "无定时触发" },
+	local tiles = ui.stats({
+		{
+			label = "运行中",
+			value = tostring(running),
+			tone = if running > 0 then "accent" else nil,
+			sub = if queued > 0 then `{queued} 个排队` else "没有排队",
+		},
+		{ label = "24 小时运行", value = tostring(total), sub = `{ok} 成功 · {bad} 失败` },
+		{
+			label = "24 小时成功率",
+			value = stats.percent(if ok + bad > 0 then ok / (ok + bad) else nil),
+			tone = if bad > 0 then "warning" else nil,
+			sub = "不含取消与跳过",
+		},
+		{
+			label = "下一次定时",
+			value = if next_row and next_row.next then util.until_(next_row.next, t) else "—",
+			sub = if next_row and next_row.next then next_row.name else "没有定时触发",
+		},
 	})
-
-	local recent = store.list(c.store, 8, nil)
-	local rows = {}
-	for _, r in recent do
-		table.insert(rows, run_row(r, t))
-	end
-	local runs_card = ui.card("最近运行", {
-		keyed(ui.table(RUN_COLS, rows :: any, { selectable = true, empty = "还没有运行。到「工作流」手动运行一次,或等待定时 / GitHub 事件。" }), "recent"),
-	}, { icon = "history", key = "recent_card" })
-
+	local children: { Node } = {
+		keyed(tiles, "stats"),
+		trend_charts(st, stats.days(c.store.runs, t, TREND_DAYS)),
+		N("col", { key = "health_view", gap = "sm" }, {
+			heading("h", "工作流", `近 {TREND_DAYS} 天 · 双击打开`),
+			health_table(st, t),
+		}),
+	}
 	local cron_items: { Node } = {}
 	for _, row in c.crons do
-		if #cron_items >= 8 then
+		if #cron_items >= 5 then
 			break
 		end
 		table.insert(
@@ -519,21 +731,21 @@ local function overview(st: State): Node
 				key = row.key,
 				label = row.name,
 				detail = { ui.span(row.desc), ui.span(`  {row.expr}{if row.utc then " UTC" else ""}`, "muted mono") },
-				value = if row.next then util.until_(row.next, t) elseif row.enabled then "—" else "已停用",
+				value = if row.next then `{util.clock(row.next)} · {util.until_(row.next, t)}` elseif row.enabled then "—" else "已停用",
 				icon = "clock",
 				tone = if row.enabled then nil else "muted",
 			})
 		)
 	end
-	local cron_card = ui.card("即将触发", {
-		if #cron_items > 0
-			then N("list", { key = "crons" }, cron_items)
-			else N("empty", { key = "crons", variant = "inline", title = "没有定时触发", text = "在工作流里添加 [[workflow.trigger]] cron = \"…\"" }),
-	}, { icon = "clock", key = "cron_card" })
-
+	if #cron_items > 0 then
+		table.insert(children, N("col", { key = "cron_view", gap = "sm" }, {
+			heading("h", "即将触发"),
+			N("list", { key = "crons" }, cron_items),
+		}))
+	end
 	local notice_items: { Node } = {}
 	for i, n in c.notices do
-		if i > 6 then
+		if i > 5 then
 			break
 		end
 		table.insert(
@@ -547,271 +759,594 @@ local function overview(st: State): Node
 			})
 		)
 	end
-	local children: { Node } = { keyed(stats, "stats"), runs_card, cron_card }
 	if #notice_items > 0 then
-		table.insert(children, ui.card("通知", { N("list", { key = "notices" }, notice_items) }, { icon = "bell", key = "notice_card" }))
+		table.insert(children, N("col", { key = "notice_view", gap = "sm" }, {
+			heading("h", "通知"),
+			N("list", { key = "notices" }, notice_items),
+		}))
 	end
-	return N("col", { key = "overview", role = "roost.overview", gap = "md" }, children)
+	return N("col", { key = "overview", role = "roost.overview", gap = "lg" }, children)
 end
 
 -- ---------------------------------------------------------------------------------------------
 -- Runs
 
-local function steps_table(r: store.Run): Node
+-- Span-token colors of a step's bar in the waterfall.
+local BAR_TOKEN: { [string]: string } = {
+	running = "accent",
+	success = "success",
+	failed = "error",
+	timed_out = "error",
+	cancelled = "warning",
+	skipped = "muted",
+}
+
+-- A run's steps as a waterfall (a trace's spans): each bar starts where its step started within
+-- the run and is as long as the step took.
+local function steps_table(r: store.Run, t: number): Node
+	local from = r.started_at or r.created_at
+	local span = math.max(1, (r.finished_at or t) - from)
 	local rows = {}
 	for i, s in r.steps do
+		local label = STATE_LABEL[s.state] or s.state
+		if s.exit_code and s.exit_code ~= 0 then
+			label ..= ` · {s.exit_code}`
+		end
+		local bar: any = ""
+		if s.started_at then
+			-- At least a visible sliver, so a step that took no time at the run's end still shows.
+			local off = math.clamp((s.started_at - from) / span, 0, 0.99)
+			local len = math.clamp(((s.finished_at or t) - s.started_at) / span, 0.01, 1 - off)
+			bar = {
+				meter = {
+					parts = {
+						{ value = off, token = "track" },
+						{ value = len, token = BAR_TOKEN[s.state] or "muted", label = s.name },
+					},
+					title = `+{util.fmt_duration(s.started_at - from)} 开始 · 用时 {duration(s.started_at, s.finished_at)}`,
+				},
+			}
+		end
+		local state: any = { text = label, dot = STATE_TONE[s.state] or "muted" }
+		-- Agent steps only: a shell step never has a tally. Compact, in the existing state cell.
+		if (s.kind == "omp" or s.agent == true) and s.tokens ~= nil and s.tokens > 0 then
+			state.text = {
+				ui.span(label),
+				ui.span(`  {fmt_usd(s.cost or 0)} · {fmt_tokens(s.tokens)}`, "muted"),
+			}
+		end
 		table.insert(rows, {
 			id = `s{i}`,
 			cells = list_of(
 				{ text = s.name, icon = STEP_ICON[s.kind] or "dot" },
-				{ badge = { text = STATE_LABEL[s.state] or s.state, tone = STATE_TONE[s.state] or "muted" } },
-				if s.exit_code then tostring(s.exit_code) else "",
+				state,
+				bar,
 				duration(s.started_at, s.finished_at)
 			),
 		})
 	end
 	return keyed(
 		ui.table({
-			{ id = "name", head = "步骤", grow = 1 },
-			{ id = "state", head = "状态" },
-			{ id = "code", head = "退出码", align = "end", mono = true, priority = 1 },
-			{ id = "took", head = "耗时", align = "end", mono = true, priority = 2 },
+			{ id = "name", head = "步骤", truncate = "end", priority = 9 },
+			{ id = "state", head = "状态", priority = 8 },
+			{ id = "bar", head = "时间线", grow = 1, priority = 2 },
+			{ id = "took", head = "耗时", align = "end", mono = true, priority = 7 },
 		}, rows :: any),
 		"steps"
 	)
 end
 
-local function run_detail(st: State, r: store.Run): Node
-	local t = now()
-	local active = r.state == "queued" or r.state == "running"
-	local actions: { Node } = {}
-	if active then
-		table.insert(actions, btn("取消", `cancel={r.id}`, { variant = "danger", icon = "stop", keys = { "c" }, key = "cancel" }))
-	else
-		table.insert(actions, btn("重跑", `rerun={r.id}`, { icon = "redo", keys = { "r" }, key = "rerun" }))
-	end
-	table.insert(actions, btn("日志文件", `open-log={r.id}`, { icon = "file", variant = "quiet", key = "log" }))
-	for i = #r.steps, 1, -1 do
-		local s = r.steps[i]
-		if s.agent then
-			table.insert(actions, btn("omp 会话", `session={r.id}:{i}`, { icon = "omp", variant = "quiet", key = "session" }))
-			break
-		end
-	end
-	if r.cwd and r.workspace ~= "temp" then
-		table.insert(actions, btn("工作区", `open-ws={r.id}`, { icon = "folder-open", variant = "quiet", key = "ws" }))
+-- Lines the page head, the page tabs, their gaps and the key legend take: the narrow runs page
+-- (one column, no split) bounds its list and log by what is left.
+local CHROME_LINES = 9
+
+local function pane_lines(st: State): number
+	return math.max(18, st.rows - CHROME_LINES)
+end
+
+-- Wide enough for the runs page's list | detail split. The split then fills the block below the
+-- tabs (roost.css: `roost.fill`, the split, `roost.runlist`, `roost.run`, `roost.log`), so the run
+-- list and the log scroll inside their panes: a height counted in lines can't match the pixels the
+-- head and tabs take, and a long log scrolled the whole page.
+local function runs_split(st: State): boolean
+	return st.cols >= 110
+end
+
+-- A detail pane's head: the item's name and muted facts at the left, its state and actions at
+-- the right (the split already frames the pane, so no card around it).
+local function pane_head(title: { any }, right: { Node }): Node
+	return N("row", { key = "head", justify = "between", align = "center", gap = "md" }, {
+		ui.text(title),
+		N("row", { key = "end", gap = "sm", align = "center" }, right),
+	})
+end
+
+-- The run's facts as one aligned key/value grid (the design guide's detail facts): why it ended
+-- first, then where it came from, who it acts as, what it was given, when and what it cost. Its
+-- took is in the head. Returns the node and its row count (the narrow page sizes the log by it).
+local function run_facts(r: store.Run, t: number): (Node, number)
+	local items: { any } = {}
+	if r.reason then
+		local calm = r.state == "success" or r.state == "skipped"
+		table.insert(items, pair(if calm then "说明" else "原因", { ui.span(r.reason, if calm then "muted" else "warning") }))
 	end
 	local trig = r.trigger.kind
-	local items: any = {
-		{ "工作流", r.workflow_name },
-		{ "触发", `{TRIGGER_LABEL[trig] or trig} · {r.trigger.detail}` },
-	}
+	local label = TRIGGER_LABEL[trig] or trig
+	if r.event then
+		-- An event run's summary is already in the head: its link is what's left to show.
+		local trigger: { any } = { ui.span(label) }
+		if r.event.url then
+			local short = string.gsub(r.event.url, "^https://github%.com/", "")
+			table.insert(trigger, ui.span("  "))
+			table.insert(trigger, ui.link(short, r.event.url))
+		end
+		table.insert(items, pair("触发", trigger))
+	else
+		table.insert(items, pair("触发", { ui.span(label), ui.span(`  {r.trigger.detail}`, "muted") }))
+	end
 	if r.repo then
 		table.insert(items, pair("仓库", { ui.span(r.repo, "mono"), ui.span(`  @ {r.fetch_ref or r.ref or "HEAD"}`, "muted mono") }))
 	end
-	if r.event and r.event.url then
-		table.insert(items, pair("链接", { ui.link(r.event.url, r.event.url) }))
+	if r.identity == "app" then
+		table.insert(items, pair("身份", { ui.span(if r.app then r.app.login else "GitHub App", "mono"), ui.span("  App 令牌", "muted") }))
 	end
 	local inputs = {}
 	for _, k in util.keys(r.inputs) do
-		table.insert(inputs, `{k}={r.inputs[k]}`)
+		local v = r.inputs[k]
+		table.insert(inputs, if v == "" then `{k}=""` else `{k}={v}`)
 	end
 	if #inputs > 0 then
 		table.insert(items, pair("输入", { ui.span(table.concat(inputs, "  "), "mono") }))
 	end
-	table.insert(items, { "创建", `{util.clock(r.created_at)} ({util.ago(r.created_at, t)})` })
-	if r.started_at then
-		table.insert(items, { "开始", util.clock(r.started_at) })
+	table.insert(items, pair("创建", { ui.span(util.clock(r.created_at), "mono"), ui.span(`  {util.ago(r.created_at, t)}`, "muted") }))
+	local cost, tokens = stats.run_cost(r)
+	if tokens ~= nil and tokens > 0 then
+		table.insert(items, pair("费用", {
+			ui.span(`{fmt_usd(cost or 0)} · {fmt_tokens(tokens)} tokens`, "mono"),
+			ui.span("  估算", "muted"),
+		}))
 	end
-	if r.finished_at then
-		table.insert(items, { "结束", `{util.clock(r.finished_at)} · 用时 {duration(r.started_at, r.finished_at)}` })
+	return keyed(ui.kv(items :: any), "facts"), #items
+end
+
+local function run_detail(st: State, r: store.Run, fill: boolean): Node
+	local t = now()
+	local active = r.state == "queued" or r.state == "running"
+	local primary = if active
+		then btn("取消", `cancel={r.id}`, { variant = "danger", icon = "stop", keys = { "c" }, key = "cancel" })
+		else btn("重跑", `rerun={r.id}`, { variant = "primary", icon = "redo", keys = { "r" }, key = "rerun" })
+	local tools: { Node } = {}
+	for i = #r.steps, 1, -1 do
+		local s = r.steps[i]
+		if s.agent then
+			table.insert(tools, btn("omp 会话", `session={r.id}:{i}`, { icon = "omp", variant = "quiet", key = "session" }))
+			break
+		end
 	end
-	if r.reason then
-		table.insert(items, pair("原因", { ui.span(r.reason, if r.state == "success" then "muted" else "warning") }))
+	table.insert(tools, btn("日志文件", `open-log={r.id}`, { icon = "file", variant = "quiet", key = "log" }))
+	table.insert(tools, btn("自动换行", "log-wrap", {
+		icon = "align-left",
+		variant = "quiet",
+		on = st.log_wrap,
+		key = "wrap",
+		title = if st.log_wrap then "日志按窗格宽度换行;关闭后长行横向滚动" else "长行横向滚动;打开后按窗格宽度换行",
+	}))
+	if store.TERMINAL[r.state] then
+		table.insert(tools, confirm_btn(st, "删除", "确认删除", `delete-run:{r.id}`, {
+			icon = "trash",
+			variant = "quiet",
+			key = "delete",
+			title = "删除这条运行的记录、日志、事件负载、omp 会话与遗留 worktree",
+		}))
 	end
+	if r.cwd and r.workspace ~= "temp" then
+		table.insert(tools, btn("工作区", `open-ws={r.id}`, { icon = "folder-open", variant = "quiet", key = "ws" }))
+	end
+	local facts, fact_rows = run_facts(r, t)
 	local lg = st.log
 	local log_body: Node
 	if lg.id == r.id and (lg.text ~= "" or lg.eof) then
-		log_body = N("scroll", { key = "log", role = "roost.log", stick = "end", max = { h = `{math.max(10, st.rows - 24)}lines` } }, {
-			N("ansi", { key = "text", text = if lg.text == "" then "(还没有输出)" else lg.text }),
+		-- The terminal sits in a col: an `ansi` ignores a `min` of its own, a layout node takes it.
+		local frame: { [string]: any } = { key = "term" }
+		if not st.log_wrap then
+			-- As wide as the widest line (and a little, in case a cell is wider than a `ch`): the
+			-- terminal wraps at its col's width, and the log's view scrolls it sideways (roost.css).
+			frame.min = { w = `{log_cells(lg) + 2}ch` }
+		end
+		local p: { [string]: any } = { key = "log", role = "roost.log", stick = "end" }
+		if not fill then
+			-- The rest of the column under the head, the facts, the steps and the tools. In the split,
+			-- roost.css gives the log what the pane leaves instead.
+			p.max = { h = `{math.max(8, pane_lines(st) - 9 - fact_rows - math.ceil(#r.steps * 1.3))}lines` }
+		end
+		log_body = N("scroll", p, {
+			N("col", frame, {
+				N("ansi", { key = "text", text = if lg.text == "" then "(还没有输出)" else lg.text }),
+			}),
 		})
 	else
-		log_body = N("spinner", { key = "log", style = "dots", label = { ui.span("读取日志…", "muted") } })
+		log_body = N("skeleton", { key = "log", shape = "text", lines = 4 })
 	end
-	local head_spans = { ui.span(r.title, "strong") }
-	local body: { Node } = {
-		N("row", { key = "state", gap = "sm", align = "center" }, {
-			keyed(state_badge(r.state), "badge"),
-			if r.state == "running" and r.started_at
-				then N("elapsed", { key = "elapsed", age = math.max(0, t - r.started_at) * 1000, format = "short" })
-				else ui.text({ ui.span(r.id, "muted mono") }),
-			N("row", { key = "actions", gap = "xs" }, actions),
-		}),
-		keyed(ui.kv(items :: any), "info"),
-		steps_table(r),
+	local subject = run_subject(r)
+	local title: { any } = { ui.span(r.workflow_name, "strong") }
+	if subject then
+		table.insert(title, ui.span(`   {subject}`, "muted"))
+	end
+	local took = if r.state == "running" and r.started_at
+		then N("elapsed", { key = "took", age = math.max(0, t - r.started_at) * 1000, format = "short" })
+		else ui.text({ ui.span(duration(r.started_at, r.finished_at), "muted mono") })
+	return N("col", { key = "run", role = "roost.run", gap = "md" }, {
+		pane_head(title, { keyed(state_badge(r.state), "state"), keyed(took, "took"), primary }),
+		facts,
+		steps_table(r, t),
+		N("row", { key = "tools", gap = "sm", align = "center" }, tools),
 		keyed(ui.rule(if lg.cut then "日志(仅显示最近 512 KiB)" else "日志"), "rule"),
 		log_body,
-	}
-	return ui.card(head_spans, body, { key = "run", role = "roost.run", icon = TRIGGER_ICON[trig] or "run" })
+	})
 end
 
 local function runs_tab(st: State): Node
 	local t = now()
 	local rows = {}
-	for _, r in runs_list(st) do
+	local list = runs_list(st)
+	for _, r in list do
 		table.insert(rows, run_row(r, t))
 	end
-	local left = N("col", { key = "left", gap = "sm" }, {
-		N("tabs", {
-			key = "filter",
-			variant = "segmented",
-			active = st.filter,
-			items = { { id = "all", label = "全部" }, { id = "active", label = "进行中" }, { id = "failed", label = "失败" } },
+	local running, failed = 0, 0
+	for _, r in st.core.store.runs do
+		if r.state == "running" or r.state == "queued" then
+			running += 1
+		elseif r.state == "failed" or r.state == "timed_out" then
+			failed += 1
+		end
+	end
+	local fill = runs_split(st)
+	-- In the split, roost.css makes the list fill its pane (`roost.runlist`); one column bounds it.
+	local lp: { [string]: any } = { key = "list" }
+	if not fill then
+		lp.max = { h = `{pane_lines(st) - 3}lines` }
+	end
+	local left = N("col", { key = "left", role = "roost.runlist", gap = "sm" }, {
+		N("row", { key = "bar", justify = "between", align = "center" }, {
+			ui.text({ ui.span(`{#list} 条运行`, "muted") }),
+			N("tabs", {
+				key = "filter",
+				variant = "segmented",
+				active = st.filter,
+				items = list_of(
+					{ id = "all", label = "全部" },
+					{ id = "active", label = { ui.span("进行中 "), ui.span(tostring(running), "muted") } },
+					{ id = "failed", label = { ui.span("失败 "), ui.span(tostring(failed), "muted") } }
+				),
+			}),
 		}),
-		keyed(
-			ui.table(RUN_COLS, rows :: any, { selectable = true, selected = st.run_id, empty = "没有符合条件的运行" }),
-			"runs"
-		),
+		N("scroll", lp, {
+			keyed(
+				ui.table(RUN_COLS, rows :: any, { selectable = true, selected = st.run_id, empty = "没有符合条件的运行" }),
+				"runs"
+			),
+		}),
 	})
 	local r = selected_run(st)
 	local right = if r
-		then run_detail(st, r)
-		else N("empty", { key = "run", title = "选择一条运行", text = "j / k 选择,c 取消,r 重跑" })
-	if st.cols < 110 then
-		return N("col", { key = "runs", role = "roost.runs", gap = "md" }, { left, right })
+		then run_detail(st, r, fill)
+		else N("empty", { key = "run", icon = "activity", title = "选择一条运行", text = "j / k 选择,c 取消,r 重跑" })
+	if not fill then
+		return N("col", { key = "runs", role = "roost.runs", gap = "lg" }, { left, right })
 	end
-	return N("split", { key = "runs", role = "roost.runs", sizes = { 0.46, 0.54 }, variant = "hairline" }, { left, right })
+	return N("split", {
+		key = "runs",
+		role = "roost.runs",
+		sizes = { 0.4, 0.6 },
+		min = { "40ch", "60ch" },
+		grow = 1,
+		variant = "hairline",
+	}, { left, right })
 end
 
 -- ---------------------------------------------------------------------------------------------
 -- Workflows
 
+-- The repositories every trigger shares (nil when they differ), and all of them together.
+local function workflow_repos(wf: model.Workflow): ({ string }?, { string })
+	local shared: { string }? = nil
+	local same = true
+	local all: { string } = {}
+	local seen: { [string]: boolean } = {}
+	for _, tr in wf.triggers do
+		local repos = model.trigger_repos(tr)
+		if shared == nil then
+			shared = repos
+		elseif not util.equal(shared, repos) then
+			same = false
+		end
+		for _, repo in repos do
+			if not seen[repo] then
+				seen[repo] = true
+				table.insert(all, repo)
+			end
+		end
+	end
+	return if same then shared else nil, all
+end
+
+-- The workflow the keys act on: the one picked with j/k or on the overview; none until then, so
+-- no card wears the selection ring by default.
+local function selected_workflow(st: State, w: model.Workflows): model.Workflow?
+	return if st.wf_id then w.by_id[st.wf_id] else nil
+end
+
+local function next_fire(c: core.Core, id: string): number?
+	local best: number? = nil
+	for _, row in c.crons do
+		if row.workflow == id and row.next and (best == nil or row.next < best) then
+			best = row.next
+		end
+	end
+	return best
+end
+
+-- Repositories on one line: up to two names, then how many there are.
+local function repos_line(all: { string }): string
+	if #all <= 2 then
+		return table.concat(all, "、")
+	end
+	return `{all[1]}、{all[2]} 等 {#all} 个`
+end
+
+-- How many recent runs a card's history strip shows.
+local HISTORY = 24
+
+-- One workflow as a card among its siblings: what fires it, where, its steps, then how it has
+-- been doing (the last run, the rate, a strip of recent runs colored by outcome).
+local function workflow_card(st: State, wf: model.Workflow, health: stats.Health?, t: number, basis: number, picked: boolean): Node
+	local c = st.core
+	local items: { any } = {}
+	local shared, all = workflow_repos(wf)
+	for i, tr in wf.triggers do
+		table.insert(items, { if i == 1 then "触发" else "", model.describe_trigger(tr, shared ~= nil) })
+	end
+	if #wf.triggers == 0 then
+		table.insert(items, pair("触发", { ui.span("仅手动运行", "muted") }))
+	end
+	if shared and #all > 0 then
+		table.insert(items, pair("仓库", { ui.span(repos_line(all), "mono") }))
+	end
+	local step_spans: { any } = {}
+	for i, s in wf.steps do
+		if i > 1 then
+			table.insert(step_spans, ui.span("  →  ", "muted"))
+		end
+		table.insert(step_spans, ui.span(s.name, if s.kind == "omp" then "accent" else nil))
+		if s.when then
+			table.insert(step_spans, ui.span(` {when_label(s.when)}`, "muted"))
+		end
+	end
+	table.insert(items, pair("步骤", step_spans))
+	local spent = stats.cost_since(c.store.runs, wf.id, stats.day_start(t))
+	if wf.daily_budget ~= nil or spent > 0 then
+		local text = fmt_usd(spent)
+		if wf.daily_budget ~= nil then
+			text ..= ` / 预算 {fmt_usd(wf.daily_budget)}`
+		end
+		table.insert(items, pair("今日费用", { ui.span(text, "mono") }))
+	end
+	local nxt = next_fire(c, wf.id)
+	if nxt then
+		table.insert(items, pair("下次", { ui.span(util.clock(nxt), "mono"), ui.span(`  {util.until_(nxt, t)}`, "muted") }))
+	end
+	local body: { Node } = {
+		N("row", { key = "end", gap = "sm", align = "center" }, {
+			btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }),
+			btn("运行", `dispatch={wf.id}`, {
+				icon = "play",
+				key = "run",
+				disabled = if not wf.manual then "manual = false:只允许自动触发" else false,
+			}),
+		}),
+	}
+	if wf.description then
+		table.insert(body, keyed(muted(wf.description), "desc"))
+	end
+	table.insert(body, keyed(ui.kv(items :: any), "info"))
+	local runs = store.list(c.store, HISTORY, wf.id)
+	local foot: { Node } = {}
+	if #runs > 0 then
+		local last = runs[1]
+		table.insert(foot, keyed(with(ui.text({
+			ui.span(`{STATE_LABEL[last.state] or last.state}`, STATE_TONE[last.state] or "muted"),
+			ui.span(` · {util.ago(last.created_at, t)}`, "muted"),
+		}), { actions = { click = `open-run={last.id}` }, title = "查看最近一次运行" }), "last"))
+		local strip = {}
+		for i = #runs, 1, -1 do
+			local r = runs[i]
+			table.insert(strip, {
+				value = 1,
+				tone = STATE_TONE[r.state] or "muted",
+				title = `{STATE_LABEL[r.state] or r.state} · {util.clock(r.created_at)} · {duration(r.started_at, r.finished_at)}`,
+			})
+		end
+		table.insert(foot, N("chart", { key = "history", kind = "spark", min = 0, max = 1, series = strip, grow = 1 }))
+		if health then
+			table.insert(foot, keyed(ui.text({ ui.span(`{TREND_DAYS} 天 {health.runs} 次 · 成功率 {stats.percent(health.rate)}`, "muted") }), "rate"))
+		end
+	else
+		table.insert(foot, keyed(muted("还没有运行"), "last"))
+	end
+	table.insert(body, keyed(ui.rule(""), "rule"))
+	table.insert(body, N("row", { key = "foot", gap = "md", align = "center" }, foot))
+	return ui.card({ ui.span(wf.name, "strong") }, body, {
+		key = wf.id,
+		role = "roost.workflow",
+		icon = wf.icon or if wf.enabled then "flow" else "pause",
+		meta = if wf.enabled then nil else "已停用",
+		tone = if wf.enabled then nil else "muted",
+		selected = picked,
+		basis = basis,
+		grow = 1,
+		["end"] = `main.body.workflows.cards.{wf.id}.end`,
+	})
+end
+
+local function workflows_toolbar(count: string?): Node
+	return N("row", { key = "bar", justify = "between", align = "center" }, {
+		ui.text({ ui.span(count or "", "muted") }),
+		N("row", { key = "end", gap = "sm", align = "center" }, {
+			btn("新建自动化", "editor-new", { icon = "plus", size = "md", key = "new" }),
+			editor.template_menu(),
+			btn("", "open=workflows", { variant = "quiet", icon = "file-code", size = "md", title = "编辑 workflows.toml", key = "file" }),
+		}),
+	})
+end
+
 local function workflows_tab(st: State): Node
 	local c = st.core
 	local w = c.workflows
-	local head = N("row", { key = "head", gap = "xs", align = "center" }, {
-		btn("新建自动化", "editor-new", { variant = "primary", icon = "sparkle", key = "new" }),
-		N("spacer", { key = "sp" }),
-		btn("编辑 workflows.toml", "open=workflows", { variant = "quiet", icon = "file", key = "file" }),
-	})
 	if not w then
-		return N("col", { key = "workflows", role = "roost.workflows", gap = "md" }, {
-			head,
+		return N("col", { key = "workflows", role = "roost.workflows", gap = "lg" }, {
+			workflows_toolbar(nil),
 			N("empty", {
 				key = "broken",
 				tone = "error",
+				icon = "warn",
 				title = "workflows.toml 还没有可用的版本",
 				text = "修好「配置」页列出的错误后自动加载。",
 			}),
 		})
 	end
-	local latest = store.latest(c.store)
+	if #w.list == 0 then
+		return N("col", { key = "workflows", role = "roost.workflows", gap = "lg" }, {
+			workflows_toolbar(nil),
+			N("empty", { key = "none", icon = "flow", title = "还没有工作流", text = "从下面的模板开始,或新建一个自动化。" }),
+			editor.templates(st),
+		})
+	end
 	local t = now()
+	local health = stats.health(c.store.runs, t, TREND_DAYS)
+	-- Cards per row by width; basis leaves room for the gaps.
+	local basis = if st.cols >= 190 then 0.31 elseif st.cols >= 110 then 0.48 else 1
+	local sel = selected_workflow(st, w)
 	local cards: { Node } = {}
+	local off = 0
 	for _, wf in w.list do
-		local body: { Node } = {}
-		if wf.description then
-			table.insert(body, keyed(muted(wf.description), "desc"))
+		if not wf.enabled then
+			off += 1
 		end
-		local trig_nodes: { Node } = {}
-		for i, tr in wf.triggers do
-			table.insert(trig_nodes, keyed(ui.text(model.describe_trigger(tr)), `t{i}`))
-		end
-		if #trig_nodes == 0 then
-			table.insert(trig_nodes, keyed(muted("仅手动运行"), "t0"))
-		end
-		table.insert(body, N("col", { key = "triggers", gap = "xs" }, trig_nodes))
-		local step_spans: { any } = {}
-		for i, s in wf.steps do
-			if i > 1 then
-				table.insert(step_spans, ui.span("  →  ", "muted"))
-			end
-			table.insert(step_spans, ui.span(s.name, if s.kind == "omp" then "accent" else nil))
-		end
-		table.insert(body, keyed(ui.text(step_spans), "steps"))
-		local last = latest[wf.id]
-		local meta = {
-			ui.span(`{wf.concurrency} · {wf.workspace}`, "muted"),
-		}
-		local row: { Node } = {
-			btn("运行", `dispatch={wf.id}`, {
-				variant = "primary",
-				icon = "play",
-				key = "run",
-				disabled = if not wf.manual then "manual = false:只允许自动触发" else false,
-			}),
-			btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }),
-		}
-		if last then
-			table.insert(row, keyed(with(state_badge(last.state), { actions = { click = `open-run={last.id}` }, title = "查看最近一次运行" }), "last"))
-			table.insert(row, keyed(muted(`最近 {util.ago(last.created_at, t)}`), "last_at"))
-		end
-		table.insert(body, N("row", { key = "actions", gap = "xs", align = "center" }, row))
-		table.insert(
-			cards,
-			ui.card(
-				{ ui.span(wf.name, "strong"), ui.span(if wf.enabled then "" else "  已停用", "muted") },
-				body,
-				{
-					key = wf.id,
-					role = "roost.workflow",
-					icon = wf.icon or if wf.enabled then "flow" else "pause",
-					meta = meta,
-					tone = if wf.enabled then nil else "muted",
-				}
-			)
-		)
+		table.insert(cards, workflow_card(st, wf, health[wf.id], t, basis, sel ~= nil and sel.id == wf.id))
 	end
-	local body: { Node } = { head, editor.templates(st) }
-	if #cards == 0 then
-		table.insert(body, N("empty", { key = "none", title = "还没有工作流", text = "从模板开始,或新建一个自动化。" }))
-	else
-		for _, card in cards do
-			table.insert(body, card)
-		end
-	end
-	return N("col", { key = "workflows", role = "roost.workflows", gap = "md" }, body)
+	local count = `{#w.list} 个工作流{if off > 0 then ` · {off} 个已停用` else ""}`
+	return N("col", { key = "workflows", role = "roost.workflows", gap = "lg" }, {
+		workflows_toolbar(count),
+		N("row", { key = "cards", gap = "lg", wrap = true, align = "stretch" }, cards),
+	})
 end
 
 -- ---------------------------------------------------------------------------------------------
 -- Events
+
+-- How long a retention age is, for people ("30 天"; 0: no limit).
+local function fmt_age(sec: number): string
+	if sec <= 0 then
+		return "不限时长"
+	end
+	if sec % 86400 == 0 then
+		return `{sec // 86400} 天`
+	end
+	return util.fmt_duration(sec)
+end
+
+local RUN_STATES = { "running", "queued", "success", "failed", "timed_out", "cancelled", "interrupted", "skipped" }
+
+-- The result cell of an event: the runs it started (with how they went), else why not.
+local function event_result(c: core.Core, e: core.EventRow): any
+	if #e.runs == 0 then
+		local why = {}
+		for wf, reason in e.reasons do
+			table.insert(why, if wf == "*" then reason else `{wf}:{reason}`)
+		end
+		table.sort(why)
+		return { text = if #why > 0 then why[1] else "无匹配的工作流", dot = "muted", title = table.concat(why, "\n") }
+	end
+	if #e.runs == 1 then
+		local r = c.store.by_id[e.runs[1]]
+		if r == nil then
+			return { text = "已触发运行(记录已清理)", dot = "muted" }
+		end
+		return {
+			text = `{r.workflow_name} · {STATE_LABEL[r.state] or r.state}`,
+			dot = STATE_TONE[r.state] or "muted",
+			title = "选中这一行打开运行",
+		}
+	end
+	local counts: { [string]: number } = {}
+	local gone = 0
+	for _, id in e.runs do
+		local r = c.store.by_id[id]
+		if r then
+			counts[r.state] = (counts[r.state] or 0) + 1
+		else
+			gone += 1
+		end
+	end
+	local parts = {}
+	for _, s in RUN_STATES do
+		if counts[s] then
+			table.insert(parts, `{counts[s]} {STATE_LABEL[s]}`)
+		end
+	end
+	if gone > 0 then
+		table.insert(parts, `{gone} 已清理`)
+	end
+	local bad = (counts.failed or 0) + (counts.timed_out or 0) > 0
+	local live = (counts.running or 0) + (counts.queued or 0) > 0
+	return {
+		text = `{#e.runs} 个运行 · {table.concat(parts, " ")}`,
+		dot = if bad then "error" elseif live then "accent" else "success",
+		title = "选中这一行打开第一个运行",
+	}
+end
 
 local function events_tab(st: State): Node
 	local c = st.core
 	local t = now()
 	local rows = {}
 	for _, e in c.events do
-		local result: any
-		if #e.runs > 0 then
-			result = { text = `启动 {#e.runs} 个运行`, dot = "success" }
-		else
-			local why = {}
-			for wf, reason in e.reasons do
-				table.insert(why, if wf == "*" then reason else `{wf}:{reason}`)
-			end
-			table.sort(why)
-			result = { text = if #why > 0 then why[1] else "无匹配的工作流", dot = "muted", title = table.concat(why, "\n") }
-		end
 		table.insert(rows, {
-			id = `e{e.seq}`,
-			cells = { util.ago(e.at, t), e.summary, e.repo or "—", result },
+			id = `d:{e.delivery}`,
+			cells = { util.ago(e.at, t), e.summary, e.repo or "—", event_result(c, e) },
 			title = e.url,
 		})
 	end
 	local rs = c.relay.state
+	local k = c.config.retention
 	local note = if not rs.configured
 		then "中继未配置:只有本机的定时与手动运行。"
 		elseif rs.waiting then "workflows.toml 无效,暂停领取中继事件。"
 		else `中继游标 {rs.head or "—"} · 最近事件 {util.ago(rs.last_event, t)}`
 	return N("col", { key = "events", role = "roost.events", gap = "sm" }, {
-		keyed(muted(note), "note"),
+		N("row", { key = "bar", justify = "between", align = "center", gap = "sm" }, {
+			keyed(muted(`{note} · 保留 {k.events} 条 / {fmt_age(k.event_age)}`), "note"),
+			N("row", { key = "end", gap = "sm", align = "center" }, {
+				confirm_btn(st, "清空记录", "确认清空", "clear-events", {
+					key = "clear",
+					variant = "quiet",
+					icon = "trash",
+					disabled = if #c.events == 0 then "没有记录" else false,
+				}),
+			}),
+		}),
 		keyed(
 			ui.table({
 				{ id = "at", head = "时间" },
 				{ id = "event", head = "事件", grow = 1, truncate = "end" },
 				{ id = "repo", head = "仓库", mono = true, priority = 1 },
 				{ id = "result", head = "结果", grow = 1, truncate = "end" },
-			}, rows :: any, { selectable = true, empty = "还没有收到中继事件" }),
+			}, rows :: any, {
+				selectable = true,
+				empty = if rs.configured
+					then "还没有收到中继事件。只有已订阅的事件才会转发到本机,见「中继」页的 Webhook 投递"
+					else "还没有收到中继事件",
+			}),
 			"table"
 		),
 	})
@@ -829,6 +1364,124 @@ local function manual_subs_text(st: State): string?
 		return model.subscriptions_toml(model.subscriptions(w))
 	end)
 	return if ok then text :: string else nil
+end
+
+local OUTCOMES = { "relayed", "ignored", "duplicate", "ping", "rejected" }
+local OUTCOME_LABEL: { [string]: string } =
+	{ relayed = "已转发", ignored = "已忽略", duplicate = "重复", ping = "ping", rejected = "已拒绝" }
+local OUTCOME_TONE: { [string]: string } =
+	{ relayed = "success", ignored = "muted", duplicate = "muted", ping = "muted", rejected = "error" }
+-- Most rows of the delivery summary shown.
+local MAX_DELIVERY_ROWS = 40
+
+-- The agent's reasons are English; the common ones read better translated.
+local function delivery_reason(reason: any): string
+	if type(reason) ~= "string" or reason == "" then
+		return ""
+	end
+	if string.find(reason, "not subscribed", 1, true) then
+		return "没有工作流订阅这个事件"
+	elseif reason == "not about a repository" then
+		return "与仓库无关"
+	elseif reason == "synthetic test event" then
+		return "测试事件"
+	end
+	return reason
+end
+
+-- What GitHub sent the relay and what became of it: counts by outcome, then by event and repo.
+-- Ignored deliveries never reach this machine, so this is the only place they show.
+local function deliveries_view(st: State, t: number): Node
+	local d = core.deliveries(st.core)
+	local body = d.body
+	local busy = st.core.relay.state.busy
+	local meta: string
+	if body then
+		local by: { [string]: any } = if type(body.by_outcome) == "table" then body.by_outcome else {}
+		local parts = {}
+		for _, o in OUTCOMES do
+			if type(by[o]) == "number" and by[o] > 0 then
+				table.insert(parts, `{OUTCOME_LABEL[o]} {by[o]}`)
+			end
+		end
+		local since = util.rfc3339(body.since)
+		meta = `{if since then util.ago(since, t) .. "起" else "自中继启动起"} 共 {body.total or 0} 次`
+		if #parts > 0 then
+			meta ..= " · " .. table.concat(parts, " · ")
+		end
+	elseif d.error then
+		meta = `读取失败:{d.error}`
+	else
+		meta = "读取中…"
+	end
+	local rows = {}
+	local summary: { any } = if body and type(body.summary) == "table" then body.summary else {}
+	for i, s in summary do
+		if i > MAX_DELIVERY_ROWS then
+			break
+		end
+		if type(s) == "table" then
+			local outcome = tostring(s.outcome or "?")
+			local event = tostring(s.event or "")
+			table.insert(rows, {
+				id = `s{i}`,
+				cells = list_of(
+					{ text = OUTCOME_LABEL[outcome] or outcome, dot = OUTCOME_TONE[outcome] or "muted" },
+					if event == "" then "(无)" else event,
+					if type(s.repo) == "string" then s.repo else "—",
+					tostring(s.count or 0),
+					util.ago(util.rfc3339(s.last_at), t),
+					delivery_reason(s.reason)
+				),
+				title = if type(s.reason) == "string" then s.reason else nil,
+			})
+		end
+	end
+	local ignored = body and type(body.by_outcome) == "table" and (tonumber(body.by_outcome.ignored) or 0) or 0
+	local out: { Node } = {
+		keyed(ui.rule("Webhook 投递"), "rule"),
+		N("row", { key = "bar", justify = "between", align = "center", gap = "sm" }, {
+			keyed(muted(meta), "meta"),
+			N("row", { key = "end", gap = "sm", align = "center" }, {
+				btn("刷新", "refresh-deliveries", { key = "refresh", variant = "quiet", icon = "repeat", busy = d.loading }),
+				confirm_btn(st, "清空统计", "确认清空统计", "clear-deliveries", {
+					key = "clear",
+					variant = "quiet",
+					icon = "trash",
+					busy = busy.clear_deliveries == true,
+					title = "清空中继内存中的投递计数与最近记录(中继重启也会清空)",
+				}),
+			}),
+		}),
+	}
+	if ignored > 0 then
+		table.insert(
+			out,
+			keyed(muted("「已忽略」的事件没有任何工作流订阅,不会转发到本机;给工作流加上对应的 GitHub 触发器后会自动订阅。"), "hint")
+		)
+	end
+	table.insert(
+		out,
+		keyed(
+			ui.table({
+				{ id = "outcome", head = "结果" },
+				{ id = "event", head = "事件", mono = true },
+				{ id = "repo", head = "仓库", mono = true, grow = 1, truncate = "end", priority = 1 },
+				{ id = "count", head = "次数", align = "end" },
+				{ id = "last", head = "最近" },
+				{ id = "reason", head = "说明", grow = 1, truncate = "end", priority = 2 },
+			}, rows :: any, {
+				empty = if body and type(body.summary) ~= "table"
+					then "中继版本较旧,不提供投递统计"
+					else "还没有收到 webhook",
+			}),
+			"table"
+		)
+	)
+	if #summary > MAX_DELIVERY_ROWS then
+		table.insert(out, keyed(ui.overflow(#summary - MAX_DELIVERY_ROWS), "more"))
+	end
+	return N("col", { key = "deliveries", role = "roost.deliveries", gap = "sm" }, out)
 end
 
 local function relay_tab(st: State): Node
@@ -851,7 +1504,7 @@ local function relay_tab(st: State): Node
 		pair("状态", if rs.connected then { ui.span("已连接", "success") } else { ui.span(rs.error or "未连接", "error") }),
 	}
 	if agent.version then
-		local started = rfc3339(agent.started_at)
+		local started = util.rfc3339(agent.started_at)
 		table.insert(conn, { "中继", `roost-agent {agent.version} · 启动于 {util.ago(started, t)} · boot {agent.boot_id or "—"}` })
 	end
 
@@ -861,7 +1514,7 @@ local function relay_tab(st: State): Node
 	if type(agent.clients) == "table" and #agent.clients > 0 then
 		local names = {}
 		for _, cl in agent.clients do
-			table.insert(names, `{cl.name or cl.id} ({util.ago(rfc3339(cl.last_seen), t)})`)
+			table.insert(names, `{cl.name or cl.id} ({util.ago(util.rfc3339(cl.last_seen), t)})`)
 		end
 		table.insert(conn, { "客户端", table.concat(names, " · ") })
 	end
@@ -874,7 +1527,7 @@ local function relay_tab(st: State): Node
 	end
 	table.insert(
 		conn_body,
-		N("row", { key = "ops", gap = "xs", align = "center" }, {
+		N("row", { key = "ops", gap = "sm", align = "center" }, {
 			btn("重新加载订阅", "reload_remote", { icon = "repeat", busy = busy.reload == true, key = "reload", title = "让中继重新读取服务器上的 subscriptions.toml" }),
 			btn(if rs.restarting then "重启中…" else "重启中继", "restart_remote", {
 				icon = "power",
@@ -884,6 +1537,13 @@ local function relay_tab(st: State): Node
 				title = "agent.toml 或二进制更新后,原地重启服务器上的 roost-agent",
 			}),
 			btn("发送测试事件", "test", { icon = "send", busy = busy.test == true, key = "test" }),
+			confirm_btn(st, "清空中继事件缓存", "确认清空中继缓存", "clear-relay-events", {
+				key = "clear",
+				variant = "quiet",
+				icon = "trash",
+				busy = busy.clear_events == true,
+				title = "删除服务器上为客户端缓存的事件(自动按 agent.toml [store] 的数量/时长/字节上限淘汰);本机还没读到的事件会丢失",
+			}),
 			keyed(muted(if rs.last_test then `测试事件 {util.ago(rs.last_test, t)} 送达` else ""), "last_test"),
 		})
 	)
@@ -897,17 +1557,22 @@ local function relay_tab(st: State): Node
 			keyed(muted(`{if sync.revision then "版本 " .. sync.revision else ""}{if sync.at then " · " .. util.ago(sync.at, t) else ""}`), "meta"),
 		}),
 	}
+	if sync.state == "idle" and not sync.error then
+		table.insert(sub_body, keyed(muted(if rs.connected then "等待中继状态以核对订阅…" else "连上中继后核对订阅"), "hint"))
+	elseif sync.state == "adopted" then
+		table.insert(sub_body, keyed(muted("中继使用服务器上的订阅,与本地工作流不同;修改工作流或点「推送订阅」会改为本地版本"), "hint"))
+	end
 	if sync.error then
 		table.insert(sub_body, keyed(ui.text({ ui.span(sync.error, "warning") }), "error"))
 	end
 	local sub_actions: { Node } = {
-		btn("推送订阅", "push", { icon = "push", busy = busy.push == true, key = "push" }),
+		btn("推送订阅", "push", { icon = "push", busy = busy.push == true, key = "push", title = "把本地工作流算出的订阅推送到中继" }),
 	}
 	if sync.state == "conflict" then
 		table.insert(sub_actions, btn("以本地覆盖", "force_push", { variant = "danger", key = "force" }))
 		table.insert(sub_actions, btn("采用云端", "adopt", { key = "adopt", title = "保留服务器上的订阅,直到本地再次修改" }))
 	end
-	table.insert(sub_body, N("row", { key = "actions", gap = "xs" }, sub_actions))
+	table.insert(sub_body, N("row", { key = "actions", gap = "sm" }, sub_actions))
 	if sync.state == "conflict" and sync.remote_text then
 		table.insert(sub_body, keyed(ui.section("服务器上的版本", { ui.code(sync.remote_text, "toml") }), "remote"))
 	end
@@ -941,7 +1606,7 @@ local function relay_tab(st: State): Node
 		table.insert(
 			app_body,
 			keyed(
-				muted("roost-agent 以 GitHub App 接收所装仓库的事件(只读权限),不需要个人令牌,也不用逐个仓库配置 webhook。"),
+				muted("roost-agent 以 GitHub App 接收所装仓库的事件,运行也以它的身份评论、审查与推送(默认分支禁止强推);不需要个人令牌,也不用逐个仓库配置 webhook。"),
 				"explain"
 			)
 		)
@@ -959,33 +1624,55 @@ local function relay_tab(st: State): Node
 				}),
 			})
 		)
-		table.insert(app_body, N("row", { key = "actions", gap = "xs" }, {
+		table.insert(app_body, N("row", { key = "actions", gap = "sm" }, {
 			btn("创建 GitHub App", "app-create", { key = "create", variant = "primary", icon = "plug", busy = st.app_busy }),
 		}))
 	else
 		table.insert(app_body, ui.kv({
 			pair("名称", { ui.span(info.name or "—", "strong"), ui.span(`  {info.slug or ""}`, "mono muted") }),
 			pair("所有者", { ui.span(info.owner or "—", "mono"), ui.span(`  {info.owner_type or ""}`, "muted") }),
+			pair("运行身份", {
+				ui.span(info.bot or "—", "mono"),
+				ui.span(if c.config.github.identity == "app" then "  默认" else "  roost.toml 设为本机身份", "muted"),
+			}),
 			pair("已安装", if info.installations then `{info.installations} 个账号或组织` else "—"),
 		} :: any))
-		table.insert(app_body, N("row", { key = "actions", gap = "xs" }, {
+		local missing = info.missing
+		if missing and #missing > 0 then
+			table.insert(
+				app_body,
+				keyed(
+					ui.text({
+						ui.span("权限尚未生效:", "warning"),
+						ui.span(table.concat(missing, " "), "mono"),
+						ui.span("。在 App 设置的 Permissions 里开启后,到安装页接受新权限。", "muted"),
+					}),
+					"missing"
+				)
+			)
+		end
+		table.insert(app_body, keyed(muted("头像只能在 GitHub 的 App 设置页上传(GitHub 没有对应的 API);Roost 自带的头像在插件目录 assets/app-logo.png。"), "logo"))
+		table.insert(app_body, N("row", { key = "actions", gap = "sm" }, {
 			btn("安装到仓库", "app-install", { key = "install", icon = "plus" }),
 			btn("在 GitHub 上管理", "app-manage", { key = "manage", icon = "open" }),
-			btn(
-				if st.app_confirm then "确认删除本地凭据" else "忘记本地凭据",
-				"app-forget",
-				{
-					key = "forget",
-					variant = "danger",
-					icon = "trash",
-					title = "只删除中继上的 App 凭据;App 本身要到 GitHub 设置里删除,删除后只能重新创建",
-				}
-			),
+			btn("权限设置", "app-permissions", { key = "permissions", icon = "open" }),
+			btn("设置头像", "app-logo", { key = "logo", icon = "open" }),
+			confirm_btn(st, "忘记本地凭据", "确认删除本地凭据", "forget-app", {
+				variant = "danger",
+				key = "forget",
+				icon = "trash",
+				title = "只删除中继上的 App 凭据;App 本身要到 GitHub 设置里删除,删除后只能重新创建",
+			}),
 		}))
 	end
 	local app_card = ui.card("GitHub App", app_body, { key = "app", icon = "plug" })
 
-	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, { conn_card, sub_card, app_card })
+	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, {
+		conn_card,
+		sub_card,
+		app_card,
+		deliveries_view(st, t),
+	})
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1013,6 +1700,70 @@ local function issues_nodes(list: { model.Issue }, path: string): { Node }
 	return out
 end
 
+-- What Roost keeps on disk, the retention policy, the last cleanup, and manual cleanup.
+local function storage_card(st: State): Node
+	local c = st.core
+	local k = c.config.retention
+	local t = now()
+	local d = core.disk(c)
+	local finished = #store.finished(c.store)
+	local function size(names: { string }): string
+		if d.at == nil then
+			return if d.loading then "统计中…" else "—"
+		end
+		local n = 0
+		for _, name in names do
+			n += d.sizes[name] or 0
+		end
+		return util.fmt_bytes(n)
+	end
+	local cl = c.cleanup
+	local last = if cl
+		then `{util.ago(cl.at, t)}{if cl.manual then "(手动)" else ""}:{cl.runs} 个运行、{cl.events} 条事件记录、{cl.orphans} 个遗留目录`
+		else "尚未执行"
+	local items: { any } = {
+		{ "运行", `{#c.store.runs} 条,{finished} 条已结束 · 保留 {k.runs} 条 / {fmt_age(k.run_age)} · {size({ "runs", "runs.json", "runs.json.bak" })}` },
+		{ "worktree", size({ "worktrees" }) },
+		{ "事件记录", `{#c.events} 条 · 保留 {k.events} 条 / {fmt_age(k.event_age)} · {size({ "events.json", "events.json.bak" })}` },
+		{ "上次自动清理", last },
+	}
+	if #c.store.trash > 0 then
+		table.insert(items, { "删除中", `{#c.store.trash} 个目录` })
+	end
+	if not c.store.indexed then
+		table.insert(items, pair("无主目录", {
+			ui.span("runs.json 曾无法读取(副本 runs.json.unreadable):暂不自动删除无主目录;处理完后删除该副本即可恢复", "warning"),
+		}))
+	end
+	if d.error then
+		table.insert(items, pair("占用统计", { ui.span(d.error, "warning") }))
+	end
+	return ui.card("存储与清理", {
+		keyed(
+			muted(
+				"运行目录含日志、事件负载与 omp 会话。启动时、每小时以及修改 roost.toml [retention] 后按策略自动清理;只删除已结束的运行。中继侧的事件缓存与投递统计在「中继」页清理。"
+			),
+			"note"
+		),
+		keyed(ui.kv(items :: any), "kv"),
+		N("row", { key = "actions", gap = "sm", align = "center", wrap = true }, {
+			btn("按策略清理", "housekeep", { icon = "trash", key = "housekeep", title = "立即删除超出保留数量或时长的运行与事件记录,以及无主的遗留目录" }),
+			confirm_btn(st, "删除全部已结束运行", `确认删除 {finished} 个运行`, "clear-runs", {
+				key = "clear-runs",
+				icon = "trash",
+				disabled = if finished == 0 then "没有已结束的运行" else false,
+			}),
+			confirm_btn(st, "清空事件记录", "确认清空", "clear-events", {
+				key = "clear-events",
+				icon = "trash",
+				disabled = if #c.events == 0 then "没有记录" else false,
+			}),
+			btn("调整保留策略", "open=config", { icon = "pen", variant = "quiet", key = "policy", title = "roost.toml 的 [retention]" }),
+			btn("", "refresh-disk", { icon = "repeat", variant = "quiet", key = "refresh", title = "重新统计占用", busy = d.loading }),
+		}),
+	}, { key = "storage", icon = "folder-open" })
+end
+
 local function config_tab(st: State): Node
 	local c = st.core
 	local p = c.paths
@@ -1026,7 +1777,7 @@ local function config_tab(st: State): Node
 		else
 			table.insert(body, N("col", { key = "issues", gap = "xs" }, issues_nodes(issues, path)))
 		end
-		table.insert(body, N("row", { key = "actions", gap = "xs" }, {
+		table.insert(body, N("row", { key = "actions", gap = "sm" }, {
 			btn("编辑", `open={key}`, { icon = "pen", key = "edit" }),
 		}))
 		return ui.card(title, body, { key = key, icon = "file-code", tone = if #issues > 0 then "error" else nil })
@@ -1037,17 +1788,17 @@ local function config_tab(st: State): Node
 		{ "agent 会话", `Tern 会话「{r.session}」中的新标签页` },
 		{ "并发", tostring(r.max_concurrent) },
 		{ "默认超时", util.fmt_duration(r.default_timeout) },
-		{ "保留运行", tostring(r.keep_runs) },
 		pair("PATH 追加", { ui.span(table.concat(r.extra_path, ":"), "mono") }),
 	} :: any)
 	return N("col", { key = "config", role = "roost.config", gap = "md" }, {
 		file_card("config", "roost.toml", p.config, c.config_issues, "有效"),
 		file_card("workflows", "workflows.toml", p.workflows, c.workflow_issues, wf_ok),
 		ui.card("运行设置", { keyed(runner_kv, "kv") }, { key = "runner", icon = "sliders" }),
+		storage_card(st),
 		ui.card("外观", {
 			keyed(muted("theme.css 放在数据目录中,保存后实时注入,覆盖 roost.css 的样式(钩子:data-role = roost.*)。"), "note"),
 			keyed(ui.text({ ui.path(p.theme) }), "path"),
-			N("row", { key = "actions", gap = "xs" }, {
+			N("row", { key = "actions", gap = "sm" }, {
 				btn(if tern.fs.exists(p.theme) then "编辑 theme.css" else "创建 theme.css", "open=theme", { icon = "palette", key = "edit" }),
 			}),
 		}, { key = "theme", icon = "palette" }),
@@ -1070,6 +1821,19 @@ end
 
 local function open_form(st: State, wf: model.Workflow)
 	local fields: { FormField } = {}
+	local target = model.pr_target(wf)
+	if target then
+		table.insert(fields, {
+			text = "",
+			cursor = 0,
+			label = "拉取请求",
+			hint = if target == "only"
+				then "owner/name#12 或 PR 链接;工作流只有一个仓库时可只写编号"
+				else "owner/name#12 或 PR 链接;留空则不针对 PR 运行",
+			required = target == "only",
+			pr = true,
+		})
+	end
 	for _, i in wf.inputs do
 		local text = i.default or ""
 		table.insert(fields, {
@@ -1085,26 +1849,7 @@ local function open_form(st: State, wf: model.Workflow)
 	focus_form(st)
 end
 
-local function submit_form(st: State)
-	local f = st.form
-	if not f then
-		return
-	end
-	local inputs: { [string]: string } = {}
-	for _, fl in f.fields do
-		if fl.required and util.trim(fl.text) == "" then
-			f.error = `{fl.label} 是必填项`
-			return
-		end
-		if fl.text ~= "" then
-			inputs[fl.name :: string] = fl.text
-		end
-	end
-	local err = core.dispatch(st.core, f.workflow, inputs)
-	if err then
-		f.error = err
-		return
-	end
+local function form_done(st: State, f: Form)
 	st.form = nil
 	st.cx:frame({ pair("focus", tern.json.null) })
 	st.tab = "runs"
@@ -1112,6 +1857,53 @@ local function submit_form(st: State)
 	if newest then
 		select_run(st, newest.id)
 	end
+end
+
+local function submit_form(st: State)
+	local f = st.form
+	if not f or f.busy then
+		return
+	end
+	local inputs: { [string]: string } = {}
+	local pr: string? = nil
+	for _, fl in f.fields do
+		local text = util.trim(fl.text)
+		if fl.required and text == "" then
+			f.error = `{fl.label} 是必填项`
+			return
+		end
+		if fl.pr then
+			pr = if text ~= "" then text else nil
+		elseif fl.text ~= "" then
+			inputs[fl.name :: string] = fl.text
+		end
+	end
+	if pr == nil then
+		local err = core.dispatch(st.core, f.workflow, inputs)
+		if err then
+			f.error = err
+			return
+		end
+		form_done(st, f)
+		return
+	end
+	f.busy, f.error = true, nil
+	local function open(): boolean
+		return not st.closed and st.form == f
+	end
+	core.dispatch_pr(st.core, f.workflow, inputs, pr, function(err)
+		-- Cancelled (or the block closed) while gh read the PR: nothing was queued.
+		if not open() then
+			return
+		end
+		f.busy = false
+		if err then
+			f.error = err
+		else
+			form_done(st, f)
+		end
+		st.cx:render()
+	end, open)
 end
 
 local function form_view(st: State): Node?
@@ -1136,12 +1928,21 @@ local function form_view(st: State): Node?
 	end
 	if f.error then
 		table.insert(children, keyed(ui.text({ ui.span(f.error, "error") }), "error"))
+	elseif f.busy then
+		table.insert(children, keyed(ui.text({ ui.span("正在用 gh 读取拉取请求…", "muted") }), "busy"))
 	end
 	table.insert(
 		children,
 		N("row", { key = "foot", justify = "end", gap = "sm" }, {
 			btn("取消", "form_cancel", { variant = "quiet", keys = { "esc" }, key = "cancel", size = "md" }),
-			btn("运行", "form_submit", { variant = "primary", keys = { "enter" }, key = "submit", size = "md", icon = "play" }),
+			btn("运行", "form_submit", {
+				variant = "primary",
+				keys = { "enter" },
+				key = "submit",
+				size = "md",
+				icon = "play",
+				disabled = if f.busy then "正在读取拉取请求" else false,
+			}),
 		})
 	)
 	return N("col", {}, {
@@ -1175,23 +1976,55 @@ function M.view(st: State): BlockView
 	else
 		body = overview(st)
 	end
-	local main = N("col", { gap = "md" }, {
+	local c = st.core
+	local active = 0
+	for _, r in c.store.runs do
+		if r.state == "running" or r.state == "queued" then
+			active += 1
+		end
+	end
+	local counts: { [string]: number } = {
+		runs = active,
+		workflows = if c.workflows then #c.workflows.list else 0,
+		events = #c.events,
+		config = #c.config_issues + #c.workflow_issues,
+	}
+	local nav: { any } = {}
+	for _, tab in TABS do
+		local n = counts[tab.id]
+		table.insert(nav, {
+			id = tab.id,
+			label = if n and n > 0 then { ui.span(`{tab.label} `), ui.span(tostring(n), "muted") } else tab.label,
+		})
+	end
+	local main = N("col", { gap = "lg" }, {
 		header(st),
-		N("tabs", { key = "nav", role = "roost.tabs", variant = "segmented", active = st.tab, items = TABS }),
-		N("col", { key = "body", gap = "md" }, { body }),
+		N("tabs", { key = "nav", role = "roost.tabs", active = st.tab, items = nav }),
+		N(
+			"col",
+			if st.tab == "runs" and runs_split(st)
+				then { key = "body", role = "roost.fill", gap = "lg" }
+				else { key = "body", gap = "lg" },
+			{ body }
+		),
 	})
-	local dock = N("col", {}, {
-		ui.text({
-			ui.span("1-6", "key"),
-			ui.span(" 切换页面  ", "muted"),
-			ui.span("j/k", "key"),
-			ui.span(" 选择运行  ", "muted"),
-			ui.span("c", "key"),
-			ui.span(" 取消  ", "muted"),
-			ui.span("r", "key"),
-			ui.span(" 重跑", "muted"),
-		}),
-	})
+	local legend: { any } = { ui.span("1-6", "key"), ui.span(" 切换页面", "muted") }
+	local function hint(k: string, what: string)
+		table.insert(legend, ui.span("   "))
+		table.insert(legend, ui.span(k, "key"))
+		table.insert(legend, ui.span(` {what}`, "muted"))
+	end
+	if st.tab == "runs" then
+		hint("j/k", "选择运行")
+		hint("c", "取消")
+		hint("r", "重跑")
+	elseif st.tab == "workflows" then
+		hint("j/k", "选择工作流")
+		hint("r", "运行")
+		hint("e", "编辑")
+		hint("Esc", "取消选中")
+	end
+	local dock = N("col", {}, { ui.text(legend) })
 	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) }
 end
 
@@ -1212,12 +2045,40 @@ local function open_path(st: State, what: string)
 	end
 end
 
+-- The second click of a confirm_btn.
+local function confirmed(st: State, what: string)
+	local c = st.core
+	local run = string.match(what, "^delete%-run:(%x+)$")
+	if run then
+		local err = core.delete_run(c, run)
+		toast_err(st, err)
+		if not err and st.run_id == run then
+			st.run_id = nil
+			reset_log(st, nil)
+		end
+	elseif what == "forget-app" then
+		core.forget_app(c)
+	elseif what == "clear-runs" then
+		core.clear_runs(c)
+		if st.run_id and c.store.by_id[st.run_id] == nil then
+			st.run_id = nil
+			reset_log(st, nil)
+		end
+	elseif what == "clear-events" then
+		core.clear_events(c)
+	elseif what == "clear-deliveries" then
+		core.clear_deliveries(c)
+	elseif what == "clear-relay-events" then
+		core.clear_relay_events(c)
+	end
+end
+
 local function do_action(st: State, act: string, value: string?, item: string?)
 	local c = st.core
 	local target = value or item
-	if act ~= "app-forget" then
-		-- 忘记本地凭据 needs two clicks in a row; anything in between disarms it.
-		st.app_confirm = false
+	if act ~= "confirm" then
+		-- A two-click action is disarmed by anything in between.
+		st.confirm = nil
 	end
 	if act == "tab" and value and TAB_IDS[value] then
 		st.tab = value
@@ -1229,7 +2090,7 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		local wf = c.workflows and c.workflows.by_id[value]
 		if not wf then
 			toast_err(st, `没有工作流 {value}`)
-		elseif #wf.inputs > 0 then
+		elseif #wf.inputs > 0 or model.pr_target(wf) then
 			open_form(st, wf)
 		else
 			local err = core.dispatch(c, value)
@@ -1257,6 +2118,8 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		end
 	elseif act == "open-log" and target then
 		st.cx:open(`{run_dir(st, target)}/log.txt`)
+	elseif act == "log-wrap" then
+		st.log_wrap = not st.log_wrap
 	elseif act == "sidebar" then
 		st.cx:open(agent.SIDEBAR_URL)
 	elseif act == "session" and value then
@@ -1290,6 +2153,8 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		editor.open(st, "edit", value)
 	elseif act == "template" and value then
 		editor.open(st, "template", value)
+	elseif string.sub(act, 1, 4) == "tpl:" then
+		editor.open(st, "template", string.sub(act, 5))
 	elseif act == "app-create" then
 		local org = st.app_org
 		local text = if org then util.trim(org.text) else ""
@@ -1307,20 +2172,47 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 			end
 			st.cx:render()
 		end)
-	elseif act == "app-install" or act == "app-manage" then
+	elseif act == "app-install" or act == "app-manage" or act == "app-permissions" or act == "app-logo" then
 		local info = core.app(c)
-		local url = info and (if act == "app-install" then info.install_url else info.html_url)
+		local url: string? = nil
+		if info then
+			if act == "app-install" then
+				url = info.install_url
+			elseif act == "app-manage" then
+				url = info.html_url
+			elseif act == "app-permissions" then
+				url = if info.settings_url then info.settings_url .. "/permissions" else nil
+			else
+				url = info.settings_url
+			end
+		end
 		if url and url ~= "" then
 			st.cx:open(url)
 		end
-	elseif act == "app-forget" then
-		-- The private key can't be fetched again: the first click only arms the button.
-		if st.app_confirm then
-			st.app_confirm = false
-			core.forget_app(c)
+	elseif act == "confirm" and value then
+		-- Destructive actions take two separate clicks (see confirm_btn): a double click, or a
+		-- second click after the arm expired, only arms it again.
+		local t = tern.now()
+		local age = t - (st.confirm_at or 0)
+		if st.confirm == value and age >= CONFIRM_MIN_MS and age <= CONFIRM_MAX_MS then
+			st.confirm = nil
+			confirmed(st, value)
 		else
-			st.app_confirm = true
+			st.confirm, st.confirm_at = value, t
+			tern.timer(CONFIRM_MAX_MS, function()
+				if not st.closed and st.confirm == value and st.confirm_at == t then
+					st.confirm = nil
+					st.cx:render()
+				end
+			end)
 		end
+	elseif act == "housekeep" then
+		core.housekeep(c, true)
+	elseif act == "refresh-disk" then
+		c.disk.at = nil
+		core.disk(c)
+	elseif act == "refresh-deliveries" then
+		core.deliveries(c, true)
 	elseif act == "copy" and value == "subs" then
 		local text = manual_subs_text(st)
 		if text then
@@ -1346,22 +2238,25 @@ function M.event(st: State, ev: UiEvent)
 		end
 		if name == "nav" and TAB_IDS[item] then
 			st.tab = item
-			st.app_confirm = false
+			st.confirm = nil
 		elseif name == "tpl" then
 			st.tpl = item
+		elseif name == "health" then
+			st.wf_id = item
+			if ev.ev == "activate" then
+				st.tab = "workflows"
+			end
 		elseif name == "filter" then
 			st.filter = item
 		elseif name == "runs" then
 			select_run(st, item)
-		elseif name == "recent" then
-			st.tab = "runs"
-			select_run(st, item)
 		elseif name == "table" and st.tab == "events" then
-			local seq = tonumber(string.match(item, "^e(%d+)$") or "")
+			local delivery = string.match(item, "^d:(.+)$")
 			for _, e in st.core.events do
-				if e.seq == seq and #e.runs > 0 then
+				local run = if e.delivery == delivery then e.runs[1] else nil
+				if run and st.core.store.by_id[run] then
 					st.tab = "runs"
-					select_run(st, e.runs[1])
+					select_run(st, run)
 					break
 				end
 			end
@@ -1411,6 +2306,9 @@ local function move_selection(st: State, delta: number): boolean
 end
 
 function M.key(st: State, key: Key): boolean?
+	-- Keys move selections and pages: an armed destructive button would end up meaning another
+	-- item, so any key disarms it.
+	st.confirm = nil
 	if st.editor and editor.key(st, key) then
 		return true
 	end
@@ -1470,6 +2368,37 @@ function M.key(st: State, key: Key): boolean?
 			return true
 		elseif key.name == "r" and st.run_id then
 			do_action(st, "rerun", st.run_id, nil)
+			return true
+		end
+	elseif st.tab == "workflows" and st.core.workflows then
+		local w = st.core.workflows :: model.Workflows
+		if key.name == "escape" and st.wf_id then
+			st.wf_id = nil
+			return true
+		end
+		local sel = selected_workflow(st, w)
+		if not sel then
+			-- Nothing picked yet: j/k pick the first card; r/e need a pick.
+			if (key.name == "j" or key.name == "down" or key.name == "k" or key.name == "up") and w.list[1] then
+				st.wf_id = w.list[1].id
+				return true
+			end
+			return false
+		end
+		if key.name == "j" or key.name == "down" or key.name == "k" or key.name == "up" then
+			local delta = if key.name == "j" or key.name == "down" then 1 else -1
+			local idx = table.find(w.list, sel) or 1
+			local nxt = w.list[math.clamp(idx + delta, 1, #w.list)]
+			if nxt.id == sel.id then
+				return false
+			end
+			st.wf_id = nxt.id
+			return true
+		elseif key.name == "r" and sel.manual then
+			do_action(st, "dispatch", sel.id, nil)
+			return true
+		elseif key.name == "e" then
+			editor.open(st, "edit", sel.id)
 			return true
 		end
 	end

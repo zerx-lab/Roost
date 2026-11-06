@@ -1,6 +1,12 @@
 --!strict
--- Run history: `runs.json` (all records, newest last, bounded by keep_runs) plus one directory
--- per run under `runs/<id>/` (log, event payload, step pid/exit files).
+-- Run history: `runs.json` (all records, newest last, bounded by retention count and age) plus
+-- one directory per run under `runs/<id>/` (log, event payload, step pid/exit files, omp
+-- sessions) and, for worktree runs, `worktrees/<id>/`.
+--
+-- Dropping runs is two-phase: the index forgets them at once (cheap, saved with runs.json) and
+-- their directories go to `trash`, which `drain` empties a few at a time so a large cleanup never
+-- blows a call's budget. Directories the index doesn't know (a reload mid-drain, older bugs) are
+-- found by `sweep`.
 --
 -- tern.fs has no rename, so a save writes `runs.json.bak` first, then `runs.json`: a crash in
 -- either write leaves the other file whole, and load falls back to the backup.
@@ -11,12 +17,18 @@ local M = {}
 
 export type StepRec = {
 	name: string,
-	kind: string, -- prepare | omp | run | cleanup
+	kind: string, -- auth | prepare | omp | run | cleanup
 	state: string, -- pending | running | success | failed | skipped
 	exit_code: number?,
 	started_at: number?,
 	finished_at: number?,
 	agent: boolean?, -- ran as an agent block (lib/agent.luau); older omp steps ran headless
+	opened: boolean?, -- agent step: "the tab is open" was logged
+	tail_file: string?, -- agent step: the session file being followed into the log
+	tail: number?, -- agent step: bytes of tail_file already logged
+	replied: boolean?, -- agent step: the log already holds the final answer
+	cost: number?, -- agent step: estimated USD from its session files (subagents included), once it ended
+	tokens: number?, -- agent step: total tokens from the same files
 }
 
 export type Run = {
@@ -46,13 +58,23 @@ export type Run = {
 	fetch_ref: string?,
 	event: { [string]: any }?,
 	rerun_of: string?,
+	identity: string?, -- "app" when the run acts on GitHub as the relay's App
+	-- While identity is "app": the bot account and when the run's token expires (renewed while it runs).
+	app: { login: string, email: string, expires: number }?,
+	-- `key=value` lines steps appended to $ROOST_OUTPUT (later steps see them as out.<key>).
+	outputs: { [string]: string }?,
 }
 
 export type Store = {
 	dir: string,
 	keep: number,
+	max_age: number, -- seconds a finished run is kept; 0 keeps them regardless of age
 	runs: { Run },
 	by_id: { [string]: Run },
+	trash: { string }, -- directories waiting for `drain`
+	indexed: boolean, -- runs.json was read (or never existed): `sweep` may trust the index
+	policy: boolean, -- keep/max_age come from a valid roost.toml: nothing expires before that
+	tries: { [string]: number }, -- failed removals per queued path (bounded by MAX_TRIES)
 }
 
 local MAX_INDEX_BYTES = 16 * 1024 * 1024
@@ -66,12 +88,27 @@ M.TERMINAL = {
 	skipped = true,
 }
 
-function M.new(dir: string, keep: number): Store
-	return { dir = dir, keep = keep, runs = {}, by_id = {} }
+function M.new(dir: string, keep: number, max_age: number): Store
+	return {
+		dir = dir,
+		keep = keep,
+		max_age = max_age,
+		runs = {},
+		by_id = {},
+		trash = {},
+		indexed = false,
+		policy = false,
+		tries = {},
+	}
 end
 
 function M.run_dir(s: Store, id: string): string
 	return agent.run_dir(s.dir, id)
+end
+
+-- Where a worktree run checks out; Roost owns it (never the user's own checkout).
+function M.worktree_dir(s: Store, id: string): string
+	return `{s.dir}/worktrees/{id}`
 end
 
 -- The decoded list, or nil plus the raw text when the file exists but can't be used.
@@ -101,6 +138,14 @@ function M.load(s: Store)
 			tern.log.warn("roost: runs.json unreadable; kept a copy as runs.json.unreadable")
 		end
 	end
+	-- Only an index that was read (or never existed) says which directories are orphans: with an
+	-- unreadable runs.json every run directory would look unowned. That stays true while the
+	-- unreadable copy is kept, even after a save writes a fresh (smaller) runs.json.
+	local function there(name: string): boolean
+		local ok, yes = pcall(tern.fs.exists, `{s.dir}/{name}`)
+		return ok and yes == true
+	end
+	s.indexed = not there("runs.json.unreadable") and (list ~= nil or not (there("runs.json") or there("runs.json.bak")))
 	s.runs, s.by_id = {}, {}
 	local rows: { Run } = list or {}
 	for _, r in rows do
@@ -133,23 +178,192 @@ function M.add(s: Store, r: Run)
 	s.by_id[r.id] = r
 end
 
--- Drops the oldest finished runs past `keep` and their directories.
-function M.prune(s: Store)
-	local excess = #s.runs - s.keep
-	if excess <= 0 then
-		return
+-- Finished runs past the retention policy, oldest first: beyond `keep` finished runs, or
+-- finished longer than `max_age` ago. Nothing until a valid roost.toml set the policy.
+function M.expired(s: Store, now: number): { string }
+	local out: { string } = {}
+	if not s.policy then
+		return out
+	end
+	local excess = -s.keep
+	for _, r in s.runs do
+		if M.TERMINAL[r.state] then
+			excess += 1
+		end
+	end
+	local cutoff = if s.max_age > 0 then now - s.max_age else nil
+	for _, r in s.runs do
+		if M.TERMINAL[r.state] then
+			local old = cutoff ~= nil and (r.finished_at or r.created_at) < cutoff
+			if excess > 0 or old then
+				table.insert(out, r.id)
+				excess -= 1
+			end
+		end
+	end
+	return out
+end
+
+-- Forgets the finished runs among `ids` and queues their directories; active runs are kept.
+-- Returns how many were dropped.
+function M.drop(s: Store, ids: { string }): number
+	local gone: { [string]: boolean } = {}
+	for _, id in ids do
+		local r = s.by_id[id]
+		if r and M.TERMINAL[r.state] then
+			gone[id] = true
+		end
+	end
+	if next(gone) == nil then
+		return 0
 	end
 	local kept: { Run } = {}
+	local n = 0
 	for _, r in s.runs do
-		if excess > 0 and M.TERMINAL[r.state] then
-			excess -= 1
+		if gone[r.id] then
+			n += 1
 			s.by_id[r.id] = nil
-			pcall(tern.fs.remove, M.run_dir(s, r.id))
+			table.insert(s.trash, M.run_dir(s, r.id))
+			table.insert(s.trash, M.worktree_dir(s, r.id))
 		else
 			table.insert(kept, r)
 		end
 	end
 	s.runs = kept
+	return n
+end
+
+-- Drops runs past the retention policy; their directories go to `trash`.
+function M.prune(s: Store, now: number): number
+	return M.drop(s, M.expired(s, now))
+end
+
+-- Every finished run, for "delete all finished runs".
+function M.finished(s: Store): { string }
+	local out: { string } = {}
+	for _, r in s.runs do
+		if M.TERMINAL[r.state] then
+			table.insert(out, r.id)
+		end
+	end
+	return out
+end
+
+local function list_dir(path: string): { string }
+	local ok, names = pcall(tern.fs.list, path)
+	return if ok and type(names) == "table" then names :: { string } else {}
+end
+
+-- A name Roost would have created under runs/ or worktrees/ (run ids, plus a little slack).
+local function plain_name(name: string): boolean
+	return string.match(name, "^[%w%-_%.]+$") ~= nil and name ~= "." and name ~= ".."
+end
+
+-- Queues directories no run owns: `runs/<id>` the index doesn't know, `worktrees/<id>` of a run
+-- that is unknown or over. At most `cap` per call; returns how many were queued.
+function M.sweep(s: Store, cap: number): number
+	if not s.indexed then
+		return 0
+	end
+	local queued: { [string]: boolean } = {}
+	for _, p in s.trash do
+		queued[p] = true
+	end
+	local n = 0
+	local function take(path: string)
+		if n < cap and not queued[path] then
+			queued[path] = true
+			table.insert(s.trash, path)
+			n += 1
+		end
+	end
+	-- Entries with other names aren't Roost's: left alone (and not counted).
+	for _, name in list_dir(`{s.dir}/runs`) do
+		if plain_name(name) and s.by_id[name] == nil then
+			take(M.run_dir(s, name))
+		end
+	end
+	for _, name in list_dir(`{s.dir}/worktrees`) do
+		local r = s.by_id[name]
+		if plain_name(name) and (r == nil or M.TERMINAL[r.state]) then
+			take(M.worktree_dir(s, name))
+		end
+	end
+	return n
+end
+
+-- A directory Roost may delete: exactly `runs/<name>` or `worktrees/<name>` under an absolute
+-- data dir.
+local function owned(s: Store, path: string): boolean
+	if string.sub(s.dir, 1, 1) ~= "/" or #s.dir < 2 then
+		return false
+	end
+	for _, sub in { "runs", "worktrees" } do
+		local base = `{s.dir}/{sub}/`
+		if string.sub(path, 1, #base) == base then
+			return plain_name(string.sub(path, #base + 1))
+		end
+	end
+	return false
+end
+
+local MAX_TRIES = 3
+
+local function exists(path: string): boolean
+	local ok, yes = pcall(tern.fs.exists, path)
+	return ok and yes == true
+end
+
+-- Requeues what is still there after a removal, up to MAX_TRIES attempts per path.
+local function settle(s: Store, batch: { string })
+	for _, p in batch do
+		if exists(p) then
+			local n = (s.tries[p] or 0) + 1
+			if n < MAX_TRIES then
+				s.tries[p] = n
+				table.insert(s.trash, p)
+			else
+				s.tries[p] = nil
+				tern.log.warn("roost: giving up removing", p)
+			end
+		else
+			s.tries[p] = nil
+		end
+	end
+end
+
+-- Deletes up to `n` queued directories with one `rm -rf` (out of process: no call budget, and rm
+-- never follows a symlink out of a worktree), then `done(left)` with how many are still queued.
+function M.drain(s: Store, n: number, done: (number) -> ())
+	local batch: { string } = {}
+	while #batch < n and #s.trash > 0 do
+		local path = table.remove(s.trash, 1) :: string
+		if owned(s, path) and exists(path) then
+			table.insert(batch, path)
+		end
+	end
+	if #batch == 0 then
+		done(#s.trash)
+		return
+	end
+	local argv = { "/bin/rm", "-rf", "--" }
+	table.move(batch, 1, #batch, #argv + 1, argv)
+	local ok, err = pcall(function(): string?
+		tern.process.run(argv, { timeout_ms = 120000 }, function(res: ProcessResult)
+			if res.timed_out or res.status ~= 0 then
+				tern.log.warn("roost: rm failed", res.status, string.sub(res.stderr or "", 1, 500))
+			end
+			-- Whatever is still there goes back in the queue (settle), however rm ended.
+			settle(s, batch)
+			done(#s.trash)
+		end)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot start rm", err)
+		settle(s, batch)
+		done(#s.trash)
+	end
 end
 
 -- Newest first, optionally only one workflow's, at most `limit`.

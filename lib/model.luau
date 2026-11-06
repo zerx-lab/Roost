@@ -26,12 +26,14 @@ export type Runner = {
 	git: string,
 	max_concurrent: number,
 	default_timeout: number,
-	keep_runs: number,
 	extra_path: { string },
 	env: { [string]: string },
 }
-export type Github = { login: string? }
-export type Config = { relay: Relay, runner: Runner, github: Github }
+-- `identity`: how runs act on GitHub by default: "app" (the relay's GitHub App) or "local" (your gh).
+export type Github = { login: string?, identity: "app" | "local" }
+-- What Roost keeps on disk and for how long (seconds; 0 = no age limit).
+export type Retention = { runs: number, run_age: number, events: number, event_age: number }
+export type Config = { relay: Relay, runner: Runner, github: Github, retention: Retention }
 
 export type Repo = { name: string, path: string?, branch: string?, worktree: boolean }
 export type Input = { name: string, description: string?, default: string?, required: boolean }
@@ -79,6 +81,8 @@ export type GithubTrigger = {
 	associations: { string }?,
 	line: number?,
 }
+-- `when = "out.x"` / `"!input.y"`: the step runs only while that value is truthy (or, with `!`, not).
+export type When = { source: "out" | "input", key: string, negate: boolean }
 export type Step = {
 	name: string,
 	kind: "omp" | "run",
@@ -88,6 +92,7 @@ export type Step = {
 	args: { string },
 	timeout: number?,
 	continue_on_error: boolean,
+	when: When?,
 }
 export type Workflow = {
 	id: string,
@@ -101,6 +106,8 @@ export type Workflow = {
 	concurrency: "queue" | "skip" | "replace",
 	workspace: "auto" | "worktree" | "repo" | "temp",
 	env: { [string]: string },
+	identity: ("app" | "local")?, -- nil: roost.toml [github] identity
+	daily_budget: number?, -- USD the workflow's omp steps may spend per local day (estimated)
 	inputs: { Input },
 	triggers: { Trigger },
 	steps: { Step },
@@ -127,7 +134,7 @@ local RESERVED_OMP_FLAGS = {
 	["--continue"] = true,
 	["--restore"] = true,
 }
-M.DEFAULT_EXTRA_PATH = { "~/.local/bin", "~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin" }
+M.DEFAULT_EXTRA_PATH = { "~/.local/bin", "~/.bun/bin", "~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin" }
 
 -- ---------------------------------------------------------------------------------------------
 -- Trigger catalogue: what the editor offers and what each trigger kind accepts.
@@ -330,6 +337,31 @@ M.GITHUB_KINDS = {
 		filters = { "repos", "authors", "actions", "branches", "labels", "comment" },
 	},
 } :: { KindMeta }
+
+-- GitHub trigger kinds that are always about one pull request.
+M.PR_KINDS = {
+	pr_opened = true,
+	pr_draft = true,
+	pr_pushed = true,
+	pr_merged = true,
+	review_comment = true,
+	review = true,
+	review_thread = true,
+}
+
+-- Whether a manual run of `wf` can target a pull request: "only" when every trigger is a PR
+-- trigger (a run without one has nothing to work on), "some" when others exist, else nil.
+function M.pr_target(wf: Workflow): string?
+	local pr, other = false, false
+	for _, t in wf.triggers do
+		if t.kind == "github" and M.PR_KINDS[(t :: GithubTrigger).on] then
+			pr = true
+		else
+			other = true
+		end
+	end
+	return if not pr then nil elseif other then "some" else "only"
+end
 
 M.SCHEDULES = {
 	{ id = "once", label = "一次", detail = "在选定的日期和时间", keys = { "at" } },
@@ -658,6 +690,55 @@ local function get_duration(c: Ctx, t: { [string]: any }, key: string, path: str
 	return d
 end
 
+-- A step output name (`key=value` lines a shell step appends to $ROOST_OUTPUT).
+function M.valid_output_key(k: string): boolean
+	return #k <= 64 and string.match(k, "^[%a_][%w_]*$") ~= nil
+end
+
+-- Whether a step output or input value counts as "on" for `when`.
+function M.truthy(v: string?): boolean
+	if v == nil then
+		return false
+	end
+	local s = string.lower(util.trim(v))
+	return s ~= "" and s ~= "0" and s ~= "false" and s ~= "no"
+end
+
+-- `daily_budget`: US dollars, more than 0.
+local function get_budget(c: Ctx, t: { [string]: any }, key: string, path: string): number?
+	local v = t[key]
+	if v == nil then
+		return nil
+	end
+	if type(v) ~= "number" or v ~= v or v <= 0 or v > 100000 then
+		issue(c, `{path}.{key}`, "应为大于 0 的金额(美元),例如 5 或 2.5", line_of(c, t, key))
+		return nil
+	end
+	return v
+end
+
+-- `when = "out.<名>"`、`"input.<名>"`,前面加 `!` 取反。
+local function get_when(c: Ctx, t: { [string]: any }, path: string, inputs: { [string]: boolean }): When?
+	local s = get_string(c, t, "when", path)
+	if s == nil then
+		return nil
+	end
+	local neg, src, key = string.match(util.trim(s), "^(!?)%s*(%a+)%.([%w_]+)$")
+	local where = `{path}.when`
+	local line = line_of(c, t, "when")
+	if src == "out" and key and M.valid_output_key(key) then
+		return { source = "out", key = key, negate = neg == "!" }
+	elseif src == "input" and key then
+		if not inputs[key] then
+			issue(c, where, `input.{key} 不是已声明的 [[workflow.input]]`, line)
+			return nil
+		end
+		return { source = "input", key = key, negate = neg == "!" }
+	end
+	issue(c, where, "应为 out.<输出名> 或 input.<输入名>,可加 ! 取反", line)
+	return nil
+end
+
 local function parse_toml(file: string, text: string): ({ [string]: any }?, toml.Positions?, { Issue })
 	local root, extra = toml.parse(text)
 	if root == nil then
@@ -676,7 +757,7 @@ function M.parse_config(text: string): (Config?, { Issue })
 		return nil, errs
 	end
 	local c: Ctx = { file = "roost.toml", issues = {}, pos = pos }
-	check_keys(c, root, "roost", { "relay", "runner", "github" })
+	check_keys(c, root, "roost", { "relay", "runner", "github", "retention" })
 	local r = get_table(c, root, "relay", "relay")
 	check_keys(c, r, "relay", { "url", "token", "token_env", "client_name" })
 	local url = get_string(c, r, "url", "relay")
@@ -698,9 +779,14 @@ function M.parse_config(text: string): (Config?, { Issue })
 	}
 
 	local u = get_table(c, root, "runner", "runner")
+	-- keep_runs is listed only to say where it went (the error keeps the whole file from applying,
+	-- so the old retention never runs under the defaults).
 	check_keys(c, u, "runner", {
-		"omp", "omp_args", "session", "shell", "git", "max_concurrent", "default_timeout", "keep_runs", "extra_path", "env",
+		"omp", "omp_args", "session", "shell", "git", "max_concurrent", "default_timeout", "extra_path", "env", "keep_runs",
 	})
+	if u.keep_runs ~= nil then
+		issue(c, "runner.keep_runs", "已移到 [retention] runs(保留的已结束运行数);改好之前不会自动清理", line_of(c, u, "keep_runs"))
+	end
 	local runner: Runner = {
 		omp = get_string(c, u, "omp", "runner") or "omp",
 		omp_args = if u.omp_args ~= nil then get_strings(c, u, "omp_args", "runner") else table.clone(M.DEFAULT_OMP_ARGS),
@@ -709,7 +795,6 @@ function M.parse_config(text: string): (Config?, { Issue })
 		git = get_string(c, u, "git", "runner") or "git",
 		max_concurrent = get_int(c, u, "max_concurrent", "runner", 2, 1, 16),
 		default_timeout = get_duration(c, u, "default_timeout", "runner") or 1800,
-		keep_runs = get_int(c, u, "keep_runs", "runner", 200, 10, 2000),
 		extra_path = if u.extra_path ~= nil
 			then get_strings(c, u, "extra_path", "runner")
 			else table.clone(M.DEFAULT_EXTRA_PATH),
@@ -721,15 +806,44 @@ function M.parse_config(text: string): (Config?, { Issue })
 	end
 
 	local g = get_table(c, root, "github", "github")
-	check_keys(c, g, "github", { "login" })
+	check_keys(c, g, "github", { "login", "identity" })
 	local login = get_string(c, g, "login", "github")
 	if login and not string.match(login, "^[%w%-]+$") then
 		issue(c, "github.login", "应为 GitHub 用户名", line_of(c, g, "login"))
 	end
+	local identity = get_string(c, g, "identity", "github") or "app"
+	if identity ~= "app" and identity ~= "local" then
+		issue(c, "github.identity", "应为 app(以 GitHub App 身份)或 local(本机 gh 身份)", line_of(c, g, "identity"))
+		identity = "app"
+	end
+
+	local k = get_table(c, root, "retention", "retention")
+	check_keys(c, k, "retention", { "runs", "run_age", "events", "event_age" })
+	local function age(key: string): number
+		local d = get_duration(c, k, key, "retention")
+		if d == nil then
+			return 30 * 86400
+		end
+		if d > 0 and d < 3600 then
+			issue(c, `retention.{key}`, "至少 1h(例如 \"30d\"),或 \"0\" 表示不按时间清理", line_of(c, k, key))
+		end
+		return d
+	end
+	local retention: Retention = {
+		runs = get_int(c, k, "runs", "retention", 200, 10, 5000),
+		run_age = age("run_age"),
+		events = get_int(c, k, "events", "retention", 200, 10, 2000),
+		event_age = age("event_age"),
+	}
 	if #c.issues > 0 then
 		return nil, c.issues
 	end
-	return { relay = relay, runner = runner, github = { login = if login == "" then nil else login } }, {}
+	return {
+		relay = relay,
+		runner = runner,
+		github = { login = if login == "" then nil else login, identity = identity :: any },
+		retention = retention,
+	}, {}
 end
 
 -- The token to send: literal, else the named environment variable.
@@ -1121,7 +1235,7 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		local base = `workflow.{if id ~= "" then id else tostring(wi)}`
 		check_keys(c, w, base, {
 			"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace",
-			"env", "input", "trigger", "step",
+			"identity", "daily_budget", "env", "input", "trigger", "step",
 		})
 		if not valid_id(id) then
 			issue(c, `{base}.id`, `id "{id}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, w, "id") or wline)
@@ -1138,6 +1252,11 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		if ws ~= "auto" and ws ~= "worktree" and ws ~= "repo" and ws ~= "temp" then
 			issue(c, `{base}.workspace`, "应为 auto、worktree、repo 或 temp", line_of(c, w, "workspace"))
 			ws = "auto"
+		end
+		local identity = get_string(c, w, "identity", base)
+		if identity ~= nil and identity ~= "app" and identity ~= "local" then
+			issue(c, `{base}.identity`, "应为 app 或 local(省略则用 roost.toml [github] identity)", line_of(c, w, "identity"))
+			identity = nil
 		end
 
 		local inputs: { Input } = {}
@@ -1176,7 +1295,7 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		for si, s in rawsteps do
 			local spath = `{base}.step[{si}]`
 			local sline = line_of(c, rawsteps, si)
-			check_keys(c, s, spath, { "name", "omp", "run", "model", "args", "timeout", "continue_on_error" })
+			check_keys(c, s, spath, { "name", "omp", "run", "model", "args", "timeout", "continue_on_error", "when" })
 			local prompt = get_string(c, s, "omp", spath)
 			local script = get_string(c, s, "run", spath)
 			local step: Step = {
@@ -1188,6 +1307,7 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 				args = get_strings(c, s, "args", spath),
 				timeout = get_duration(c, s, "timeout", spath),
 				continue_on_error = get_bool(c, s, "continue_on_error", spath, false),
+				when = get_when(c, s, spath, input_names),
 			}
 			if prompt and script then
 				issue(c, spath, "omp 与 run 只能二选一", sline)
@@ -1235,6 +1355,8 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 			concurrency = conc :: any,
 			workspace = ws :: any,
 			env = get_map(c, w, "env", base),
+			identity = identity :: any,
+			daily_budget = get_budget(c, w, "daily_budget", base),
 			inputs = inputs,
 			triggers = triggers,
 			steps = steps,
@@ -1331,7 +1453,8 @@ local function day_names(days: { string }): string
 end
 
 -- One line for a trigger: 「每周 周一、周五 09:00」, 「拉取请求已打开 · 仓库 acme/web」.
-function M.describe_trigger(t: Trigger): string
+-- `omit_repos` leaves the repository scope out (lists show it once, see trigger_repos).
+function M.describe_trigger(t: Trigger, omit_repos: boolean?): string
 	if t.kind == "cron" then
 		local ct = t :: CronTrigger
 		local s: string
@@ -1357,7 +1480,7 @@ function M.describe_trigger(t: Trigger): string
 		if ct.utc then
 			s ..= " UTC"
 		end
-		if ct.repo then
+		if ct.repo and not omit_repos then
 			s ..= ` · {ct.repo}`
 		end
 		return s
@@ -1370,6 +1493,9 @@ function M.describe_trigger(t: Trigger): string
 	local parts: { string } = { if gt.on == "event" then `{meta.label} {gt.events[1] or "?"}` else meta.label }
 	local get = gt :: any
 	for _, key in meta.filters do
+		if omit_repos and key == "repos" then
+			continue
+		end
 		local f = M.FILTERS[key]
 		local v = get[key]
 		if f.kind == "text" and type(v) == "string" then
@@ -1390,6 +1516,15 @@ function M.describe_trigger(t: Trigger): string
 		end
 	end
 	return table.concat(parts, " · ")
+end
+
+-- The repositories a trigger is limited to; empty means any.
+function M.trigger_repos(t: Trigger): { string }
+	if t.kind == "cron" then
+		local ct = t :: CronTrigger
+		return if ct.repo then { ct.repo } else {}
+	end
+	return (t :: GithubTrigger).repos
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1471,7 +1606,10 @@ function M.slug(name: string, taken: { [string]: boolean }): string
 	return id
 end
 
-local WF_ORDER = { "id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace", "env" }
+local WF_ORDER = {
+	"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace", "identity",
+	"daily_budget", "env",
+}
 local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify = true, concurrency = "queue", workspace = "auto" }
 local SUB_ORDER: { [string]: { string } } = {
 	input = { "name", "description", "default", "required" },
@@ -1481,7 +1619,7 @@ local SUB_ORDER: { [string]: { string } } = {
 		"conclusions", "workflows", "review_states", "thread_actions", "comment",
 		"skip_drafts", "include_closed", "ignore_bots", "ignore_self", "forks", "associations",
 	},
-	step = { "name", "omp", "run", "model", "args", "timeout", "continue_on_error" },
+	step = { "name", "when", "omp", "run", "model", "args", "timeout", "continue_on_error" },
 }
 local SUB_DEFAULTS: { [string]: { [string]: any } } = {
 	input = { required = false },

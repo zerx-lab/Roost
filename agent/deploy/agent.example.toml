@@ -15,7 +15,9 @@ token = "env:ROOST_TOKEN"
 
 [github]
 # The agent runs as a GitHub App, created from the Roost relay page (「创建 GitHub App」): GitHub
-# shows the read-only App for confirmation, then you pick the repositories to install it on.
+# shows the App for confirmation, then you pick the repositories to install it on. Runs act on
+# GitHub with per-run tokens the agent hands out once a repository's default branch can't be
+# force-pushed (it adds a ruleset when needed; that is what the Administration permission is for).
 # Its id, private key and webhook secret are kept in <data>/github-app.json (mode 600).
 # api_url = "https://api.github.com"     # GitHub Enterprise: https://HOST/api/v3
 # web_url = "https://github.com"         # GitHub Enterprise: https://HOST

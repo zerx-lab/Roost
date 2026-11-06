@@ -14,7 +14,7 @@ flowchart LR
   GH[GitHub App 所装仓库] -- webhook + HMAC --> A[roost-agent<br/>服务器]
   P[Roost 插件<br/>本机 Tern] -- 长轮询 /api/v1/events --> A
   P -- 推送订阅 / 仓库与人员建议 --> A
-  A -- 只读安装令牌 --> GH
+  A -- 安装令牌(中继自用 / 每次运行一个) --> GH
   P -- 定时 / 手动 / 事件 --> R[omp 与 shell 步骤<br/>git worktree]
 ```
 
@@ -24,24 +24,26 @@ flowchart LR
 tern plugin install github.com/<owner>/<repo>    # 或开发时:tern plugin link .
 ```
 
-命令面板运行 **Roost:打开工作台**。首次启动会在 `tern.plugin.data`(macOS:`~/Library/Application Support/Tern/plugin-data/roost/`)生成两个文件,保存即生效:
+命令面板运行 **Roost:打开工作台**。首次启动会在 `tern.plugin.data`(macOS:`~/Library/Application Support/Tern/plugin-data/roost/`)生成两个配置文件,保存即生效;运行产生的数据也放在这里:
 
 | 文件 | 作用 |
 |---|---|
-| `roost.toml` | 本机绑定:中继地址与令牌、runner 设置(omp 参数、agent 会话名、并发、超时、PATH)、`[github] login`(可选,你的 GitHub 用户名) |
+| `roost.toml` | 本机绑定:中继地址与令牌、runner 设置(omp 参数、agent 会话名、并发、超时、PATH)、`[retention]` 保留策略、`[github] login`(可选,你的 GitHub 用户名) |
 | `workflows.toml` | 仓库(GitHub 名 → 本机路径)、自动化、触发器、步骤;面板的表单编辑器读写的就是它 |
+| `runs.json`、`runs/<run>/`、`worktrees/<run>/` | 运行历史;每个运行的日志、事件负载与 omp 会话;事件运行的临时 worktree |
+| `events.json` | 「事件」页:收到的每个中继事件,以及它启动的运行或没有触发的原因 |
 | `theme.css`(可选) | 自定义样式,实时注入,见「外观定制」 |
 
 ### 在面板中新建自动化
 
-「工作流」页的「新建自动化」会打开一个表单,也可以从下方的模板库开始。表单内容:
+「工作流」页左边是工作流列表(名称、触发摘要、最近运行、下次定时),右边是选中工作流的触发器、仓库、步骤和最近 5 次运行;双击一行直接编辑。「新建自动化」会打开一个表单,也可以从旁边的「从模板」菜单开始(还没有工作流时,页面直接显示模板库)。表单内容:
 
 - **名称与图标**。
 - **触发器**:点「＋添加触发器」,菜单按「定时」和「GitHub」分组。
   - 定时触发器显示成一句话,例如「每周 ▾ 在 一 三 五 于 09:00」「每小时 ▾ 在 工作日 9:00–18:00 之间」。
   - GitHub 触发器显示成一张卡片,列出该种类支持的筛选器,空着表示「任意」。仓库、作者、负责人、标签、分支、工作流名称这几项会通过 GitHub App 给出建议。
   - 每个 GitHub 触发器至少要设一个筛选器。
-- **指令**:即 omp 提示词,可以选模型;另外可以追加更多 omp 或 shell 步骤。
+- **指令**:即 omp 提示词,可以选模型;另外可以追加更多 omp 或 shell 步骤。模型下拉框来自本机 omp(`omp config get modelRoles` 与 `omp models --json`,PATH 含 `[runner] extra_path`,缓存 5 分钟):**Auto**(不传 `--model`,即 omp 的 `default` 角色)、角色 `@<角色>`(由 omp 按 `modelRoles` 解析,改了 omp 的角色配置就跟着变)、各 provider 的聊天模型 `provider/id`;`workflows.toml` 里手写的值(例如带 `:high` 思考后缀)照样保留可选。
 - **通知**:运行结束时在 Tern 弹出通知。
 - **高级**:id、并发、工作区、超时、时区、外部贡献者与 fork 的放行。
 
@@ -120,16 +122,37 @@ omp = """
 - 开关项及默认值:`skip_drafts` 默认开,`include_closed` 默认关,`ignore_bots` 默认开,`ignore_self` 默认开。`ignore_self` 忽略你自己的活动,前提是 `roost.toml` 设了 `[github] login`,或者 App 归你个人所有;把自己(`@me`)写进 `authors` 就会放行你自己的活动。
 - **安全默认值**:议题、评论、PR 这类「用户可写内容」事件,默认只接受 `OWNER`/`MEMBER`/`COLLABORATOR` 作者;设 `associations = ["*"]`(表单「高级」里的「允许外部贡献者」)才对所有人开放。`check_completed`/`workflow_run` 默认拒绝代码来自 fork(或无法确认来源)的事件,设 `forks = true` 才接受。omp 以 yolo 模式运行,放开前请想清楚提示词注入与执行外部代码的风险。
 - **模板**只用于 omp 提示词:`{{repo}} {{event}} {{action}} {{number}} {{title}} {{body}} {{url}} {{ref}} {{sha}} {{branch}} {{sender}} {{comment}} {{label}} {{workflow}} {{run_id}} {{trigger}} {{input.<名>}} {{payload.<路径>}}`(数组下标从 0 开始)。shell 步骤不做模板替换,改读环境变量 `ROOST_*`:`ROOST_REPO`、`ROOST_NUMBER`、`ROOST_SHA`、`ROOST_BRANCH`、`ROOST_SENDER`、`ROOST_URL`、`ROOST_EVENT_PATH`(完整 payload)、`ROOST_INFO_PATH`(归一化事件)、`ROOST_WORKSPACE`、`ROOST_INPUT_<名>` 等,事件文本不会被拼进命令行。
-- **工作区**:在 `[repos]` 里声明了本机路径的仓库,事件运行在 `plugin-data/roost/worktrees/<run>` 的临时 worktree 中(检出 PR 的 `refs/pull/N/head`、push 的 sha 等),结束后自动清理;`workspace = "repo" | "temp"` 可改。没声明的仓库在临时空目录中运行。
+- **步骤输出与条件**:shell 步骤可以向 `$ROOST_OUTPUT` 追加 `键=值` 行(键为字母、数字、下划线,值一行),之后的步骤在提示词里用 `{{out.<键>}}`、在 shell 里用 `ROOST_OUT_<键大写>` 读取。步骤加 `when = "out.<键>"` 或 `when = "input.<名>"`(前面加 `!` 取反)时,只有该值为真(非空,且不是 `0`/`false`/`no`)才运行,否则记为「已跳过」并继续下一步。输出 `stop=<原因>` 会在该步骤成功后结束整个运行,运行记为「已跳过」(不弹通知),适合「没有要处理的东西」。`$ROOST_OUTPUT` 只接受普通文件,只在 shell 步骤里提供。
+- **费用与预算**:omp 步骤结束后,插件汇总它会话目录里所有 JSONL(包括子代理)中的 `usage.cost.total` 与 `totalTokens`,记到步骤上,运行详情、步骤表与工作流卡片显示估算费用(按 omp 的标价估算,订阅类 provider 记为 0)。工作流设 `daily_budget = 5`(美元)后,当天(本机时区)该工作流 omp 步骤的累计费用达到预算时,后续 omp 步骤不再启动,运行记为「已跳过」并写明原因。
+- **工作区**:在 `[repos]` 里声明了本机路径的仓库,事件运行在 `plugin-data/roost/worktrees/<run>` 的临时 worktree 中(检出 PR 的 `refs/pull/N/head`、push 的 sha 等),结束后自动清理;`workspace = "repo" | "temp"` 可改。没声明的仓库在临时空目录中运行。手动运行用触发器唯一指向的已声明仓库(定时的 `repo`、GitHub 触发器不含通配的 `repos`),否则用唯一声明的仓库;`workspace = "worktree" | "repo"` 却确定不了仓库时拒绝手动运行。
+- **手动指定 PR**:有 PR 类触发器(PR 打开/草稿/推送/合并、审查、审查评论、审查线程)的工作流,点「运行」时表单多一个「拉取请求」字段,填 `owner/name#12`、PR 链接,或在触发器只指向一个仓库时只写编号;只有 PR 类触发器时必填,还有其他触发器时留空就是普通手动运行。插件用本机 `gh api repos/<仓库>/pulls/<编号>` 读取 PR(PATH 含 `[runner] extra_path`;中继不提供 PR 读取),把它整理成和 webhook 相同的事件字段(`action = "manual"`),`payload` 为 `{action, pull_request, repository}`,在 PR head(`refs/pull/N/head`)上运行;读取期间取消表单则不排队。
 - 取消或超时时,shell 步骤会向整个进程组发送 SIGTERM,8 秒后 SIGKILL;omp 步骤直接关闭它的 agent 标签页。插件重载时,仍在运行的步骤会被重新接管。
 
 ### omp 步骤与会话侧栏
 
-- omp 步骤以 **Tern 原生 agent block** 运行。Tern 窗口在固定会话(`roost.toml` 的 `[runner] session`,默认 `Roost`,不存在时自动创建)里新开一个标签页执行。打开时不会抢走焦点。这一轮结束后标签页自动关闭,成功或失败都会关;如果被人手动关掉,这一步按失败处理。agent 的最后一条回复会追加到运行日志。
+- omp 步骤以 **Tern 原生 agent block** 运行。Tern 窗口在固定会话(`roost.toml` 的 `[runner] session`,默认 `Roost`,不存在时自动创建)里新开一个标签页执行。打开时不会抢走焦点。这一轮结束后标签页自动关闭,成功或失败都会关;如果被人手动关掉,这一步按失败处理。
+- agent 运行期间,插件每 2 秒读取它的会话文件,把进展写进运行日志:标签页打开、每段说明文字、每次工具调用(一行,取工具的意图说明或路径/命令)、失败的工具结果,最后是完整的最终回复和结束状态。会话文件里没有最终回复时(例如没能打开 agent),改为追加窗口记录的最后一条消息。
 - agent 只能由窗口打开:插件 host 把任务写进运行目录和 kv,所有窗口用 `mkdir` 认领,保证只有一个窗口去打开。**没有打开的 Tern 窗口时,omp 步骤会一直等待,直到有窗口出现或超时**。agent 已经打开后如果所有窗口都关了,取消和超时要等有窗口重新打开后才会关掉它。
-- omp 以交互式运行,会话保存在运行目录 `runs/<run>/s<步骤>.session/`(`--session-dir`),不会写入 `~/.omp`。这些会话随 `keep_runs` 跟运行一起清理。`-p`、`--session-dir`、`--resume`、`--continue` 等参数由 Roost 管理,写进 `omp_args` 或步骤 `args` 会报配置错误。
+- omp 以交互式运行,会话保存在运行目录 `runs/<run>/s<步骤>.session/`(`--session-dir`),不会写入 `~/.omp`。这些会话随运行一起按 `[retention]` 清理。`-p`、`--session-dir`、`--resume`、`--continue` 等参数由 Roost 管理,写进 `omp_args` 或步骤 `args` 会报配置错误。
 - omp 步骤收不到 `[runner] env`、工作流 `env` 以及 `ROOST_*` 环境变量,环境沿用 Tern 打开 agent 时的环境。需要的信息请通过提示词模板传入。
 - **会话侧栏**:命令面板运行 **Roost:会话侧栏**,或点工作台标题栏的 omp 图标,会在当前标签页左侧打开或关闭 `roost.sessions` 分屏,列出 Roost 跑过的 omp 会话。双击某行或按 Enter:还在运行的会话会跳到它的标签页;已结束的会话会在新标签页中用 `omp --resume` 继续打开。运行详情里的「omp 会话」按钮效果相同。
+
+### 数据保留与清理
+
+长期积累的数据都有自动清理和手动清理两种方式:
+
+| 数据 | 自动清理 | 手动清理 |
+|---|---|---|
+| 运行记录、日志、事件负载、omp 会话、遗留 worktree | `[retention] runs = 200`、`run_age = "30d"`:超出数量或结束超过时长的**已结束**运行会被删除;没有对应运行的目录一并清掉 | 运行详情的「删除」;「配置 → 存储与清理」的「按策略清理」「删除全部已结束运行」 |
+| 「事件」页记录(`events.json`) | `events = 200`、`event_age = "30d"` | 「事件」页或「存储与清理」的「清空记录」 |
+| 中继的事件缓存(服务器 `events/`) | `agent.toml` 的 `[store] keep_events`、`max_age`、`max_total_bytes` | 「中继」页的「清空中继事件缓存」 |
+| 中继的投递统计(服务器内存) | 最近 200 条、统计 256 组,重启即清空 | 「中继」页的「清空统计」 |
+
+- 自动清理在插件启动时、每小时一次、`[retention]` 首次生效或修改之后执行。roost.toml 有错误时不按策略删除任何东西;旧的 `[runner] keep_runs` 会报错并提示改成 `[retention] runs`。时长写 `"0"` 表示不按时间清理,否则至少 `1h`。`runs` 只计已结束的运行,排队中和运行中的运行不会被删除。
+- 目录在后台分批删除:每批最多 8 个,交给 `rm -rf` 在插件进程外执行,所以不会卡住面板,也不会跟随 worktree 里的符号链接删到外面。删除失败的目录会重试。「存储与清理」卡片显示各部分的磁盘占用、上次自动清理删了什么,以及还有多少目录在等待删除。如果 `runs.json` 曾无法读取(留有 `runs.json.unreadable`),就暂不清理无主目录,以免误删旧运行。
+- 删除和清空都要点两次,两次点击之间要隔 0.8 到 5 秒,所以双击不会误删。第一次点击后按钮变成「确认…」,按键、切换选择或做别的操作都会取消。
+- 「事件」页每行的「结果」列显示它启动的运行和运行状态,选中这一行会跳到对应的运行;运行已被清理的标为「记录已清理」。首次连接中继,或者还没有 `events.json` 时,会取回中继里最近 20 条已读事件作为历史,只展示不触发;如果当时启动过运行,会按投递 id 关联上。
+- 「中继」页底部的「Webhook 投递」按结果、事件和仓库统计 GitHub 发来的 webhook。「已忽略」表示没有任何工作流订阅这个事件,所以不会转发到本机,本机的「事件」页也看不到它。给工作流加上对应的 GitHub 触发器后,订阅会自动同步。
 
 ## 部署中继 roost-agent
 
@@ -162,13 +185,29 @@ token = "<ROOST_TOKEN 的值>"   # 或 token_env = "ROOST_TOKEN"
 3. GitHub 回调中继。中继把 App 的 id、私钥和 webhook 密钥保存到 `<data>/github-app.json`(权限 600),然后跳转到安装页。在安装页选择要安装的仓库。
 4. 以后要增减仓库,在 GitHub 的 App 安装设置里修改。
 
-App 只申请**只读**权限:metadata、contents、issues、pull_requests、checks、actions。中继用它接收事件,并给表单提供仓库、人员、标签、分支、工作流名称的建议。需要写 GitHub 的动作(评论、审查、推送)由 omp 或 shell 步骤用你本机的 `gh` 身份完成。「忘记本地凭据」只删除中继上的凭据,App 本身要到 GitHub 设置里删除。
+App 申请的仓库权限:actions、checks、contents、deployments、discussions、issues、pull_requests、statuses、workflows 为读写,metadata 只读,另有 administration 读写。中继用 App 接收事件、给表单提供仓库/人员/标签/分支/工作流名称的建议,并给每次运行签发令牌(见下一节)。「忘记本地凭据」只删除中继上的凭据,App 本身要到 GitHub 设置里删除。
+
+2026-11-06 之前创建的 App 只有只读权限。GitHub 不允许通过 API 修改 App 权限,需要手动升级:「中继」页点「权限设置」,在 Permissions 中按上面的列表开启读写,保存;再到每个安装(组织或个人账号的 Installed GitHub Apps)接受新权限。「中继」页会列出还没生效的权限。
+
+头像:GitHub 没有设置 App 头像的 API,只能在 App 设置页上传。「中继」页点「设置头像」打开设置页,Roost 自带的头像在 `assets/app-logo.png`(512×512,源文件 `assets/app-logo.svg`)。
+
+### 以 App 身份运行
+
+运行在 GitHub 上的操作(评论、审查、推送、开 PR)默认以 App 的机器人账号 `<slug>[bot]` 进行。`roost.toml` 的 `[github] identity = "local"` 可改回本机 `gh` 身份,单个工作流可用 `identity = "app" | "local"` 覆盖。没有关联仓库的运行总是用本机身份,日志里会写明。
+
+- 以 App 身份的运行,第一步是「获取 App 令牌」:插件调用 `POST /api/v1/github/token`,中继签发一个**只限该仓库**的安装令牌,包含安装授予的所有权限,唯独去掉 administration。令牌约一小时过期,运行期间插件会在到期前 15 分钟自动续期;运行结束后删除令牌文件。
+- **禁止强推默认分支**:签发令牌前,中继检查仓库默认分支(通常是 main)是否已有禁止强推和删除的规则;没有就用 administration 权限加上规则集「Roost: protect default branch」(non_fast_forward + deletion,仓库管理员可绕过,App 不能)。规则加不上(例如私有仓库所在账号的套餐不支持规则集,或安装还没接受 administration 权限)时,中继拒绝签发令牌,运行失败并在日志中写明原因。其他分支的强推、rebase、合并、推送到 main(快进)都允许。
+- 令牌保存在运行目录的 `app-token`(权限 600),只经标准输入写入,不出现在命令行或环境文件里。shell 步骤得到 `GH_TOKEN`;所有步骤都会把 `<plugin-data>/bin/gh` 放到 `PATH` 最前,这个包装每次调用都读取当前令牌再执行真正的 `gh`。git 通过 `GIT_CONFIG_*` 只对 github.com 使用该令牌(清掉你自己的凭据助手),ssh 远端改走 https,提交作者与提交者是 App 机器人(`<id>+<slug>[bot]@users.noreply.github.com`)。
+- omp 步骤:`cx.agents:start` 不能传环境变量,所以 omp 通过 `/bin/sh` 先 source 运行目录里的 `s<i>.env`(只含上述变量,不含令牌)再启动。准备与清理 worktree 仍用你本机的 git 身份。之后从会话侧栏续开的历史会话也是本机身份。
+- 工作流触发器的「忽略我自己的活动」同样忽略 App 机器人的活动,避免 Roost 回复自己的评论形成循环。
+- 限制与注意:中继地址必须是 https(本机回环地址除外),否则不签发 App 令牌;令牌或身份丢失(例如插件恰好在令牌步骤后重载)时,后续步骤直接失败,不会退回你的身份。`$GH_TOKEN` 是步骤启动时的快照,超过一小时的步骤里直接读它的工具(curl 等)应改读 `$ROOST_GH_TOKEN_FILE`;`gh` 包装和 git 凭据总是读最新令牌。你的 git 配置里若有 `url.….pushInsteadOf` 把 github.com 推送改回 ssh,推送仍会用你的 ssh 密钥。
 
 ### 配置同步与回退
 
 - **本地优先**:保存 `workflows.toml` 后,插件计算每个仓库需要的事件,推送到中继(`PUT /api/v1/subscriptions`,带版本号防覆盖)。仓库筛选为空的触发器订阅在 `"*"`(任意仓库)下。中继只保留订阅了的事件。
 - **回退到云端手动设置**:推送失败时,「中继」页给出完整的 `subscriptions.toml` 内容可复制;保存到服务器后点「重新加载」(或 `systemctl reload roost-agent`)。
 - 服务器上手改过订阅后,本机再推送会提示冲突:可「以本地覆盖」或「采用云端」。
+- 订阅状态以中继 `/status` 报告的版本为准:中继运行的正是本机上次推送的版本且本地没改 →「已同步」;采用云端后 →「沿用云端」(本地修改工作流后自动改推本地版本);还没拿到中继状态 →「待核对」。「推送订阅」总会发起一次推送,即使内容没变。
 - **远程重启**:`agent.toml` 改动(或换了二进制)后,点「重启中继」即可,无需登录服务器。中继原地 `exec` 自身(PID 不变),已缓存的事件与游标保留。
 
 ### 中继 API
@@ -185,13 +224,22 @@ App 只申请**只读**权限:metadata、contents、issues、pull_requests、che
 | POST | `/api/v1/github/app/manifest` | 开始创建 App(`{"org"?, "name"?}`),返回要在浏览器打开的地址 |
 | DELETE | `/api/v1/github/app` | 删除本地 App 凭据 |
 | GET | `/api/v1/github/{repos,people,labels,branches,workflows}?repo=` | 表单建议 |
+| POST | `/api/v1/github/token` | 为一次运行签发 App 令牌(`{"repo"}`):先确保默认分支禁止强推与删除,返回 `token`、`expires_in`、`login`、`email`、`permissions`、`branch`、`protection` |
 | POST | `/api/v1/events/test` | 产生一条 `roost_test` 事件,验证全链路 |
-| GET | `/api/v1/status`、`/api/v1/deliveries` | 状态(含 App 信息)、最近投递记录 |
+| DELETE | `/api/v1/events` | 清空缓存的事件(序号继续递增,客户端游标仍然有效;还没读到的客户端会看到缺口提示) |
+| GET | `/api/v1/status`、`/api/v1/deliveries` | 状态(含 App 信息);最近投递,以及按结果、事件、仓库的计数(内存中,从启动或上次清空开始) |
+| DELETE | `/api/v1/deliveries` | 清空投递记录与计数 |
 | GET | `/github/app/new`、`/github/app/callback`、`/github/app/installed` | App 注册流程的浏览器页面 |
 
 ## 外观定制
 
-面板全部由 Tern 原生元素绘制(表格、分栏、ANSI 日志、状态徽章),视图按节点 key 增量更新,日志只发送追加部分。`roost.css` 顶部列出了所有 `data-role` 钩子;在 `plugin-data/roost/theme.css` 中写样式即可覆盖,保存后实时生效,插件目录不会被改动。
+面板按 Tern 设计规范组织成一页:标题行(版本、工作流数、中继地址、状态徽章)、页签,再是当前视图。
+
+- **概览**:4 个指标(运行中、24 小时运行数、24 小时成功率、下一次定时),近 14 天的「运行次数」(成功 / 失败)与「运行耗时」(P50 / P95)折线图,以及每个工作流的健康表(运行数、成功率、P50/P95、每日趋势、最近运行、下次定时);下面是即将触发的定时和通知。
+- **运行**:左右分栏铺满整个面板,页面本身不滚动。左边是运行列表(状态、工作流与事件摘要、触发方式、时间、耗时),右边是选中运行的详情:标题行(工作流名、事件摘要、状态、耗时、重跑/取消),键值对齐的事实表(失败原因置顶,其后是触发与事件链接、仓库与 ref、身份、输入、创建时间、估算费用),步骤时间线(每个步骤按开始时间和耗时画成条),omp 会话 / 日志文件 / 自动换行 / 工作区按钮,最后是实时日志,占满详情的剩余高度并在其中滚动。「自动换行」默认打开,日志按窗格宽度换行;关闭后长行保持一行,只在日志区内横向滚动。
+- **工作流**:每个工作流一张卡片平铺(宽窗口每行 2–3 张):标题右侧是「编辑」「运行」,正文是触发器、仓库(超过两个时折叠为「等 N 个」)、步骤与下次定时,底部是最近一次运行、最近 24 次运行的结果条(按成败着色,悬停看时间与耗时)和近 14 天成功率。`j/k` 切换选中卡片,`r` 运行,`e` 编辑。
+
+面板全部由 Tern 原生元素绘制(表格、分栏、图表、ANSI 日志、状态徽章),视图按节点 key 增量更新,日志只发送追加部分。`roost.css` 顶部列出了所有 `data-role` 钩子;在 `plugin-data/roost/theme.css` 中写样式即可覆盖,保存后实时生效,插件目录不会被改动。
 
 ## 开发
 

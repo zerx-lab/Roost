@@ -94,6 +94,44 @@ function M.clock(t: number?): string
 	return os.date("%m-%d %H:%M", t) :: string
 end
 
+-- An RFC 3339 timestamp (the agent's, UTC or with an offset) as epoch seconds.
+function M.rfc3339(s: any): number?
+	if type(s) ~= "string" then
+		return nil
+	end
+	local y, mo, d, h, mi, se = string.match(s, "^(%d+)%-(%d+)%-(%d+)T(%d+):(%d+):(%d+)")
+	if not y then
+		return nil
+	end
+	local Y, Mo, D = tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number
+	-- Days from civil (proleptic Gregorian), UTC.
+	local yy = if Mo <= 2 then Y - 1 else Y
+	local era = math.floor(yy / 400)
+	local yoe = yy - era * 400
+	local mp = (Mo + 9) % 12
+	local doy = math.floor((153 * mp + 2) / 5) + D - 1
+	local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+	local days = era * 146097 + doe - 719468
+	local t = days * 86400 + (tonumber(h) :: number) * 3600 + (tonumber(mi) :: number) * 60 + (tonumber(se) :: number)
+	local sign, oh, om = string.match(s, "([%+%-])(%d%d):?(%d%d)$")
+	if sign and oh and om then
+		local off = (tonumber(oh) :: number) * 3600 + (tonumber(om) :: number) * 60
+		t = if sign == "+" then t - off else t + off
+	end
+	return t
+end
+
+-- `1.2 MiB` style size of `bytes`.
+function M.fmt_bytes(bytes: number): string
+	local units = { "B", "KiB", "MiB", "GiB", "TiB" }
+	local v, i = math.max(0, bytes), 1
+	while v >= 1024 and i < #units do
+		v /= 1024
+		i += 1
+	end
+	return if i == 1 then `{math.floor(v)} B` else string.format("%.1f %s", v, units[i])
+end
+
 -- At most `n` characters of `s` (UTF-8 aware), with an ellipsis when cut.
 function M.clip(s: string, n: number): string
 	local len = utf8.len(s)
@@ -102,6 +140,58 @@ function M.clip(s: string, n: number): string
 	end
 	local cut = utf8.offset(s, n + 1)
 	return string.sub(s, 1, (cut or (#s + 1)) - 1) .. "…"
+end
+
+-- East Asian wide and fullwidth ranges (CJK, Hangul, fullwidth forms, emoji): two cells each.
+local function wide(cp: number): boolean
+	return (cp >= 0x1100 and cp <= 0x115F)
+		or (cp >= 0x2E80 and cp <= 0xA4CF and cp ~= 0x303F)
+		or (cp >= 0xAC00 and cp <= 0xD7A3)
+		or (cp >= 0xF900 and cp <= 0xFAFF)
+		or (cp >= 0xFE30 and cp <= 0xFE4F)
+		or (cp >= 0xFF00 and cp <= 0xFF60)
+		or (cp >= 0xFFE0 and cp <= 0xFFE6)
+		or (cp >= 0x1F300 and cp <= 0x1F64F)
+		or (cp >= 0x1F900 and cp <= 0x1F9FF)
+		or (cp >= 0x20000 and cp <= 0x3FFFD)
+end
+
+-- Terminal cells one output line takes: escape sequences take none, `\r` returns to the first
+-- column (the widest pass counts), a tab moves to the next multiple of 8, `\b` steps back, wide
+-- characters take two. Bytes that are not UTF-8 are skipped.
+function M.cells(line: string): number
+	local s = string.gsub(line, "\27%][^\7\27]*\7", "")
+	s = string.gsub(s, "\27%][^\7\27]*\27\\", "")
+	s = string.gsub(s, "\27%[[0-?]*[ -/]*[@-~]", "")
+	s = string.gsub(s, "\27.", "")
+	local col, best = 0, 0
+	for ch in string.gmatch(s, utf8.charpattern) do
+		local b = string.byte(ch)
+		local n = #ch
+		if n == 1 then
+			if b == 13 then
+				col = 0
+			elseif b == 9 then
+				col += 8 - col % 8
+			elseif b == 8 then
+				col = math.max(0, col - 1)
+			elseif b >= 32 and b ~= 127 then
+				col += 1
+			end
+		else
+			local cp = 0
+			if n == 2 then
+				cp = (b % 32) * 64 + string.byte(ch, 2) % 64
+			elseif n == 3 then
+				cp = (b % 16) * 4096 + (string.byte(ch, 2) % 64) * 64 + string.byte(ch, 3) % 64
+			elseif n == 4 then
+				cp = (b % 8) * 262144 + (string.byte(ch, 2) % 64) * 4096 + (string.byte(ch, 3) % 64) * 64 + string.byte(ch, 4) % 64
+			end
+			col += if wide(cp) then 2 else 1
+		end
+		best = math.max(best, col)
+	end
+	return best
 end
 
 -- The first line of `s`.

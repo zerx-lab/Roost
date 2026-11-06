@@ -2,7 +2,7 @@
 -- The `roost.sessions` block: the omp agent sessions Roost ran, newest first, sized for a left
 -- split. Activating a row (double-click, Enter, or the row menu) hands `roost://session/<run>/<i>`
 -- to the window, which focuses the live agent or resumes the saved conversation in a new tab.
--- The sessions live in each run's directory and go when keep_runs prunes the run.
+-- The sessions live in each run's directory and go when [retention] cleanup deletes the run.
 --
 -- Theming: data-role `roost.sessions`.
 

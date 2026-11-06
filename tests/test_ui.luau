@@ -50,7 +50,8 @@ workspace = "temp"
 run = "echo plain"
 ]==]
 
-local ROOST = '[relay]\nurl = "https://relay.test"\ntoken = "tok-0123456789abcdef"\n'
+local ROOST = '[relay]\nurl = "https://relay.test"\ntoken = "tok-0123456789abcdef"\n[github]\nidentity = "local"\n'
+local LOCAL = '[github]\nidentity = "local"\n'
 
 type World = { env: any, core: any, c: any, ui: any, st: any, cx: any, now: number }
 
@@ -140,11 +141,40 @@ do -- the host block renders every page; keys switch pages
 		truthy(F.text(v.main) ~= "", `page {id} has content`)
 	end
 	w.st.tab = "workflows"
-	local cards = view(w)
-	local card_text = F.text(cards.main)
-	truthy(string.find(card_text, "新建自动化", 1, true), "new automation button")
-	truthy(string.find(card_text, "Issue 已打开", 1, true), "trigger line uses the kind label")
-	eq(string.find(card_text, 'github = "issues"', 1, true), nil, "raw github field is not the card line")
+	local page = view(w)
+	truthy(string.find(F.text(page.main), "新建自动化", 1, true), "new automation button")
+	-- One card per workflow, keyed by id; the first is picked until another is.
+	local function cards(v: any): { [string]: any }
+		local out = {}
+		F.walk(v.main, function(x)
+			if x.k == "card" and x.p and x.p.role == "roost.workflow" then
+				out[x.p.key] = x
+			end
+		end)
+		return out
+	end
+	local by = cards(page)
+	truthy(by.triage and by.plain, "a card per workflow")
+	eq(by.triage.p.selected, false, "no card is picked until the user picks one")
+	eq(by.plain.p.selected, false)
+	eq(press(w, "r"), false, "r runs nothing without a pick")
+	-- The head's controls are named by id: `end` must be the card's own child keyed "end".
+	eq(by.triage.p["end"], "main.body.workflows.cards.triage.end")
+	truthy(find(by.triage, function(x)
+		return x.p and x.p.key == "end" and x.k == "row"
+	end), "the card holds its end row")
+	local info = find(by.triage, function(x)
+		return x.k == "kv"
+	end)
+	local first = info.p.items[1]
+	truthy(string.find(F.text({ k = "text", p = { spans = first[2] or first.v } }), "Issue 已打开", 1, true), "trigger line uses the kind label")
+	eq(press(w, "j"), true, "j picks the first card")
+	eq(cards(view(w)).triage.p.selected, true)
+	eq(press(w, "j"), true, "then the next")
+	eq(cards(view(w)).plain.p.selected, true)
+	eq(press(w, "j"), false, "already the last")
+	eq(press(w, "escape"), true, "escape clears the pick")
+	eq(cards(view(w)).plain.p.selected, false)
 	eq(press(w, "x"), false, "unbound key changes nothing")
 	-- The relay page shows the manual fallback while pushes fail.
 	w.st.tab = "relay"
@@ -163,7 +193,7 @@ do -- the host block renders every page; keys switch pages
 end
 
 do -- manual run with a required input goes through the form; the log tails by appends
-	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = "" })
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	w.st.tab = "workflows"
 	w.ui.event(w.st, { ev = "action", id = "main.body.workflows.triage.actions.run", act = "dispatch", value = "triage" })
 	truthy(w.st.form, "form opened for a workflow with inputs")
@@ -202,13 +232,108 @@ do -- manual run with a required input goes through the form; the log tails by a
 	end)
 	eq(string.sub(ansi.p.text, 1, #before), before, "log grows by suffix (append frames)")
 	truthy(string.find(ansi.p.text, "more output", 1, true), "new output appended")
-	-- Cancel from the detail card.
-	w.ui.event(w.st, { ev = "action", id = "main.body.runs.run.state.actions.cancel", act = "cancel", value = run.id })
+	-- Unwrapped, the terminal's frame is as wide as the widest line so far, measured across appends.
+	local function width(): string?
+		local frame = find(view(w).main, function(x)
+			return x.k == "col" and x.p ~= nil and x.p.key == "term"
+		end)
+		return frame.p.min and frame.p.min.w
+	end
+	eq(width(), nil, "wraps by default")
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.run.tools.wrap", act = "log-wrap" })
+	local first = width()
+	truthy(first and tonumber(string.match(first, "^(%d+)ch$")), "min width in cells")
+	w.env.files[log] ..= "\27[2m" .. string.rep("宽", 60) .. "\27[0m\n"
+	step(w, 2)
+	eq(width(), "122ch", "a wider appended line widens it (60 wide characters + 2)")
+	w.env.files[log] ..= "short\n"
+	step(w, 2)
+	eq(width(), "122ch", "a shorter line keeps the widest")
+	eq(w.ui.save(w.st).log_wrap, false, "the choice is saved")
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.run.tools.wrap", act = "log-wrap" })
+	eq(width(), nil, "wraps again")
+	-- Cancel from the detail pane's head.
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.run.head.end.cancel", act = "cancel", value = run.id })
 	eq(run.stop, "cancel", "cancel requested")
 end
 
+do -- deleting a run takes two clicks in a row; events show how their runs went and open them
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.core.dispatch(w.c, "plain")
+	local r = w.c.store.runs[1]
+	r.state, r.finished_at = "success", T0
+	w.st.tab = "runs"
+	w.ui.event(w.st, { ev = "select", id = "main.body.runs.left.list.runs", item = r.id })
+	local function delete_btn(): any
+		return find(view(w).main, function(x)
+			return x.p and x.p.key == "delete"
+		end)
+	end
+	eq(F.text(delete_btn()), "删除")
+	local click = { ev = "action", id = "main.body.runs.run.tools.delete", act = "confirm", value = `delete-run:{r.id}` }
+	w.ui.event(w.st, click)
+	truthy(w.c.store.by_id[r.id], "the first click only arms it")
+	eq(F.text(delete_btn()), "确认删除")
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.run.tools.log", act = "open-log", value = r.id })
+	eq(F.text(delete_btn()), "删除", "another action disarms it")
+	w.ui.event(w.st, click)
+	w.ui.event(w.st, click)
+	truthy(w.c.store.by_id[r.id], "a double click only arms it")
+	step(w, 1)
+	press(w, "j")
+	eq(F.text(delete_btn()), "删除", "a key disarms it")
+	w.ui.event(w.st, click)
+	step(w, 6)
+	w.ui.event(w.st, click)
+	truthy(w.c.store.by_id[r.id], "a second click after the arm expired only arms again")
+	step(w, 1)
+	w.ui.event(w.st, click)
+	eq(w.c.store.by_id[r.id], nil, "a second, separate click deletes")
+	eq(w.st.run_id, nil, "and the detail pane lets go of it")
+	step(w, 1)
+	eq(w.env.tern.fs.exists(`{DATA}/runs/{r.id}`), false, "its directory is gone")
+
+	w.core.on_events(w.c, {
+		{ seq = 1, delivery = "dx", info = { event = "issues", action = "opened", repo = "acme/web", number = 3, title = "Bug", association = "OWNER" } },
+	})
+	local ev = w.c.events[1]
+	eq(#ev.runs, 1, "the issue started triage")
+	w.st.tab = "events"
+	local row = find(view(w).main, function(x)
+		return x.k == "table" and x.p and x.p.key == "table"
+	end).p.rows[1]
+	eq(row.id, "d:dx", "rows are keyed by delivery")
+	truthy(string.find(F.text({ k = "text", p = { spans = row.cells[4].text } }), "Issue 分诊", 1, true), "result names the run's workflow")
+	w.ui.event(w.st, { ev = "select", id = "main.body.events.table", item = "d:dx" })
+	eq(w.st.tab, "runs", "selecting the event opens its run")
+	eq(w.st.run_id, ev.runs[1])
+end
+
+do -- the step waterfall places bars by start offset; a step at the run's very end keeps a sliver
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.core.dispatch(w.c, "plain")
+	step(w, 2)
+	local r = w.c.store.runs[1]
+	r.started_at, r.finished_at = 100, 110
+	r.steps[1].started_at, r.steps[1].finished_at = 110, 110
+	w.st.tab = "runs"
+	w.st.run_id = r.id
+	local steps = find(view(w).main, function(x)
+		return x.k == "table" and x.p and x.p.key == "steps"
+	end)
+	local parts = steps.p.rows[1].cells[3].meter.parts
+	eq(parts[1].value, 0.99, "pulled back from the end")
+	eq(parts[2].value, 0.01, "so a sliver still shows")
+	r.steps[1].started_at, r.steps[1].finished_at = 102, 107
+	parts = find(view(w).main, function(x)
+		return x.k == "table" and x.p and x.p.key == "steps"
+	end).p.rows[1].cells[3].meter.parts
+	eq(parts[1].value, 0.2, "starts 2 s into a 10 s run")
+	eq(parts[2].value, 0.5, "and lasts half of it")
+end
+
 do -- a queued run cancelled from the row menu; j/k move the selection
-	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = "" })
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	w.core.dispatch(w.c, "plain")
 	w.core.dispatch(w.c, "plain") -- queued behind the first (one run per workflow)
 	local runs = w.c.store.runs
@@ -227,7 +352,7 @@ do -- a queued run cancelled from the row menu; j/k move the selection
 end
 
 do -- the sessions sidebar lists omp steps; its links show the live agent, then resume the saved one
-	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = "" })
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	local win = w.env.window()
 	w.env.wcx = win.cx
 	local launcher = require("../lib/launcher")
@@ -291,9 +416,107 @@ do -- the sessions sidebar lists omp steps; its links show the live agent, then 
 
 	-- Pruning a run removes its sessions with it.
 	w.c.store.keep = 0
-	require("../lib/store").prune(w.c.store)
+	local store = require("../lib/store")
+	eq(store.prune(w.c.store, 0), 1, "the finished run is dropped")
+	eq(w.env.tern.fs.exists(sdir), true, "its directory waits for the drain")
+	local left = -1
+	store.drain(w.c.store, 10, function(n)
+		left = n
+	end)
+	w.env.drain()
+	eq(left, 0, "drained")
 	eq(w.env.tern.fs.exists(sdir), false, "session files pruned with the run")
 	sidebar.close(st)
+end
+
+do -- the cost pair appears only when tokens are above zero
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.core.dispatch(w.c, "plain")
+	local r = w.c.store.runs[1]
+	r.state = "success"
+	r.started_at, r.finished_at = w.now, w.now
+	local s = r.steps[1]
+	s.state = "success"
+	s.started_at, s.finished_at = w.now, w.now
+	w.st.tab = "runs"
+	w.st.run_id = r.id
+	local function spans_text(v: any): string
+		return F.text({ k = "text", p = { spans = v } })
+	end
+	local function cost_value(): any
+		local facts = find(view(w).main, function(x)
+			return x.k == "kv" and x.p and x.p.key == "facts"
+		end)
+		truthy(facts, "run facts")
+		for _, item in facts.p.items do
+			if item[1] == "费用" then
+				return item[2]
+			end
+		end
+		return nil
+	end
+	eq(cost_value(), nil, "no cost pair before a tally")
+	s.cost = 0.42
+	s.tokens = 0
+	eq(cost_value(), nil, "zero tokens hides the pair")
+	s.tokens = 128000
+	local shown = spans_text(cost_value())
+	truthy(string.find(shown, "$0.42", 1, true) ~= nil, shown)
+	truthy(string.find(shown, "128k tokens", 1, true) ~= nil, shown)
+	truthy(string.find(shown, "估算", 1, true) ~= nil, shown)
+	local function row_state(): string
+		local steps = find(view(w).main, function(x)
+			return x.k == "table" and x.p and x.p.key == "steps"
+		end)
+		local text = steps.p.rows[1].cells[2].text
+		if type(text) == "string" then
+			return text
+		end
+		return spans_text(text)
+	end
+	eq(string.find(row_state(), "$", 1, true), nil, "a shell step does not show a tally")
+	s.kind = "omp"
+	local row = row_state()
+	truthy(string.find(row, "$0.42", 1, true) ~= nil, row)
+	truthy(string.find(row, "128k", 1, true) ~= nil, row)
+end
+
+do -- today's spend and a step condition show on the workflow card
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.st.tab = "workflows"
+	local function item(id: string, label: string): any
+		local card = find(view(w).main, function(x)
+			return x.k == "card" and x.p and x.p.role == "roost.workflow" and x.p.key == id
+		end)
+		local kv = find(card, function(x)
+			return x.k == "kv" and x.p and x.p.key == "info"
+		end)
+		for _, it in kv.p.items do
+			if it[1] == label then
+				return it[2]
+			end
+		end
+		return nil
+	end
+	local function spans_text(v: any): string
+		return F.text({ k = "text", p = { spans = v } })
+	end
+	eq(item("plain", "今日费用"), nil, "no line without a budget or spend")
+	eq(string.find(spans_text(item("plain", "步骤")), "条件", 1, true), nil)
+	w.core.dispatch(w.c, "plain")
+	local run = w.c.store.runs[1]
+	run.steps[1].cost = 1.25
+	run.steps[1].started_at = w.now
+	local spent = spans_text(item("plain", "今日费用"))
+	truthy(string.find(spent, "$1.25", 1, true) ~= nil, spent)
+	eq(string.find(spent, "预算", 1, true), nil, "no budget suffix when unset")
+	local triage = w.c.workflows.by_id.triage
+	triage.daily_budget = 5
+	triage.steps[1].when = { source = "out", key = "verify", negate = false }
+	eq(spans_text(item("triage", "今日费用")), "$0.00 / 预算 $5.00")
+	truthy(string.find(spans_text(item("triage", "步骤")), "条件 out.verify", 1, true) ~= nil, "positive when")
+	triage.steps[1].when = { source = "input", key = "dry_run", negate = true }
+	truthy(string.find(spans_text(item("triage", "步骤")), "条件 !input.dry_run", 1, true) ~= nil, "negated when")
 end
 
 print("ok")

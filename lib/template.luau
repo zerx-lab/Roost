@@ -69,8 +69,13 @@ function M.check(t: Template, inputs: { [string]: boolean }): string?
 				if #path ~= 2 or not inputs[path[2]] then
 					return `{table.concat(path, ".")} 不是已声明的 [[workflow.input]]`
 				end
+			elseif head == "out" then
+				-- Step outputs only exist at run time: any well-formed name is accepted.
+				if #path ~= 2 or #path[2] > 64 or not string.match(path[2], "^[%a_][%w_]*$") then
+					return `{table.concat(path, ".")} 无效:输出名为字母、数字、下划线`
+				end
 			elseif not (KNOWN[head] and #path == 1) then
-				return `未知变量 {table.concat(path, ".")}(可用:{table.concat(M.VARS, ", ")}, input.<名>, payload.<路径>)`
+				return `未知变量 {table.concat(path, ".")}(可用:{table.concat(M.VARS, ", ")}, input.<名>, out.<名>, payload.<路径>)`
 			end
 		end
 	end
