@@ -27,7 +27,6 @@
  *   [data-role='roost.templates']            template gallery card
  *   [data-role='roost.summary']              validation summary above the editor footer
  *   [data-role='roost.warn']                 a field or card warning
- *   [data-surface='plugin.roost.sessions']  the sessions sidebar; its list is [data-role='roost.sessions']
  *
  * Nodes also carry data-tone (accent, success, warning, error, pending, muted); `--tc` is the
  * tone color. Use theme variables (--accent, --t1..--t4, --l1..--l4, --ok, --warn, --bad,

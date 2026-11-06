@@ -347,11 +347,9 @@ do -- agent command lines survive spaces and quotes; roost:// links round-trip
 	eq(agent.command("omp", dir, { "--model", "it's" }), `omp --session-dir '{dir}' --model 'it'\\''s'`)
 	eq(agent.quote(""), "''", "an empty argument stays an argument")
 	local r = agent.parse_url(agent.session_url("ab12", 3)) :: any
-	eq(r.kind, "session")
 	eq(r.run, "ab12")
 	eq(r.step, 3)
 	eq(agent.parse_url("roost://session/../../x/1"), nil, "only hex run ids")
-	eq((agent.parse_url(agent.SIDEBAR_URL) :: any).kind, "sidebar")
 end
 
 do -- session progress: whole lines only; a line longer than a read is dropped, its rest skipped

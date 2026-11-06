@@ -1,5 +1,5 @@
 --!strict
--- Window half: the palette commands (console, sessions sidebar), a status-line segment fed by the
+-- Window half: the palette command that opens the console, a status-line segment fed by the
 -- host's `status` kv record, the user's theme.css applied live, and the agent launcher that opens
 -- omp steps as agent blocks (lib/launcher.luau) and answers `roost://` links.
 
@@ -29,7 +29,6 @@ local function open(cx: WindowCx)
 end
 
 tern.command({ id = "open", title = "Roost:打开工作台", icon = "flow", run = open })
-tern.command({ id = "sessions", title = "Roost:会话侧栏", icon = "omp", run = launcher.toggle_sidebar })
 
 -- Agent steps: claim and watch on a timer, end turns as soon as Tern reports them.
 local L = launcher.new(tern.plugin.data)

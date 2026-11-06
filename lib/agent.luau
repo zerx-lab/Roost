@@ -170,22 +170,17 @@ function M.describe(code: number): string
 	return DESCRIBE[code] or `退出码 {code}`
 end
 
--- Links the console and the sidebar hand to the window (`cx:open` → `tern.route.link`).
+-- Links the console hands to the window (`cx:open` → `tern.route.link`).
 function M.session_url(run: string, step: number): string
 	return `{M.SCHEME}session/{run}/{step}`
 end
 
-M.SIDEBAR_URL = `{M.SCHEME}sidebar`
-
-export type Route = { kind: "sidebar" } | { kind: "session", run: string, step: number }
+export type Route = { run: string, step: number }
 
 function M.parse_url(url: string): Route?
-	if url == M.SIDEBAR_URL then
-		return { kind = "sidebar" }
-	end
 	local run, step = string.match(url, "^roost://session/([%x]+)/(%d+)$")
 	if run and step then
-		return { kind = "session", run = run, step = tonumber(step) :: number }
+		return { run = run, step = tonumber(step) :: number }
 	end
 	return nil
 end

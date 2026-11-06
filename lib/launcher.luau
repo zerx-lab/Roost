@@ -7,15 +7,14 @@
 -- where another left. Tab operations (kv `tab_ops`) are claimed the same way and carried out at
 -- once; the tabs they open are recorded so only those are ever closed.
 --
--- Also handles the `roost://` links the console and the sidebar open: toggling the sidebar, and
--- showing a step's conversation (its live tab, or the saved session resumed in a new tab).
+-- Also handles the `roost://session/…` links the console opens: showing a step's conversation
+-- (its live tab, or the saved session resumed in a new tab).
 
 local agent = require("./agent")
 local tabs = require("./tabs")
 
 local M = {}
 
-M.SIDEBAR = "roost.sessions"
 -- Ticks an agent may be missing from cx.agents:list() before it counts as closed by hand.
 local MISSING_TICKS = 3
 -- Ticks an agent must look finished (idle, last message from the assistant) before it counts.
@@ -608,25 +607,6 @@ function M.on_finished(L: Launcher, ev: AgentFinishedEvent, cx: WindowCx)
 	end
 end
 
--- Opens the sessions sidebar at the left of the focused block, or closes the one this tab has.
-function M.toggle_sidebar(cx: WindowCx)
-	local focused = cx.session:focused()
-	local tab = if focused then cx.session:tab_of(focused) else nil
-	for _, p in cx.session:panes() do
-		if p.block == M.SIDEBAR and tab and p.tab == tab then
-			cx.layout:close(p.pane)
-			return
-		end
-	end
-	local opts: BlockOpts = { dir = "left", ratio = 0.22, focus = false }
-	if focused then
-		opts.target = focused
-	end
-	if cx:new_block(M.SIDEBAR, {}, "beside", opts) == nil then
-		cx:toast("error", "Roost 未就绪", "当前主机没有加载 roost 插件")
-	end
-end
-
 -- The session a pane belongs to, from the window's session list.
 local function session_of(cx: WindowCx, pane: number): number?
 	local tab = cx.session:tab_of(pane)
@@ -680,11 +660,7 @@ function M.route(L: Launcher, cx: WindowCx, url: string): boolean
 		return false
 	end
 	local ok, err = pcall(function(): string?
-		if r.kind == "sidebar" then
-			M.toggle_sidebar(cx)
-		elseif r.kind == "session" then
-			show_session(L, cx, r.run, r.step)
-		end
+		show_session(L, cx, r.run, r.step)
 		return nil
 	end)
 	if not ok then

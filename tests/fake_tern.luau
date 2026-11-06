@@ -288,6 +288,8 @@ local ui = {
 		local seen = {}
 		for _, col in cols do
 			assert(type(col.id) == "string" and type(col.head) == "string", "table col needs id and head")
+			-- Tern rejects a fractional priority at render time (`cols[N].priority`).
+			assert(col.priority == nil or (type(col.priority) == "number" and col.priority == math.floor(col.priority)), `table col {col.id}: priority must be an integer`)
 			seen[col.id] = true
 		end
 		local ids = {}

@@ -351,7 +351,7 @@ do -- a queued run cancelled from the row menu; j/k move the selection
 	eq(w.st.closed, true)
 end
 
-do -- the sessions sidebar lists omp steps; its links show the live agent, then resume the saved one
+do -- an agent step row opens its session; the link shows the live agent, then resumes the saved one
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	local win = w.env.window()
 	w.env.wcx = win.cx
@@ -364,25 +364,28 @@ do -- the sessions sidebar lists omp steps; its links show the live agent, then 
 			w.env.drain()
 		end
 	end
-	local sidebar = require("../lib/sidebar")
-	local cx = w.env.cx(2)
-	local st = sidebar.new(w.c, cx, nil)
 	eq(w.core.dispatch(w.c, "triage", { focus = "crash" }), nil)
 	eq(w.core.dispatch(w.c, "plain"), nil)
 	tick(2)
-	local run = w.c.store.runs[1]
-	local rows = sidebar.rows(w.c)
-	eq(#rows, 1, "only omp steps are sessions")
-	eq(rows[1].id, `{run.id}:1`)
-	local v = sidebar.view(st)
-	F.check_keys(v.main)
-	local tbl = find(v.main, function(x)
-		return x.k == "table"
-	end)
-	eq(tbl.p.rows[1].cells[2], "Issue 分诊 · think", "row names workflow and step")
-	sidebar.event(st, { ev = "activate", id = "main.list", item = rows[1].id })
-	local url = cx.opened[1]
+	local run, plain = w.c.store.runs[1], w.c.store.runs[2]
+	eq(run.steps[1].agent, true, "triage's first step is an agent")
+	w.st.tab = "runs"
+	local function steps_rows(id: string): any
+		w.st.run_id = id
+		local tbl = find(view(w).main, function(x)
+			return x.k == "table" and x.p and x.p.key == "steps"
+		end)
+		return tbl.p.rows
+	end
+	eq(steps_rows(plain.id)[1].menu, nil, "a shell step has no session")
+	w.ui.event(w.st, { ev = "activate", id = "main.body.runs.detail.steps", item = "s1" })
+	eq(#w.cx.opened, 0, "double-clicking a shell step opens nothing")
+	eq(steps_rows(run.id)[1].menu[1], "open-session")
+	w.ui.event(w.st, { ev = "activate", id = "main.body.runs.detail.steps", item = "s1" })
+	local url = w.cx.opened[1]
 	eq(url, `roost://session/{run.id}/1`)
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.detail.steps", act = "open-session", item = "s1" })
+	eq(w.cx.opened[2], url, "the row menu opens the same session")
 
 	local pane = win.started[1].pane
 	win.focused = 1
@@ -405,13 +408,6 @@ do -- the sessions sidebar lists omp steps; its links show the live agent, then 
 	eq(opened.command, `omp --session-dir {sdir} --resume {sdir}/2026-11-06T01-00-00-000Z_b.jsonl`, "newest session resumed")
 	eq(opened.cwd, "/home/test", "the temp workspace is gone: home instead")
 
-	win.focused = 1
-	eq(launcher.route(L, win.cx, "roost://sidebar"), true)
-	eq(win.blocks[1].kind, "roost.sessions")
-	eq(win.blocks[1].opts.dir, "left")
-	eq(win.blocks[1].opts.target, 1, "beside the focused block")
-	launcher.route(L, win.cx, "roost://sidebar")
-	eq(win.closed[1], win.blocks[1].pane, "the same link closes this tab's sidebar")
 	eq(launcher.route(L, win.cx, "https://example.com"), false, "other links pass through")
 
 	-- Pruning a run removes its sessions with it.
@@ -426,7 +422,6 @@ do -- the sessions sidebar lists omp steps; its links show the live agent, then 
 	w.env.drain()
 	eq(left, 0, "drained")
 	eq(w.env.tern.fs.exists(sdir), false, "session files pruned with the run")
-	sidebar.close(st)
 end
 
 do -- the cost pair appears only when tokens are above zero
@@ -479,6 +474,15 @@ do -- the cost pair appears only when tokens are above zero
 	local row = row_state()
 	truthy(string.find(row, "$0.42", 1, true) ~= nil, row)
 	truthy(string.find(row, "128k", 1, true) ~= nil, row)
+	local function list_cost(): any
+		local runs = find(view(w).main, function(x)
+			return x.k == "table" and x.p and x.p.key == "runs"
+		end)
+		return runs.p.rows[1].cells[5]
+	end
+	eq(list_cost(), "$0.42", "the run list shows the run's agent spend")
+	s.tokens = 0
+	eq(list_cost(), "", "blank without a tally")
 end
 
 do -- today's spend and a step condition show on the workflow card

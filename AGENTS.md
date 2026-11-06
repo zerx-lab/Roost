@@ -66,14 +66,14 @@ Roost 是一个 **Tern 插件**,目标是做成一个**可自升级、可自我�
 ## Key Directories
 
 ```text
-plugin.toml          # id = "roost",blocks console + sessions
-host.luau            # 运行时 + roost.console / roost.sessions block
+plugin.toml          # id = "roost",block console
+host.luau            # 运行时 + roost.console block
 window.luau          # 命令、状态栏、theme.css 注入、agent 启动器、roost:// 路由
 roost.css            # 主题钩子(data-role = roost.*)
 lib/core.luau        # 运行时编排与给视图的动作 API
 lib/runner.luau      # 运行引擎(高风险:状态机/进程/持久化,主会话维护)
 lib/agent.luau       # omp agent 步骤的 host↔window 文件协议(主会话维护)
-lib/launcher.luau    # window 侧:认领/打开/结束 agent 步骤,会话侧栏与 roost:// 链接(主会话维护)
+lib/launcher.luau    # window 侧:认领/打开/结束 agent 步骤,roost://session 链接(主会话维护)
 lib/relay.luau       # 中继客户端(wire 协议,主会话维护)
 lib/model.luau      # 两个配置文件的解析与校验、订阅计算
 lib/store.luau       # runs.json 历史、保留策略与分批删除(高风险:持久化,主会话维护)
@@ -86,7 +86,7 @@ lib/groups.luau      # 「工作流」页的分组(groups.json):纯函数 + 读�
 lib/evolve.luau      # 工作流自迭代:材料、应用、修订快照、观察与回滚、触发(高风险:持久化与改写用户文件,主会话维护)
 lib/upgrade.luau     # Roost 自升级:检查与进程外应用脚本、boot 标记、结果(高风险:写插件目录,主会话维护)
 lib/match.luau lib/template.luau lib/cron.luau lib/toml.luau lib/util.luau lib/stats.luau   # 纯函数(stats:概览的按日统计与工作流健康度)
-lib/ui.luau lib/editor.luau lib/sidebar.luau lib/field.luau  # 面板视图、自动化编辑器、会话侧栏与文本输入
+lib/ui.luau lib/editor.luau lib/field.luau  # 面板视图、自动化编辑器与文本输入
 tests/               # run.py + fake_tern.luau + harness.luau + test_*.luau
 agent/               # roost-agent(Rust):src/{api,store,github,event,config,secret}.rs,deploy/
 ```

@@ -577,7 +577,6 @@ local function header(st: State): Node
 		meta ..= ` · {host}`
 	end
 	local tools: { Node } = badges
-	table.insert(tools, btn("", "sidebar", { icon = "omp", variant = "quiet", size = "md", title = "会话侧栏:Roost 运行过的 omp 会话", key = "sidebar" }))
 	table.insert(tools, btn("", "reload_files", { icon = "repeat", variant = "quiet", size = "md", title = "重新读取配置文件", key = "reload" }))
 	return N("row", { key = "head", role = "roost.header", justify = "between", align = "center" }, {
 		ui.text({ ui.span("Roost", "title"), ui.span(meta, "muted") }),
@@ -594,6 +593,12 @@ local function run_subject(r: store.Run): string?
 	return if r.event then r.title else nil
 end
 
+-- A run's estimated agent spend; blank for runs without an agent tally.
+local function cost_cell(r: store.Run): string
+	local cost, tokens = stats.run_cost(r)
+	return if tokens ~= nil and tokens > 0 then fmt_usd(cost or 0) else ""
+end
+
 local function run_row(r: store.Run, t: number): any
 	local trig = r.trigger.kind
 	local subject = run_subject(r)
@@ -608,6 +613,7 @@ local function run_row(r: store.Run, t: number): any
 			r.id,
 			{ text = name },
 			{ text = TRIGGER_LABEL[trig] or trig, icon = TRIGGER_ICON[trig] or "dot" },
+			cost_cell(r),
 			util.ago(r.created_at, t),
 			duration(r.started_at, r.finished_at)
 		),
@@ -625,7 +631,9 @@ local RUN_COLS: { Col } = {
 	{ id = "id", head = "ID", mono = true, priority = 4 },
 	{ id = "run", head = "运行", grow = 1, truncate = "end", priority = 9 },
 	{ id = "trigger", head = "触发", priority = 3 },
-	{ id = "at", head = "创建", align = "end", priority = 5 },
+	-- Agent runs only; it gives way before the creation time does.
+	{ id = "cost", head = "费用", align = "end", mono = true, priority = 5 },
+	{ id = "at", head = "创建", align = "end", priority = 6 },
 	{ id = "took", head = "耗时", align = "end", mono = true, priority = 7 },
 }
 
@@ -959,6 +967,8 @@ local function steps_table(r: store.Run, t: number): Node
 				bar,
 				duration(s.started_at, s.finished_at)
 			),
+			title = if s.agent then "双击打开 omp 会话:运行中的跳到其标签页,已结束的续开会话" else nil,
+			menu = if s.agent then { "open-session" } else nil,
 		})
 	end
 	return keyed(
@@ -967,7 +977,7 @@ local function steps_table(r: store.Run, t: number): Node
 			{ id = "state", head = "状态", priority = 8 },
 			{ id = "bar", head = "时间线", grow = 1, priority = 2 },
 			{ id = "took", head = "耗时", align = "end", mono = true, priority = 7 },
-		}, rows :: any),
+		}, rows :: any, { selectable = true }),
 		"steps"
 	)
 end
@@ -2988,10 +2998,12 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		st.cx:toast("success", `已复制运行 ID {target}`)
 	elseif act == "log-wrap" then
 		st.log_wrap = not st.log_wrap
-	elseif act == "sidebar" then
-		st.cx:open(agent.SIDEBAR_URL)
-	elseif act == "session" and value then
-		local run, i = string.match(value, "^(%x+):(%d+)$")
+	elseif (act == "session" or act == "open-session") and target then
+		-- The detail's button names `<run>:<i>`; a step row's menu names `s<i>` of the shown run.
+		local run, i = string.match(target, "^(%x+):(%d+)$")
+		if run == nil then
+			run, i = st.run_id, string.match(target, "^s(%d+)$")
+		end
 		if run and i then
 			st.cx:open(agent.session_url(run, tonumber(i) :: number))
 		end
@@ -3186,6 +3198,12 @@ function M.event(st: State, ev: UiEvent)
 			st.filter = item
 		elseif name == "runs" then
 			select_run(st, item)
+		elseif name == "steps" and ev.ev == "activate" then
+			local r = selected_run(st)
+			local s = r and r.steps[tonumber(string.match(item, "^s(%d+)$") or "") or 0]
+			if s and s.agent then
+				do_action(st, "session", nil, item)
+			end
 		elseif name == "table" and st.tab == "events" then
 			local delivery = string.match(item, "^d:(.+)$")
 			for _, e in st.core.events do
