@@ -841,7 +841,24 @@ function F.new(opts: { [string]: any }?)
 				table.insert(w.opened, launch)
 				return pane
 			end,
+			split = function(_self: any, target: number, dir: string, launch: any, reveal: any): number?
+				if w.panes[target] == nil then
+					return nil
+				end
+				local pane = new_id()
+				w.panes[pane] = { tab = w.panes[target].tab, launch = launch, reveal = reveal, split = { target = target, dir = dir } }
+				table.insert(w.opened, launch)
+				if reveal and reveal.focus then
+					w.focused = pane
+				end
+				return pane
+			end,
 		}
+		-- File opens: `{target, how}`.
+		w.files_opened = {} :: { any }
+		function cx:open(target: string, how: string?)
+			table.insert(w.files_opened, { target = target, how = how })
+		end
 		function cx:new_block(kind: string, args: any, how: string, opts: any): number
 			local pane = new_id()
 			w.panes[pane] = { tab = w.panes[w.focused] and w.panes[w.focused].tab, block = kind }

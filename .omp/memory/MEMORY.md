@@ -39,6 +39,7 @@
 
 ## 约束与陷阱
 
+- [2026-11-06] 悬浮面板:文件可用 window 的 `cx:open(path, "glimpse")`(居中浮层,点外面/Esc 关闭,拖标题保留;`How` 里有但文档未写);终端/agent 没有 glimpse,只能 `layout:float`(贴角落)。host 的 `cx:open` 不能带 how,所以「日志文件」经 `roost://log/<run>` 交给 window 以 glimpse 打开。已结束的 omp 会话用户要求**分屏**续开(控制台右侧 `layout:split`),不要悬浮;运行中的 agent 仍跳到它的标签页(挪过来后关掉=结束这一步) — 依据:用户确认「omp会话需要分屏打开而不是悬浮面板」、lib/launcher.luau show_log/show_session
 - [2026-11-06] `tern.ui.table` 列的 `priority` 必须是整数:tern.d.luau 写的是 `number?`,但运行时对小数(如 4.5)直接报 `tern.ui.table: cols[N].priority…`,整个 view 失败、页面进不去。fake_tern 已同样断言 — 依据:用户报告「运行」页打不开 + 插件报错截图
 - [2026-11-06] Tern 的 `input`/`editor` 只负责绘制,选区要靠 block 的 `features = { "edit" }` 开启原生编辑:开启后 Tern 自己处理 ⌘A、⇧+方向键、拖拽和双击/三击选区,把改动作为 `edit` 事件发来(`from`/`to`/`cursor` 是 UTF-16 偏移,`len` 与当前文本的 UTF-16 长度不符就丢弃),由 `field.edit` 应用;没有选区时的输入和删除仍走 `key`。还要求用户开着 Settings › Terminal › Native composer editing,且字段没有 `mode`/`readonly`。目前没开 `undo`,⌃Z 仍作为按键送达 — 依据:docs.stencil.so/tern/elements/input.md「Native editing」、tern.d.luau BlockDef.features,用户报告无法全选/选择文字
 - [2026-11-06] 控制台只让页面滚动、标题与标签栏固定:`M.view` 的 body 一律是 `roost.fill`(flex + overflow hidden),各页根 col 就地改成同 key 同 role 的 `scroll`(节点 id 不变、每页滚动位置独立),宽运行页仍是 split。无头实例里 `tern ctl tree SEL` 直接给出 rect,`move` + `wheel 0 600` 可验证滚动 — 依据:用户要求「避免整页滚动」,TSP 探针实测(旧结构页面 col 高 1914px,新结构 scroll 限在 624px,滚动后标题/标签栏不动)

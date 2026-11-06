@@ -64,7 +64,7 @@ tern.on("pane_closed", function(ev: PaneEvent, _cx: WindowCx)
 end)
 
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
-	if launcher.route(L, cx, link.url) then
+	if launcher.route(L, cx, link) then
 		return { handled = true }
 	end
 	return nil

@@ -2992,7 +2992,8 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 			end
 		end
 	elseif act == "open-log" and target then
-		st.cx:open(`{run_dir(st, target)}/log.txt`)
+		-- Through the window (`roost://log/…`): only it can open a file as a glimpse.
+		st.cx:open(agent.log_url(target))
 	elseif act == "copy-id" and target then
 		st.cx:copy(target)
 		st.cx:toast("success", `已复制运行 ID {target}`)

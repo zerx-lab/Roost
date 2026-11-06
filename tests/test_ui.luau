@@ -389,7 +389,10 @@ do -- an agent step row opens its session; the link shows the live agent, then r
 
 	local pane = win.started[1].pane
 	win.focused = 1
-	eq(launcher.route(L, win.cx, url), true)
+	local function link(u: string): any
+		return { url = u, pane = 1, mods = { cmd = false, alt = false, shift = false, ctrl = false } }
+	end
+	eq(launcher.route(L, win.cx, link(url)), true)
 	eq(win.focused, pane, "a running session jumps to its agent")
 	eq(win.shown, win.sessions[2].id, "in the Roost session")
 	eq(win.sessions[2].name, "Roost")
@@ -397,18 +400,32 @@ do -- an agent step row opens its session; the link shows the live agent, then r
 	win.reply(pane, "ok")
 	tick(3)
 	eq(run.state, "success")
-	launcher.route(L, win.cx, url)
+	launcher.route(L, win.cx, link(url))
 	eq(win.toasts[1].text, "这一步没有保存的 omp 会话", "nothing to resume yet")
 	local sdir = `{DATA}/runs/{run.id}/s1.session`
 	w.env.files[`{sdir}/2026-11-06T01-00-00-000Z_b.jsonl`] = "{}\n"
 	w.env.files[`{sdir}/2026-11-06T00-00-00-000Z_a.jsonl`] = "{}\n"
 	w.env.files[`{sdir}/.2026-11-06T01-00-00-000Z_b.jsonl.lock.os`] = ""
-	launcher.route(L, win.cx, url)
+	launcher.route(L, win.cx, link(url))
 	local opened = win.opened[1]
 	eq(opened.command, `omp --session-dir {sdir} --resume {sdir}/2026-11-06T01-00-00-000Z_b.jsonl`, "newest session resumed")
 	eq(opened.cwd, "/home/test", "the temp workspace is gone: home instead")
+	local resumed = win.focused
+	eq(win.panes[resumed].launch, opened, "the resumed session is focused")
+	eq(win.panes[resumed].tab, win.panes[1].tab, "in the console's tab")
+	eq(win.panes[resumed].split.target, 1, "split beside the console the link came from")
+	eq(win.panes[resumed].split.dir, "right")
 
-	eq(launcher.route(L, win.cx, "https://example.com"), false, "other links pass through")
+	-- The log opens as a glimpse; a run without one says so.
+	eq(launcher.route(L, win.cx, link(`roost://log/{run.id}`)), true)
+	eq(win.files_opened[1].target, `{DATA}/runs/{run.id}/log.txt`)
+	eq(win.files_opened[1].how, "glimpse")
+	local toasts = #win.toasts
+	launcher.route(L, win.cx, link("roost://log/abc123"))
+	eq(#win.files_opened, 1, "no log, nothing opened")
+	eq(win.toasts[toasts + 1].text, "这条运行还没有日志")
+
+	eq(launcher.route(L, win.cx, link("https://example.com")), false, "other links pass through")
 
 	-- Pruning a run removes its sessions with it.
 	w.c.store.keep = 0

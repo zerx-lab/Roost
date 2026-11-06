@@ -7,8 +7,8 @@
 -- where another left. Tab operations (kv `tab_ops`) are claimed the same way and carried out at
 -- once; the tabs they open are recorded so only those are ever closed.
 --
--- Also handles the `roost://session/…` links the console opens: showing a step's conversation
--- (its live tab, or the saved session resumed in a new tab).
+-- Also handles the `roost://` links the console opens: a step's conversation (its live tab, or
+-- the saved session resumed in a split beside the console) and a run's log (in a glimpse).
 
 local agent = require("./agent")
 local tabs = require("./tabs")
@@ -623,9 +623,10 @@ local function session_of(cx: WindowCx, pane: number): number?
 	return nil
 end
 
--- Shows step `step` of run `run`: its agent while it runs, else its saved conversation resumed
--- in a new tab of the shown session.
-local function show_session(L: Launcher, cx: WindowCx, run: string, step: number)
+-- Shows step `step` of run `run`: its agent while it runs (in its own tab: moving it out would
+-- tie the step to a pane the user closes at will), else its saved conversation resumed in a
+-- split beside `over` (the console the link came from).
+local function show_session(L: Launcher, cx: WindowCx, run: string, step: number, over: number?)
 	local files = files_of(L, run, step)
 	local pane = agent.read_number(files.pane)
 	if pane and not tern.fs.exists(files.exit) then
@@ -647,24 +648,44 @@ local function show_session(L: Launcher, cx: WindowCx, run: string, step: number
 	end
 	local j = job :: agent.Job
 	local cwd = if tern.fs.exists(j.cwd) then j.cwd else (tern.getenv("HOME") or "/")
-	local opened = cx.layout:new_tab({ cwd = cwd, command = agent.resume_command(j.omp, files.session, file :: string) })
-	if opened then
-		name_tab(cx, opened, `↺ {j.title}`)
+	local launch = { cwd = cwd, command = agent.resume_command(j.omp, files.session, file :: string) }
+	local target = over or cx.session:focused()
+	local opened = if target then cx.layout:split(target, "right", launch, { focus = true }) else nil
+	if opened == nil then
+		-- Nothing to split: a tab of its own.
+		local tabbed = cx.layout:new_tab(launch)
+		if tabbed then
+			name_tab(cx, tabbed, `↺ {j.title}`)
+		end
 	end
 end
 
+-- Shows run `run`'s log in a glimpse: over the whole tab until the next click outside it.
+local function show_log(L: Launcher, cx: WindowCx, run: string)
+	local path = `{agent.run_dir(L.data, run)}/log.txt`
+	if not tern.fs.exists(path) then
+		cx:toast("info", "这条运行还没有日志")
+		return
+	end
+	cx:open(path, "glimpse")
+end
+
 -- `tern.route.link` for `roost://` links; false when the link isn't one.
-function M.route(L: Launcher, cx: WindowCx, url: string): boolean
-	local r = agent.parse_url(url)
+function M.route(L: Launcher, cx: WindowCx, link: LinkRequest): boolean
+	local r = agent.parse_url(link.url)
 	if r == nil then
 		return false
 	end
 	local ok, err = pcall(function(): string?
-		show_session(L, cx, r.run, r.step)
+		if r.step then
+			show_session(L, cx, r.run, r.step, link.pane)
+		else
+			show_log(L, cx, r.run)
+		end
 		return nil
 	end)
 	if not ok then
-		cx:toast("error", "Roost 无法打开会话", tostring(err))
+		cx:toast("error", if r.step then "Roost 无法打开会话" else "Roost 无法打开日志", tostring(err))
 	end
 	return true
 end

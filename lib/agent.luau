@@ -175,12 +175,21 @@ function M.session_url(run: string, step: number): string
 	return `{M.SCHEME}session/{run}/{step}`
 end
 
-export type Route = { run: string, step: number }
+function M.log_url(run: string): string
+	return `{M.SCHEME}log/{run}`
+end
+
+-- `step` nil: the run's log.
+export type Route = { run: string, step: number? }
 
 function M.parse_url(url: string): Route?
 	local run, step = string.match(url, "^roost://session/([%x]+)/(%d+)$")
 	if run and step then
 		return { run = run, step = tonumber(step) :: number }
+	end
+	local log = string.match(url, "^roost://log/([%x]+)$")
+	if log then
+		return { run = log }
 	end
 	return nil
 end

@@ -350,6 +350,10 @@ do -- agent command lines survive spaces and quotes; roost:// links round-trip
 	eq(r.run, "ab12")
 	eq(r.step, 3)
 	eq(agent.parse_url("roost://session/../../x/1"), nil, "only hex run ids")
+	local lr = agent.parse_url(agent.log_url("ab12")) :: any
+	eq(lr.run, "ab12")
+	eq(lr.step, nil, "a log link names no step")
+	eq(agent.parse_url("roost://log/../x"), nil, "only hex run ids")
 end
 
 do -- session progress: whole lines only; a line longer than a read is dropped, its rest skipped
