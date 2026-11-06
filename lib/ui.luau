@@ -13,6 +13,7 @@ local store = require("./store")
 local model = require("./model")
 local field = require("./field")
 local util = require("./util")
+local agent = require("./agent")
 
 local ui = tern.ui
 local N = ui.node
@@ -433,6 +434,7 @@ local function header(st: State): Node
 			N("row", { key = "badges", gap = "xs" }, badges),
 		}),
 		N("row", { key = "tools", gap = "xs" }, {
+			btn("", "sidebar", { icon = "omp", variant = "quiet", title = "会话侧栏:Roost 运行过的 omp 会话", key = "sidebar" }),
 			btn("", "reload_files", { icon = "repeat", variant = "quiet", title = "重新读取配置文件", key = "reload" }),
 			btn("", "open=workflows", { icon = "file-code", variant = "quiet", title = "编辑 workflows.toml", key = "edit" }),
 		}),
@@ -586,6 +588,13 @@ local function run_detail(st: State, r: store.Run): Node
 		table.insert(actions, btn("重跑", `rerun={r.id}`, { icon = "redo", keys = { "r" }, key = "rerun" }))
 	end
 	table.insert(actions, btn("日志文件", `open-log={r.id}`, { icon = "file", variant = "quiet", key = "log" }))
+	for i = #r.steps, 1, -1 do
+		local s = r.steps[i]
+		if s.agent then
+			table.insert(actions, btn("omp 会话", `session={r.id}:{i}`, { icon = "omp", variant = "quiet", key = "session" }))
+			break
+		end
+	end
 	if r.cwd and r.workspace ~= "temp" then
 		table.insert(actions, btn("工作区", `open-ws={r.id}`, { icon = "folder-open", variant = "quiet", key = "ws" }))
 	end
@@ -1059,6 +1068,7 @@ local function config_tab(st: State): Node
 	local wf_ok = if c.workflows then `已加载 {#c.workflows.list} 个工作流 · {#util.keys(c.workflows.repos)} 个仓库` else "未加载"
 	local runner_kv = ui.kv({
 		pair("omp", { ui.span(r.omp .. " " .. table.concat(r.omp_args, " "), "mono") }),
+		{ "agent 会话", `Tern 会话「{r.session}」中的新标签页` },
 		{ "并发", tostring(r.max_concurrent) },
 		{ "默认超时", util.fmt_duration(r.default_timeout) },
 		{ "保留运行", tostring(r.keep_runs) },
@@ -1277,6 +1287,13 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		end
 	elseif act == "open-log" and target then
 		st.cx:open(`{run_dir(st, target)}/log.txt`)
+	elseif act == "sidebar" then
+		st.cx:open(agent.SIDEBAR_URL)
+	elseif act == "session" and value then
+		local run, i = string.match(value, "^(%x+):(%d+)$")
+		if run and i then
+			st.cx:open(agent.session_url(run, tonumber(i) :: number))
+		end
 	elseif act == "open-ws" and target then
 		local r = c.store.by_id[target]
 		if r and r.cwd then

@@ -66,13 +66,16 @@ local function world(files: { [string]: string }): World
 			env.files[argv[6]] = "4242"
 			env.files[argv[5]] = (env.files[argv[5]] or "") .. "\27[32mstarted\27[0m\n"
 			return false -- keeps running
+		elseif argv[1] == "/bin/mkdir" then
+			env.dirs[argv[2]] = true
+			return { status = 0, stdout = "", stderr = "", timed_out = false }
 		elseif string.find(script, "tail -c", 1, true) then
 			local from = tonumber(argv[5]) :: number
 			local text = env.files[argv[6]] or ""
 			local limit = tonumber(argv[7]) :: number
 			return { status = 0, stdout = string.sub(text, from, from + limit - 1), stderr = "", timed_out = false }
 		end
-		return { status = 0, stdout = "", stderr = "", timed_out = false }
+		return env.append(argv) or { status = 0, stdout = "", stderr = "", timed_out = false }
 	end
 	env.fetch = function(_url: string, _o: any): any
 		return { status = 0, headers = {}, body = "", error = "connection refused", timed_out = false }
@@ -178,7 +181,7 @@ do -- manual run with a required input goes through the form; the log tails by a
 	local ansi = find(v.main, function(x)
 		return x.k == "ansi"
 	end)
-	truthy(ansi and string.find(ansi.p.text, "started", 1, true), "log shown")
+	truthy(ansi and string.find(ansi.p.text, "等待 Tern 窗口", 1, true), "log shown")
 	local before = ansi.p.text
 	local log = `{DATA}/runs/{run.id}/log.txt`
 	w.env.files[log] = w.env.files[log] .. "more output\n"
@@ -211,6 +214,76 @@ do -- a queued run cancelled from the row menu; j/k move the selection
 	view(w)
 	w.ui.close(w.st)
 	eq(w.st.closed, true)
+end
+
+do -- the sessions sidebar lists omp steps; its links show the live agent, then resume the saved one
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = "" })
+	local win = w.env.window()
+	w.env.wcx = win.cx
+	local launcher = require("../lib/launcher")
+	local L = launcher.new(DATA)
+	local function tick(n: number)
+		for _ = 1, n do
+			step(w, 1)
+			launcher.tick(L, win.cx)
+			w.env.drain()
+		end
+	end
+	local sidebar = require("../lib/sidebar")
+	local cx = w.env.cx(2)
+	local st = sidebar.new(w.c, cx, nil)
+	eq(w.core.dispatch(w.c, "triage", { focus = "crash" }), nil)
+	eq(w.core.dispatch(w.c, "plain"), nil)
+	tick(2)
+	local run = w.c.store.runs[1]
+	local rows = sidebar.rows(w.c)
+	eq(#rows, 1, "only omp steps are sessions")
+	eq(rows[1].id, `{run.id}:1`)
+	local v = sidebar.view(st)
+	F.check_keys(v.main)
+	local tbl = find(v.main, function(x)
+		return x.k == "table"
+	end)
+	eq(tbl.p.rows[1].cells[2], "Issue 分诊 · think", "row names workflow and step")
+	sidebar.event(st, { ev = "activate", id = "main.list", item = rows[1].id })
+	local url = cx.opened[1]
+	eq(url, `roost://session/{run.id}/1`)
+
+	local pane = win.started[1].pane
+	win.focused = 1
+	eq(launcher.route(L, win.cx, url), true)
+	eq(win.focused, pane, "a running session jumps to its agent")
+	eq(win.shown, win.sessions[2].id, "in the Roost session")
+	eq(win.sessions[2].name, "Roost")
+
+	win.reply(pane, "ok")
+	tick(3)
+	eq(run.state, "success")
+	launcher.route(L, win.cx, url)
+	eq(win.toasts[1].text, "这一步没有保存的 omp 会话", "nothing to resume yet")
+	local sdir = `{DATA}/runs/{run.id}/s1.session`
+	w.env.files[`{sdir}/2026-11-06T01-00-00-000Z_b.jsonl`] = "{}\n"
+	w.env.files[`{sdir}/2026-11-06T00-00-00-000Z_a.jsonl`] = "{}\n"
+	w.env.files[`{sdir}/.2026-11-06T01-00-00-000Z_b.jsonl.lock.os`] = ""
+	launcher.route(L, win.cx, url)
+	local opened = win.opened[1]
+	eq(opened.command, `omp --session-dir {sdir} --resume {sdir}/2026-11-06T01-00-00-000Z_b.jsonl`, "newest session resumed")
+	eq(opened.cwd, "/home/test", "the temp workspace is gone: home instead")
+
+	win.focused = 1
+	eq(launcher.route(L, win.cx, "roost://sidebar"), true)
+	eq(win.blocks[1].kind, "roost.sessions")
+	eq(win.blocks[1].opts.dir, "left")
+	eq(win.blocks[1].opts.target, 1, "beside the focused block")
+	launcher.route(L, win.cx, "roost://sidebar")
+	eq(win.closed[1], win.blocks[1].pane, "the same link closes this tab's sidebar")
+	eq(launcher.route(L, win.cx, "https://example.com"), false, "other links pass through")
+
+	-- Pruning a run removes its sessions with it.
+	w.c.store.keep = 0
+	require("../lib/store").prune(w.c.store)
+	eq(w.env.tern.fs.exists(sdir), false, "session files pruned with the run")
+	sidebar.close(st)
 end
 
 print("ok")

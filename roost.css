@@ -14,6 +14,7 @@
  *   [data-role='roost.relay']                relay page
  *   [data-role='roost.config']               config page
  *   [data-role='roost.form']                 manual-run form overlay
+ *   [data-surface='plugin.roost.sessions']  the sessions sidebar; its list is [data-role='roost.sessions']
  *
  * Nodes also carry data-tone (accent, success, warning, error, pending, muted); `--tc` is the
  * tone color. Use theme variables (--accent, --t1..--t4, --l1..--l4, --ok, --warn, --bad,

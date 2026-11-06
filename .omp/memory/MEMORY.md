@@ -9,7 +9,9 @@
 
 ## 决策(当前有效)
 
-- [2026-11-05] 架构:omp 在本地(Tern 插件 host)执行;cron 是插件核心,在插件内调度。服务器上的 `roost-agent`(Rust)是监控探针式的中继节点,不是 AI 运行时:只接 GitHub webhook、验签、按订阅过滤、缓存事件供本地长轮询拉取,外加 GitHub hook 注册、远程 reload/重启 — 依据:用户确认
+- [2026-11-06] omp 步骤以 Tern 原生 agent block 运行:window 用 `cx.agents:start` 在固定会话(`[runner] session`,默认 Roost)新开 tab,不抢焦点,无论成败结束后都关闭;会话经 `--session-dir` 存进运行目录,随 keep_runs 清理,不进 `~/.omp`;历史会话用独立 block `roost.sessions` 左分屏查看。被否:终端 tab 跑 `omp -p`、控制台内嵌左栏、失败 tab 保留 — 依据:用户确认
+- [2026-11-06] agent 步骤协议:host 写 `s<i>.job.json` + kv `agent_jobs`;window `mkdir s<i>.claim` 认领、写 `.pane`/`.exit`/`.reply.txt`;未认领时的停止、认领后 30 s 仍无 pane 由 host 自己写 exit。agent 命令不加 `env K=V` 前缀,所以 omp 步骤拿不到 `env`/`ROOST_*` — 依据:lib/agent.luau(主会话设计,未经用户另行确认)
+- [2026-11-05] 架构:omp 在本机执行(2026-11-06 起由 window 打开 agent block,见上条);cron 是插件核心,在插件内调度。服务器上的 `roost-agent`(Rust)是监控探针式的中继节点,不是 AI 运行时:只接 GitHub webhook、验签、按订阅过滤、缓存事件供本地长轮询拉取,外加 GitHub hook 注册、远程 reload/重启 — 依据:用户确认
 - [2026-11-05] 配置分层:本地 `plugin-data/roost/roost.toml`(中继地址/令牌绑定)+ `workflows.toml`(repos 本地路径、工作流、cron/github 触发、步骤);服务器 `agent.toml`(监听、密钥,不同步)+ `subscriptions.toml`(repo→事件,由插件推送,推送失败时在服务器手改后远程 reload) — 依据:用户确认「本地优先、云端同步、失败回退云端手动」
 - [2026-11-05] 运行安全默认:用户可写内容事件只接受 OWNER/MEMBER/COLLABORATOR(`associations = ["*"]` 放开);shell 步骤不做模板替换,只给 `ROOST_*` 环境变量 — 依据:lib/match.luau、lib/runner.luau(主会话设计,未经用户另行确认)
 - [2026-11-05] 记忆只放在仓库内的 `.omp/memory/`,不使用 omp 用户级记忆(`.omp/config.yml` 设了 `memory.backend: off`、`autolearn.enabled: false`) — 依据:用户确认
@@ -17,6 +19,9 @@
 
 ## 约束与陷阱
 
+- [2026-11-06] `cx.agents`/`cx.sessions`/`cx.layout` 只在 window 可用;host block 想让窗口做事只能 `cx:open("roost://…")`,由 window 的 `tern.route.link` 认领 — 依据:tern.d.luau(EffectCx.open、LinkRequest)
+- [2026-11-06] `omp --session-dir D` 是平铺布局:D 下直接是 `<ISO时间>_<id>.jsonl`,另有隐藏的 `.….jsonl.lock.os` — 依据:本机 `omp -p --session-dir /tmp/roost-sd-probe` 实测
+- [2026-11-06] `cx.sessions:create` 会切换到新会话,需要手动 `switch` 回原会话;`cx.agents:start` 只能在当前会话开 tab,换到其他会话要靠 `layout:move_to_new_tab(pane, session, {focus=false})` — 依据:docs.stencil.so/tern/reference/api-window.md
 - [2026-11-05] `tern.json.array(t)` 会就地给 t 加受保护元表,`tern.json.decode` 出来的数组也带;之后 `table.clone(t)` 直接抛错。序列化时给副本打标签(`table.move(t, 1, #t, 1, {})`);fake_tern 已同样模拟 — 依据:Tern daemon 日志实测(lib/store.luau save)
 - [2026-11-05] Luau strict 下 `pcall(fn)` 若 fn 无返回值,只能接 1 个返回值;要拿错误信息就包一层 `pcall(function(): string? ...; return nil end)` — 依据:luau-lsp 实测(lib/runner.luau)
 - [2026-11-05] `tern.process.run` 无法启动时会直接抛错(不是回调报错),调用处必须 pcall,否则会打断调用方的 timer 循环 — 依据:tern.d.luau process.run 注释、ReviewFixes 审查

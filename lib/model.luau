@@ -17,6 +17,7 @@ export type Relay = { url: string?, token: string?, token_env: string?, client_n
 export type Runner = {
 	omp: string,
 	omp_args: { string },
+	session: string, -- the Tern session agent steps open their tabs in
 	shell: string,
 	git: string,
 	max_concurrent: number,
@@ -86,7 +87,20 @@ export type Workflows = {
 	by_id: { [string]: Workflow },
 }
 
-M.DEFAULT_OMP_ARGS = { "-p", "--approval-mode", "yolo", "--no-title" }
+M.DEFAULT_OMP_ARGS = { "--approval-mode", "yolo" }
+M.DEFAULT_SESSION = "Roost"
+-- omp flags Roost sets itself: agent steps are interactive and keep their conversation in the run.
+local RESERVED_OMP_FLAGS = {
+	["-p"] = true,
+	["--print"] = true,
+	["--session-dir"] = true,
+	["--no-session"] = true,
+	["-r"] = true,
+	["--resume"] = true,
+	["-c"] = true,
+	["--continue"] = true,
+	["--restore"] = true,
+}
 M.DEFAULT_EXTRA_PATH = { "~/.local/bin", "~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin" }
 
 local function valid_id(s: string): boolean
@@ -190,6 +204,16 @@ local function get_strings(c: Ctx, t: { [string]: any }, key: string, path: stri
 	return out
 end
 
+-- Flags in `args` that Roost manages itself, as an issue.
+local function check_omp_args(c: Ctx, args: { string }, path: string, line: number?)
+	for _, a in args do
+		local flag = string.match(a, "^([^=]+)=") or a
+		if RESERVED_OMP_FLAGS[flag] then
+			issue(c, path, `{flag} 由 Roost 管理(omp 步骤以交互式 agent 运行,会话保存在运行目录),请删除`, line)
+		end
+	end
+end
+
 local function get_map(c: Ctx, t: { [string]: any }, key: string, path: string): { [string]: string }
 	local v = t[key]
 	local out: { [string]: string } = {}
@@ -287,11 +311,12 @@ function M.parse_config(text: string): (Config?, { Issue })
 
 	local u = get_table(c, root, "runner", "runner")
 	check_keys(c, u, "runner", {
-		"omp", "omp_args", "shell", "git", "max_concurrent", "default_timeout", "keep_runs", "extra_path", "env",
+		"omp", "omp_args", "session", "shell", "git", "max_concurrent", "default_timeout", "keep_runs", "extra_path", "env",
 	})
 	local runner: Runner = {
 		omp = get_string(c, u, "omp", "runner") or "omp",
 		omp_args = if u.omp_args ~= nil then get_strings(c, u, "omp_args", "runner") else table.clone(M.DEFAULT_OMP_ARGS),
+		session = get_string(c, u, "session", "runner") or M.DEFAULT_SESSION,
 		shell = get_string(c, u, "shell", "runner") or "/bin/sh",
 		git = get_string(c, u, "git", "runner") or "git",
 		max_concurrent = get_int(c, u, "max_concurrent", "runner", 2, 1, 16),
@@ -302,6 +327,10 @@ function M.parse_config(text: string): (Config?, { Issue })
 			else table.clone(M.DEFAULT_EXTRA_PATH),
 		env = get_map(c, u, "env", "runner"),
 	}
+	check_omp_args(c, runner.omp_args, "runner.omp_args", line_of(c, u, "omp_args"))
+	if runner.session == "" or #runner.session > 64 then
+		issue(c, "runner.session", "应为 1..64 个字符的会话名", line_of(c, u, "session"))
+	end
 	if #c.issues > 0 then
 		return nil, c.issues
 	end
@@ -549,6 +578,7 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 				end
 				step.kind = "omp"
 				step.prompt = tpl
+				check_omp_args(c, step.args, `{spath}.args`, line_of(c, s, "args"))
 			elseif script then
 				if step.model or #step.args > 0 then
 					issue(c, spath, "model 与 args 只用于 omp 步骤", sline)

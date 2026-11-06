@@ -5,6 +5,8 @@
 -- tern.fs has no rename, so a save writes `runs.json.bak` first, then `runs.json`: a crash in
 -- either write leaves the other file whole, and load falls back to the backup.
 
+local agent = require("./agent")
+
 local M = {}
 
 export type StepRec = {
@@ -14,6 +16,7 @@ export type StepRec = {
 	exit_code: number?,
 	started_at: number?,
 	finished_at: number?,
+	agent: boolean?, -- ran as an agent block (lib/agent.luau); older omp steps ran headless
 }
 
 export type Run = {
@@ -68,7 +71,7 @@ function M.new(dir: string, keep: number): Store
 end
 
 function M.run_dir(s: Store, id: string): string
-	return `{s.dir}/runs/{id}`
+	return agent.run_dir(s.dir, id)
 end
 
 -- The decoded list, or nil plus the raw text when the file exists but can't be used.

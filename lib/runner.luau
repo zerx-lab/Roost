@@ -1,7 +1,9 @@
 --!strict
--- The local run engine. A run is a list of steps; each step is one child process started through
--- a small sh wrapper that puts the command in its own process group and records pids and the
--- exit code in files. Progress is read from those files, so a run survives a plugin reload: the
+-- The local run engine. A run is a list of steps. A shell step is one child process started
+-- through a small sh wrapper that puts the command in its own process group and records pids and
+-- the exit code in files. An omp step is a native agent block that a window opens (see
+-- lib/agent.luau): the host writes a job file and lists it in kv, the window records the pane and
+-- the exit code. Either way progress is read from files, so a run survives a plugin reload: the
 -- new VM finds the step still running (or finished) and carries on.
 --
 -- Concurrency: at most `max_concurrent` runs at once, one per workflow; per-workflow policy
@@ -13,6 +15,7 @@ local store = require("./store")
 local template = require("./template")
 local util = require("./util")
 local match = require("./match")
+local agent = require("./agent")
 
 local M = {}
 
@@ -62,6 +65,8 @@ local PROBE_EVERY = 5
 local BACKSTOP_MS = 120000
 local MAX_PAYLOAD = 8 * 1024 * 1024
 local SAVE_DELAY_MS = 250
+-- How long a window may hold an agent step's claim without recording a pane.
+local CLAIM_GRACE = 30
 
 export type Request = {
 	trigger: { kind: string, detail: string, delivery: string? },
@@ -91,6 +96,8 @@ type Live = {
 	killed: { [number]: string }, -- step index -> last signal sent
 	kill_at: { [number]: number }, -- step index -> when SIGTERM went out
 	probe_at: { [number]: number }, -- step index -> last liveness probe
+	claim_at: { [number]: number }, -- step index -> when a claim without a pane was first seen
+	exit_bad: { [number]: number }, -- step index -> when its exit file was first found unreadable
 }
 
 export type Runner = {
@@ -99,6 +106,7 @@ export type Runner = {
 	seq: number,
 	timer: any?,
 	save_timer: any?,
+	jobs_json: string?, -- what kv `agent_jobs` was last set to
 }
 
 local function now(r: Runner): number
@@ -107,6 +115,29 @@ end
 
 local function dir_of(r: Runner, id: string): string
 	return store.run_dir(r.env.store, id)
+end
+
+-- Lists the running agent steps for the windows (kv `agent_jobs`), when that list changed.
+local function publish_jobs(r: Runner)
+	local list: { agent.Active } = {}
+	for _, run in r.env.store.runs do
+		local s = if run.state == "running" then run.steps[run.step] else nil
+		if s and s.agent and s.state == "running" then
+			table.insert(list, { run = run.id, step = run.step, stop = run.stop ~= nil })
+		end
+	end
+	local enc = tern.json.encode(tern.json.array(list))
+	if enc ~= r.jobs_json then
+		local ok, err = pcall(function(): string?
+			tern.kv.set(agent.KV, list)
+			return nil
+		end)
+		if ok then
+			r.jobs_json = enc
+		else
+			tern.log.warn("roost: cannot publish agent jobs", err)
+		end
+	end
 end
 
 -- Saves runs.json: at once when `now_` (before spawning a step), else coalesced.
@@ -123,20 +154,43 @@ local function persist(r: Runner, now_: boolean?)
 			store.save(r.env.store)
 		end)
 	end
+	publish_jobs(r)
 	r.env.changed()
+end
+
+-- Appends `lines` (then the file at `tail`, when given) to a run's log.
+local function append_log(r: Runner, id: string, lines: { string }, tail: string?)
+	local argv = {
+		"/bin/sh",
+		"-c",
+		'f=$1; t=$2; shift 2; printf "%s\\n" "$@" >>"$f"; if [ -n "$t" ] && [ -f "$t" ]; then cat "$t" >>"$f"; printf "\\n" >>"$f"; fi; exit 0',
+		"roost",
+		`{dir_of(r, id)}/log.txt`,
+		tail or "",
+	}
+	for _, l in lines do
+		table.insert(argv, l)
+	end
+	local ok, err = pcall(function(): string?
+		tern.process.run(argv, { timeout_ms = 5000 }, function(_res) end)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot append to log", err)
+	end
 end
 
 local function live(r: Runner, id: string): Live
 	local l = r.live[id]
 	if not l then
-		l = { spawned = {}, exited = {}, killed = {}, kill_at = {}, probe_at = {} }
+		l = { spawned = {}, exited = {}, killed = {}, kill_at = {}, probe_at = {}, claim_at = {}, exit_bad = {} }
 		r.live[id] = l
 	end
 	return l
 end
 
 function M.new(env: Env): Runner
-	return { env = env, live = {}, seq = 0, timer = nil, save_timer = nil }
+	return { env = env, live = {}, seq = 0, timer = nil, save_timer = nil, jobs_json = nil }
 end
 
 local function new_id(r: Runner): string
@@ -405,7 +459,7 @@ function M.cancel(r: Runner, id: string, reason: string?): boolean
 	run.stop = "cancel"
 	run.reason = reason or "已取消"
 	local cur = run.steps[run.step]
-	if cur and cur.kind ~= "cleanup" and cur.state == "running" then
+	if cur and cur.kind ~= "cleanup" and not cur.agent and cur.state == "running" then
 		signal(r, run, "TERM")
 	end
 	persist(r, true)
@@ -506,14 +560,62 @@ end
 local check: (Runner, Run) -> ()
 local next_step: (Runner, Run, Workflow) -> ()
 
--- The definition of user step `i` (prepare/cleanup have none), matched by name.
+-- The definition of user step `i` (prepare/cleanup have none), matched by name and kind.
 local function definition(run: Run, wf: Workflow, i: number): model.Step?
 	local offset = if run.steps[1] and run.steps[1].kind == "prepare" then 1 else 0
 	local def = wf.steps[i - offset]
-	if def and def.name == run.steps[i].name then
+	if def and def.name == run.steps[i].name and def.kind == run.steps[i].kind then
 		return def
 	end
 	return nil
+end
+
+-- Hands an omp step to the windows: the job file first, then kv `agent_jobs` (through persist).
+local function start_agent(r: Runner, run: Run, i: number, job: agent.Job)
+	local f = agent.files(dir_of(r, run.id), i)
+	for _, p in { f.claim, f.pane, f.reply, f.job } do
+		pcall(tern.fs.remove, p)
+	end
+	pcall(tern.fs.mkdir, f.session)
+	run.steps[i].agent = true
+	local ok, err = pcall(function(): string?
+		tern.fs.write(f.job, tern.json.encode(job))
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot write agent job", err)
+		pcall(tern.fs.write, f.exit, tostring(agent.CODE.launch))
+	end
+	persist(r, true)
+	append_log(r, run.id, {
+		`\27[1;36m▶ {run.steps[i].name}\27[0m`,
+		`[roost] 等待 Tern 窗口在会话「{job.session}」中打开 agent 标签页`,
+	})
+	M.schedule(r, 1000)
+end
+
+-- An agent step nobody else will finish: unclaimed when stopping, or claimed but never started.
+local function watch_agent(r: Runner, run: Run, i: number)
+	local f = agent.files(dir_of(r, run.id), i)
+	local l = live(r, run.id)
+	if not tern.fs.exists(f.claim) then
+		l.claim_at[i] = nil
+		if run.stop then
+			pcall(tern.fs.write, f.exit, tostring(agent.CODE.stopped))
+		end
+		return
+	end
+	if tern.fs.exists(f.pane) then
+		-- The window that opened it stops it, and records how it ended.
+		l.claim_at[i] = nil
+		return
+	end
+	local t = now(r)
+	local since = l.claim_at[i] or t
+	l.claim_at[i] = since
+	if t - since >= CLAIM_GRACE then
+		pcall(tern.fs.write, f.exit, tostring(agent.CODE.lost))
+	end
 end
 
 local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
@@ -521,7 +623,8 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	local d = dir_of(r, run.id)
 	local cfg = r.env.config().runner
 	run.step = i
-	local argv: { string }
+	local argv: { string } = {}
+	local job: agent.Job? = nil
 	local cwd = run.cwd or d
 	local def: model.Step? = nil
 	if s.kind == "prepare" then
@@ -543,19 +646,24 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 		end
 		local step = def :: model.Step
 		if step.kind == "omp" and step.prompt then
-			local prompt = template.render(step.prompt, template_ctx(r, run, wf, uses_payload(step.prompt)))
-			argv = { cfg.omp }
-			for _, a in cfg.omp_args do
-				table.insert(argv, a)
-			end
+			local args = table.clone(cfg.omp_args)
 			for _, a in step.args do
-				table.insert(argv, a)
+				table.insert(args, a)
 			end
 			if step.model then
-				table.insert(argv, "--model")
-				table.insert(argv, step.model)
+				table.insert(args, "--model")
+				table.insert(args, step.model)
 			end
-			table.insert(argv, prompt)
+			job = {
+				run = run.id,
+				step = i,
+				cwd = cwd,
+				omp = cfg.omp,
+				command = agent.command(cfg.omp, agent.files(d, i).session, args),
+				prompt = template.render(step.prompt, template_ctx(r, run, wf, uses_payload(step.prompt))),
+				title = `{run.workflow_name} · {s.name}`,
+				session = cfg.session,
+			}
 		else
 			argv = { cfg.shell, "-c", step.script or "true" }
 		end
@@ -577,6 +685,10 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 		pcall(tern.fs.mkdir, run.cwd)
 	end
 	pcall(tern.fs.remove, `{d}/s{i}.exit`)
+	if job then
+		start_agent(r, run, i, job)
+		return
+	end
 	pcall(tern.fs.remove, `{d}/s{i}.pid`)
 	pcall(tern.fs.remove, `{d}/s{i}.pid.w`)
 	local log = `{d}/log.txt`
@@ -647,8 +759,11 @@ local function step_done(r: Runner, run: Run, wf: Workflow, code: number)
 	elseif code ~= 0 and s.kind ~= "cleanup" and not (def and def.continue_on_error) then
 		if run.final == nil then
 			run.final = "failed"
-			run.reason = `{s.name} 退出码 {code}`
+			run.reason = if s.agent then `{s.name}:{agent.describe(code)}` else `{s.name} 退出码 {code}`
 		end
+	end
+	if s.agent then
+		append_log(r, run.id, { `[roost] agent 结束:{agent.describe(code)}` }, agent.files(dir_of(r, run.id), run.step).reply)
 	end
 	run.stop = nil
 	next_step(r, run, wf)
@@ -720,8 +835,15 @@ function check(r: Runner, run: Run)
 	local exitf = `{d}/s{i}.exit`
 	if tern.fs.exists(exitf) then
 		if wf then
-			local ok, text = pcall(tern.fs.read, exitf, 64)
-			local code = if ok then tonumber(util.trim(text :: string)) else nil
+			local code = agent.read_number(exitf)
+			if code == nil then
+				-- Still being written (agent exit files are written in place): give it a moment.
+				local since = l.exit_bad[i] or t
+				l.exit_bad[i] = since
+				if t - since < EXIT_GRACE then
+					return
+				end
+			end
 			step_done(r, run, wf, code or -1)
 		end
 		return
@@ -729,6 +851,10 @@ function check(r: Runner, run: Run)
 	if run.stop == nil and run.step_deadline and t >= run.step_deadline then
 		run.stop = "timeout"
 		persist(r)
+	end
+	if cur.agent then
+		watch_agent(r, run, i)
+		return
 	end
 	if run.stop and cur.kind ~= "cleanup" then
 		local sent = l.killed[i]

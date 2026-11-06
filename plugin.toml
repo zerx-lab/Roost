@@ -2,7 +2,7 @@ schema = 1
 id = "roost"
 name = "Roost"
 version = "0.1.0"
-description = "本地自动化工作台:定时(cron)与 GitHub 事件(经服务器中继)触发,在本机按固定流程运行 omp;中继订阅自动同步,支持远程重载与重启。"
+description = "本地自动化工作台:定时(cron)与 GitHub 事件(经服务器中继)触发,在本机按固定流程运行;omp 步骤在固定 Tern 会话中以原生 agent 标签页执行,侧栏可查看历史会话;中继订阅自动同步,支持远程重载与重启。"
 icon = "flow"
 host = "host.luau"
 window = "window.luau"
@@ -12,3 +12,8 @@ styles = ["roost.css"]
 id = "console"
 title = "Roost"
 icon = "flow"
+
+[[blocks]]
+id = "sessions"
+title = "Roost 会话"
+icon = "omp"

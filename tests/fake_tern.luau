@@ -444,6 +444,11 @@ function F.new(opts: { [string]: any }?)
 						env.files[k] = nil
 					end
 				end
+				for k: string in table.clone(env.dirs) :: { [string]: boolean } do
+					if string.sub(k, 1, #p) == p then
+						env.dirs[k] = nil
+					end
+				end
 			end,
 			list = function(path: string)
 				local out, seen = {}, {}
@@ -475,14 +480,15 @@ function F.new(opts: { [string]: any }?)
 			end,
 		},
 		process = {
-			run = function(argv: { string }, opts: any, cb: ((any) -> ())?)
+			run = function(argv: { string }, opts: any, cb: ((any, any) -> ())?)
 				assert(type(opts) == "table" and type(opts.timeout_ms) == "number", "process.run needs timeout_ms")
 				table.insert(env.calls, { argv = argv, opts = opts })
 				local r = env.process(argv, opts)
 				if cb then
 					table.insert(env.queue, function()
 						if r ~= false then
-							cb(r)
+							-- Window-context callbacks get a fresh cx: the fake window's, when one exists.
+							cb(r, env.wcx)
 						end
 					end)
 				end
@@ -612,6 +618,194 @@ function F.new(opts: { [string]: any }?)
 			table.insert(cx.copied, text)
 		end
 		return cx
+	end
+
+	-- The runner's log append (`printf … >>"$f"`, then the tail file): applied to env.files.
+	function env.append(argv: { string }): any
+		local script = argv[3] or ""
+		if not string.find(script, 'printf "%s\\n" "$@" >>"$f"', 1, true) then
+			return nil
+		end
+		local out = { env.files[argv[5]] or "" }
+		for i = 7, #argv do
+			table.insert(out, argv[i] .. "\n")
+		end
+		local tail = argv[6]
+		if tail ~= "" and env.files[tail] then
+			table.insert(out, env.files[tail] .. "\n")
+		end
+		env.files[argv[5]] = table.concat(out)
+		return { status = 0, stdout = "", stderr = "", timed_out = false }
+	end
+
+	-- A window cx with agents, sessions, tabs and layout, enough for lib/launcher.luau. Agents
+	-- start "working" with the prompt as their first message; `w.reply(pane, text)` ends a turn.
+	function env.window(): any
+		local w: any = {
+			agents = {} :: { [number]: any },
+			sessions = { { id = 1, name = "Default", host = 1, tabs = { 10 } } } :: { any },
+			shown = 1,
+			panes = { [1] = { tab = 10 } } :: { [number]: any },
+			focused = 1,
+			next_id = 100,
+			started = {} :: { any },
+			stopped = {} :: { number },
+			moved = {} :: { any },
+			named = {} :: { [number]: string },
+			opened = {} :: { any },
+			blocks = {} :: { any },
+			closed = {} :: { number },
+			toasts = {} :: { any },
+			host_kind = "local",
+		}
+		local function new_id(): number
+			w.next_id += 1
+			return w.next_id
+		end
+		local function session(id: number): any
+			for _, s in w.sessions do
+				if s.id == id then
+					return s
+				end
+			end
+			return nil
+		end
+		local function new_tab(sid: number, pane: number): number
+			local tab = new_id()
+			table.insert(session(sid).tabs, tab)
+			w.panes[pane] = w.panes[pane] or {}
+			w.panes[pane].tab = tab
+			return tab
+		end
+		local function managed(s: any): any
+			return { id = s.id, name = s.name, host = s.host, current = s.id == w.shown, locked = false, note = nil, tabs = #s.tabs }
+		end
+		function w.reply(pane: number, text: string)
+			local a = w.agents[pane]
+			table.insert(a.messages, { role = "assistant", text = text, tools = {} })
+			a.state = "idle"
+		end
+		local cx: any = {}
+		cx.agents = {
+			start = function(_self: any, o: any): number
+				assert(type(o.prompt) == "string" and type(o.cwd) == "string", "agents:start prompt/cwd")
+				local pane = new_id()
+				new_tab(w.shown, pane)
+				w.focused = pane
+				w.agents[pane] = { state = "working", cwd = o.cwd, command = o.command, messages = { { role = "user", text = o.prompt, tools = {} } } }
+				table.insert(w.started, { pane = pane, opts = o })
+				return pane
+			end,
+			list = function(_self: any): any
+				local out = {}
+				for pane, a in w.agents do
+					table.insert(out, { pane = pane, command = a.command, model = NULL, cwd = a.cwd, state = a.state, last_message = NULL })
+				end
+				return out
+			end,
+			transcript = function(_self: any, pane: number, o: any): any
+				local a = w.agents[pane]
+				assert(a, "transcript: no agent " .. tostring(pane))
+				local n = (o and o.last) or 50
+				local out = {}
+				for i = math.max(1, #a.messages - n + 1), #a.messages do
+					table.insert(out, a.messages[i])
+				end
+				return out
+			end,
+			stop = function(_self: any, pane: number)
+				assert(w.agents[pane], "stop: no agent " .. tostring(pane))
+				w.agents[pane] = nil
+				w.panes[pane] = nil
+				table.insert(w.stopped, pane)
+			end,
+		}
+		cx.sessions = {
+			list = function(_self: any): any
+				local out = {}
+				for _, s in w.sessions do
+					table.insert(out, managed(s))
+				end
+				return out
+			end,
+			current = function(_self: any): any
+				return managed(session(w.shown))
+			end,
+			create = function(_self: any, o: any): any
+				local s = { id = new_id(), name = o.name, host = 1, tabs = {} }
+				table.insert(w.sessions, s)
+				new_tab(s.id, new_id())
+				w.shown = s.id
+				return managed(s)
+			end,
+			switch = function(_self: any, id: number)
+				assert(session(id), "switch: no session")
+				w.shown = id
+			end,
+		}
+		cx.hosts = {
+			list = function(_self: any): any
+				return { { id = 1, name = "local", kind = w.host_kind, state = "connected", current = true, sessions = {}, panes = {} } }
+			end,
+			current = function(_self: any): any
+				return { id = 1, name = "local", kind = w.host_kind, state = "connected", current = true, sessions = {}, panes = {} }
+			end,
+		}
+		cx.session = {
+			focused = function(_self: any): number?
+				return w.focused
+			end,
+			tab_of = function(_self: any, pane: number): number?
+				return w.panes[pane] and w.panes[pane].tab
+			end,
+			sessions = function(_self: any): any
+				local out = {}
+				for _, s in w.sessions do
+					table.insert(out, { id = s.id, name = s.name, current = s.id == w.shown, locked = false, tabs = s.tabs })
+				end
+				return out
+			end,
+			panes = function(_self: any): any
+				local out = {}
+				for pane, p in w.panes do
+					table.insert(out, { pane = pane, tab = p.tab, block = p.block, cwd = "" })
+				end
+				return out
+			end,
+		}
+		cx.layout = {
+			move_to_new_tab = function(_self: any, pane: number, sid: number, reveal: any): number
+				table.insert(w.moved, { pane = pane, session = sid, reveal = reveal })
+				return new_tab(sid, pane)
+			end,
+			name_tab = function(_self: any, tab: number, name: string?)
+				w.named[tab] = name
+			end,
+			focus = function(_self: any, pane: number)
+				w.focused = pane
+			end,
+			close = function(_self: any, pane: number)
+				w.panes[pane] = nil
+				table.insert(w.closed, pane)
+			end,
+			new_tab = function(_self: any, launch: any, _reveal: any): number
+				local pane = new_id()
+				new_tab(w.shown, pane)
+				table.insert(w.opened, launch)
+				return pane
+			end,
+		}
+		function cx:new_block(kind: string, args: any, how: string, opts: any): number
+			local pane = new_id()
+			w.panes[pane] = { tab = w.panes[w.focused] and w.panes[w.focused].tab, block = kind }
+			table.insert(w.blocks, { kind = kind, args = args, how = how, opts = opts, pane = pane })
+			return pane
+		end
+		function cx:toast(level: string, text: string, sub: string?)
+			table.insert(w.toasts, { level = level, text = text, sub = sub })
+		end
+		w.cx = cx
+		return w
 	end
 
 	return env

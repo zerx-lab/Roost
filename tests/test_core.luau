@@ -1,7 +1,8 @@
 --!strict
 -- Runtime flows on the fake tern: config loading, cron firing, the run engine's step machine
--- (through the pid/exit-file wrapper protocol), cancellation, timeouts, recovery after a reload,
--- relayed events turning into runs, and subscription sync with the relay.
+-- (through the pid/exit-file wrapper protocol for shell steps, and the agent job protocol with a
+-- fake window for omp steps), cancellation, timeouts, recovery after a reload, relayed events
+-- turning into runs, and subscription sync with the relay.
 
 local F = require("./fake_tern")
 local harness = require("./harness")
@@ -40,6 +41,8 @@ local function classify(argv: { string }): Proc
 		p.kind = "alive"
 	elseif string.find(script, "tail -c", 1, true) then
 		p.kind = "tail"
+	elseif argv[1] == "/bin/mkdir" then
+		p.kind = "mkdir"
 	end
 	return p
 end
@@ -56,6 +59,9 @@ type Scenario = {
 	-- Whether probed processes are alive; whether SIGTERM is ignored by hanging steps.
 	alive: boolean,
 	ignore_term: boolean,
+	-- A fake Tern window running lib/launcher.luau, once `window(s)` attached one.
+	win: any,
+	L: any,
 }
 
 local function scenario(files: { [string]: string }, opts: { [string]: any }?): Scenario
@@ -77,6 +83,8 @@ local function scenario(files: { [string]: string }, opts: { [string]: any }?): 
 		now = T0,
 		alive = o.alive == true,
 		ignore_term = false,
+		win = nil :: any,
+		L = nil :: any,
 	}
 	env.process = function(argv: { string }, popts: any): any
 		local p = classify(argv)
@@ -109,8 +117,15 @@ local function scenario(files: { [string]: string }, opts: { [string]: any }?): 
 			return { status = if s.alive then 0 else 1, stdout = "", stderr = "", timed_out = false }
 		elseif p.kind == "tail" then
 			return { status = 0, stdout = "", stderr = "", timed_out = false }
+		elseif p.kind == "mkdir" then
+			-- Atomic like mkdir(1): fails when the directory exists.
+			if env.tern.fs.exists(argv[2]) then
+				return { status = 1, stdout = "", stderr = "File exists", timed_out = false }
+			end
+			env.dirs[argv[2]] = true
+			return { status = 0, stdout = "", stderr = "", timed_out = false }
 		end
-		return { status = 0, stdout = "", stderr = "", timed_out = false }
+		return env.append(argv) or { status = 0, stdout = "", stderr = "", timed_out = false }
 	end
 	env.fetch = function(url: string, fopts: any): any
 		local path = string.match(url, "^https?://[^/]+(.*)$") or url
@@ -134,11 +149,25 @@ local function scenario(files: { [string]: string }, opts: { [string]: any }?): 
 	return s
 end
 
+-- Attaches a fake window that runs the agent launcher on every scenario second.
+local function window(s: Scenario): any
+	local w = s.env.window()
+	s.env.wcx = w.cx
+	s.win = w
+	s.L = require("../lib/launcher").new(DATA)
+	return w
+end
+
 local function step(s: Scenario, seconds: number)
-	-- Advance wall clock and the fake timer clock together, one second at a time.
+	-- Advance wall clock and the fake timer clock together, one second at a time; the window's
+	-- launcher ticks after the host each second.
 	for _ = 1, seconds do
 		s.now += 1
 		s.env.advance(1000)
+		if s.L then
+			require("../lib/launcher").tick(s.L, s.win.cx)
+			s.env.drain()
+		end
 	end
 end
 
@@ -173,8 +202,9 @@ do -- defaults are written on first start and parse cleanly
 	eq(s.c.relay.state.configured, false, "relay unconfigured by default")
 end
 
-do -- cron fires once per matching minute, runs steps in order, renders the prompt
+do -- cron fires once per matching minute; the omp step runs as an agent tab in the Roost session
 	local s = scenario({ [DATA .. "/workflows.toml"] = WF_CRON, [DATA .. "/roost.toml"] = "" })
+	local w = window(s)
 	s.core.start(s.c)
 	eq(#s.c.crons, 1, "one cron row")
 	eq(s.c.crons[1].next, T0 + 300, "next fire is the next */5 minute")
@@ -183,18 +213,42 @@ do -- cron fires once per matching minute, runs steps in order, renders the prom
 	step(s, 5)
 	eq(#s.c.store.runs, 1, "fired at the */5 minute")
 	local run = last_run(s)
-	step(s, 3)
-	eq(run.state, "success", "both steps succeeded")
+	local say = s.procs[1]
+	eq(say.kind, "wrapper", "shell step runs through the wrapper")
+	eq(say.opts.env.ROOST_TRIGGER, "cron")
+	truthy(string.find(say.opts.env.PATH, "/home/test/.local/bin", 1, true), "extra_path expanded into PATH")
+	step(s, 2)
 	eq(run.steps[1].state, "success")
-	eq(run.steps[2].state, "success")
-	local omp = s.procs[2]
-	eq(omp.cmd[1], "omp", "omp step runs omp")
-	eq(omp.cmd[2], "-p", "default omp args")
-	eq(omp.cmd[#omp.cmd], `Summarize cron run {run.id}`, "prompt rendered")
-	eq(omp.opts.env.ROOST_TRIGGER, "cron")
-	truthy(string.find(omp.opts.env.PATH, "/home/test/.local/bin", 1, true), "extra_path expanded into PATH")
+	eq(run.steps[2].state, "running", "omp step waits for its agent")
+	eq(#w.started, 1, "the window opened one agent")
+	local started = w.started[1]
+	local dir = `{DATA}/runs/{run.id}`
+	eq(started.opts.command, `omp --session-dir {dir}/s2.session --approval-mode yolo`, "omp keeps its session in the run")
+	eq(started.opts.prompt, `Summarize cron run {run.id}`, "prompt rendered")
+	eq(started.opts.cwd, `{dir}/work`)
+	eq(started.opts.how, "tab")
+	eq(#w.sessions, 2, "Roost session created")
+	eq(w.sessions[2].name, "Roost")
+	eq(w.shown, 1, "the shown session is back to what it was")
+	eq(w.moved[1].session, w.sessions[2].id, "agent moved into the Roost session")
+	eq(w.moved[1].reveal.focus, false)
+	eq(w.named[w.panes[started.pane].tab], "tick · think", "tab named after the step")
+	eq(w.focused, 1, "focus restored")
+	eq(s.env.files[`{dir}/s2.pane`], tostring(started.pane), "pane recorded")
+	step(s, 5)
+	eq(run.state, "running", "still working")
+	w.reply(started.pane, "总结完毕")
+	step(s, 4)
+	eq(run.state, "success", "turn finished: run succeeded")
+	eq(run.steps[2].exit_code, 0)
+	eq(w.stopped[1], started.pane, "agent tab closed")
+	eq(#s.env.kv.agent_jobs, 0, "no agent jobs left")
+	local log = s.env.files[`{dir}/log.txt`] or ""
+	truthy(string.find(log, "总结完毕", 1, true), "reply appended to the log")
+	truthy(string.find(log, "agent 结束:完成", 1, true), "outcome logged")
 	step(s, 60)
 	eq(#s.c.store.runs, 1, "no second fire within the same 5 minutes")
+	eq(#w.started, 1, "a finished step is never reopened")
 	truthy(s.env.files[DATA .. "/runs.json"] and s.env.files[DATA .. "/runs.json.bak"], "history saved twice")
 end
 
@@ -263,14 +317,10 @@ name = "work"
 omp = "Fix #{{number}}: {{payload.comment.body}}"
 ]==]
 
-do -- cancel while running in a worktree still runs the cleanup step
+do -- cancel while an agent works in a worktree: the window closes it, cleanup still runs
 	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TREE, [DATA .. "/roost.toml"] = "" })
+	local w = window(s)
 	s.core.start(s.c)
-	s.behave = function(p)
-		return if p.cmd[3] and string.find(p.cmd[3], "worktree add", 1, true) then "exit:0"
-			elseif p.cmd[1] == "omp" then "hang"
-			else "exit:0"
-	end
 	s.core.dispatch(s.c, "fix")
 	step(s, 2)
 	local run = last_run(s)
@@ -279,9 +329,14 @@ do -- cancel while running in a worktree still runs the cleanup step
 	eq(run.repo_path, "/home/test/code/web")
 	eq(run.steps[1].kind, "prepare")
 	eq(run.steps[2].state, "running")
+	eq(#w.started, 1, "agent opened")
+	eq(w.started[1].opts.cwd, `{DATA}/worktrees/{run.id}`, "agent works in the worktree")
 	eq(s.core.cancel(s.c, run.id), nil, "cancel accepted")
+	eq(s.env.kv.agent_jobs[1].stop, true, "stop published to the windows")
 	step(s, 3)
+	eq(w.stopped[1], w.started[1].pane, "window closed the agent")
 	eq(run.state, "cancelled")
+	eq(run.steps[2].exit_code, 143)
 	eq(run.steps[3].kind, "cleanup")
 	eq(run.steps[3].state, "success", "cleanup ran after cancel")
 end
@@ -388,8 +443,8 @@ do -- relayed events: cursor, matching, run with payload template, subscriptions
 	eq(s.env.kv.cursor.seq, 10, "cursor starts at head")
 
 	queue = { comment_event(11, "/roost please", "MEMBER"), comment_event(12, "/roost x", "NONE") }
-	s.behave = function(p)
-		return if p.cmd[1] == "omp" then "hang" else "exit:0"
+	s.behave = function(_p)
+		return "exit:0"
 	end
 	step(s, 4)
 	eq(s.env.kv.cursor.seq, 12, "cursor advanced")
@@ -400,14 +455,8 @@ do -- relayed events: cursor, matching, run with payload template, subscriptions
 	local run = s.c.store.by_id[member.runs[1]]
 	eq(run.fetch_ref, "refs/pull/7/head", "event ref checked out")
 	step(s, 2)
-	local omp: Proc? = nil
-	for _, p in s.procs do
-		if p.cmd[1] == "omp" then
-			omp = p
-		end
-	end
-	truthy(omp, "omp started")
-	eq((omp :: Proc).cmd[#(omp :: Proc).cmd], "Fix #7: /roost please", "payload template rendered")
+	local job = F.decode(s.env.files[`{DATA}/runs/{run.id}/s2.job.json`])
+	eq(job.prompt, "Fix #7: /roost please", "payload template rendered")
 end
 
 do -- a server-side edit makes the push conflict; adopting the remote revision clears it
@@ -640,6 +689,163 @@ do -- an edit during a push is pushed right after it; offline pushes retry on re
 	eq(#puts, 2, "queued push sent after the first finished")
 	eq(puts[2].repos["acme/web"].events[1], "issues", "with the edited subscriptions")
 	eq(s.c.relay.state.sync.state, "ok")
+end
+
+local WF_AGENT = [==[
+[[workflow]]
+id = "a"
+workspace = "temp"
+timeout = "1m"
+[[workflow.step]]
+name = "ask"
+omp = "hello"
+args = ["--model", "x/y"]
+]==]
+
+local function agent_run(with_window: boolean): (Scenario, any)
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_AGENT, [DATA .. "/roost.toml"] = "" })
+	if with_window then
+		window(s)
+	end
+	s.core.start(s.c)
+	s.core.dispatch(s.c, "a")
+	return s, last_run(s)
+end
+
+do -- no window: the step waits, then times out; the host records the stop itself
+	local s, run = agent_run(false)
+	step(s, 30)
+	eq(run.state, "running", "waiting for a window")
+	eq(#s.env.kv.agent_jobs, 1, "job listed for the windows")
+	step(s, 35)
+	eq(run.state, "timed_out")
+	eq(run.steps[1].exit_code, 143)
+	eq(#s.env.kv.agent_jobs, 0)
+end
+
+do -- a claim that never got a pane (window died mid-launch) is given up after the grace
+	local s, run = agent_run(false)
+	step(s, 1)
+	s.env.dirs[`{DATA}/runs/{run.id}/s1.claim`] = true
+	step(s, 20)
+	eq(run.state, "running", "within the grace")
+	step(s, 15)
+	eq(run.state, "failed")
+	eq(run.steps[1].exit_code, 137)
+	truthy(string.find(run.reason, "丢失", 1, true), "reason explains: " .. run.reason)
+end
+
+do -- an agent tab closed by hand fails the step; a reported failure fails it too
+	local s, run = agent_run(true)
+	local w = s.win
+	step(s, 2)
+	local pane = w.started[1].pane
+	truthy(string.find(w.started[1].opts.command, "--model x/y", 1, true), "step args passed to omp")
+	w.agents[pane] = nil -- the user closed it
+	step(s, 5)
+	eq(run.state, "failed")
+	eq(run.steps[1].exit_code, 130)
+	truthy(string.find(run.reason, "手动关闭", 1, true), run.reason)
+
+	local s2, run2 = agent_run(true)
+	step(s2, 2)
+	local launcher = require("../lib/launcher")
+	launcher.on_finished(s2.L, { pane = s2.win.started[1].pane, result = "failed" }, s2.win.cx)
+	step(s2, 2)
+	eq(run2.state, "failed")
+	eq(run2.steps[1].exit_code, 1)
+	eq(#s2.win.stopped, 1, "failed agents are closed too")
+end
+
+do -- a reloaded window adopts the agent from s<i>.pane; a second window never opens a duplicate
+	local s, run = agent_run(true)
+	local launcher = require("../lib/launcher")
+	local w2 = s.env.window()
+	w2.agents = s.win.agents -- every window sees the same agent blocks
+	local L2 = launcher.new(DATA)
+	for _ = 1, 3 do
+		step(s, 1)
+		launcher.tick(L2, w2.cx)
+		s.env.drain()
+	end
+	eq(#s.win.started + #w2.started, 1, "exactly one window opened the agent")
+	local pane = s.win.started[1].pane
+	s.L = launcher.new(DATA) -- the first window's VM restarts
+	step(s, 2)
+	eq(#s.win.started, 1, "not reopened after the reload")
+	s.win.reply(pane, "done")
+	step(s, 4)
+	eq(run.state, "success", "the new VM saw the turn end")
+end
+
+do -- a window showing another machine leaves the job for later
+	local s, run = agent_run(true)
+	s.win.host_kind = "remote"
+	step(s, 3)
+	eq(#s.win.started, 0, "not opened on a remote host")
+	eq(s.env.tern.fs.exists(`{DATA}/runs/{run.id}/s1.claim`), false, "claim released")
+	s.win.host_kind = "local"
+	step(s, 2)
+	eq(#s.win.started, 1, "opened once the window is local")
+end
+
+do -- an exit file caught mid-write is read again instead of failing the step
+	local s, run = agent_run(true)
+	step(s, 2)
+	local exitf = `{DATA}/runs/{run.id}/s1.exit`
+	s.env.files[exitf] = ""
+	step(s, 1)
+	eq(run.state, "running", "empty exit file: wait")
+	s.env.files[exitf] = "0"
+	step(s, 2)
+	eq(run.state, "success")
+	eq(run.steps[1].exit_code, 0)
+end
+
+do -- a cancel between the claim and the launch opens nothing
+	local s, run = agent_run(true)
+	local launcher = require("../lib/launcher")
+	s.env.advance(1000) -- host publishes the job; the window has not looked yet
+	launcher.tick(s.L, s.win.cx) -- claims (mkdir answer still queued)
+	s.core.cancel(s.c, run.id)
+	s.env.drain() -- mkdir answers: the job is already stopping
+	eq(#s.win.started, 0, "no agent opened")
+	step(s, 2)
+	eq(run.state, "cancelled")
+	eq(run.steps[1].exit_code, 143)
+end
+
+do -- an omp step that was running headless before the upgrade keeps the process path
+	local s, run = agent_run(false)
+	step(s, 1)
+	-- Rewrite history as the old engine left it: a running omp step with wrapper pid files.
+	run.steps[1].agent = nil
+	local dir = `{DATA}/runs/{run.id}`
+	s.env.files[`{dir}/s1.pid`] = "4242"
+	s.env.files[`{dir}/s1.pid.w`] = "4241"
+	s.env.files[`{dir}/s1.job.json`] = nil
+	require("../lib/store").save(s.c.store)
+	local s2 = scenario(table.clone(s.env.files), { alive = true })
+	s2.now = s.now
+	window(s2)
+	s2.core.start(s2.c)
+	step(s2, 3)
+	local old = s2.c.store.by_id[run.id]
+	eq(old.state, "running", "adopted")
+	eq(#s2.env.kv.agent_jobs, 0, "not handed to the windows")
+	eq(#s2.win.started, 0)
+	s2.core.cancel(s2.c, run.id)
+	step(s2, 2)
+	local termed = false
+	for _, p in s2.procs do
+		if p.kind == "kill" and p.argv[6] == "4242" then
+			termed = true
+		end
+	end
+	truthy(termed, "cancel still signals the old process group")
+	s2.env.files[`{dir}/s1.exit`] = "143\n" -- the old wrapper records its child's death
+	step(s2, 2)
+	eq(old.state, "cancelled")
 end
 
 print("ok")

@@ -33,9 +33,9 @@ Roost 是一个 **Tern 插件**,目标是做成一个**可自升级、可自我�
 **Roost 的数据流**:
 
 - `host.luau` 在 daemon worker 启动时创建唯一的 `lib/core.luau` 运行时:每 3 s 读取 plugin-data 下的 `roost.toml`/`workflows.toml`(`lib/model.luau` 校验,出错保留上一份有效配置);每分钟边界检查 cron(`lib/cron.luau`);`lib/relay.luau` 对中继长轮询 `/api/v1/events`,游标存 `tern.kv` 的 `cursor`;`lib/runner.luau` 执行运行。
-- 运行引擎:每个步骤经 `runner.WRAPPER`(`sh -c`,`set -m` 独立进程组)启动,pid/退出码写入 `runs/<id>/s<i>.pid|.exit`,进度靠读这些文件推进,因此插件重载后能接管仍在运行的步骤。历史在 `runs.json`(先写 `.bak` 再写主文件)。
+- 运行引擎:shell 步骤经 `runner.WRAPPER`(`sh -c`,`set -m` 独立进程组)启动,pid/退出码写入 `runs/<id>/s<i>.pid|.exit`;omp 步骤走 agent 协议(`lib/agent.luau`):host 写 `s<i>.job.json` 并把活跃步骤发布到 kv `agent_jobs`,window(`lib/launcher.luau`)用 `mkdir s<i>.claim` 认领,在固定会话(默认 `Roost`)新开标签页 `cx.agents:start`,记 `s<i>.pane`,本轮结束(或关闭/停止)后写 `s<i>.exit` 与 `s<i>.reply.txt` 并关闭 agent;omp 会话存于 `s<i>.session/`(`--session-dir`),随运行目录被 `keep_runs` 清理。两类步骤的进度都靠读文件推进,因此插件重载后能接管。历史在 `runs.json`(先写 `.bak` 再写主文件)。
 - 订阅同步:`model.subscriptions(workflows)` → `PUT /api/v1/subscriptions`(`base_revision` 乐观并发,上次版本存 kv `subs_rev`);失败时 UI 给出 `model.subscriptions_toml` 手动回退。
-- host → window 只经 kv `status`(window 每 2 s 读取,刷新状态栏);window 同时把 plugin-data 下的 `theme.css` 经 `tern.css` 注入。
+- host → window 只经 kv:`status`(window 每 2 s 读取,刷新状态栏)与 `agent_jobs`(window 每 1 s 读取);window → host 只经运行目录里的文件。host block 通过 `cx:open("roost://…")` 让 window 的 `tern.route.link` 打开会话侧栏或会话。window 同时把 plugin-data 下的 `theme.css` 经 `tern.css` 注入。
 - `agent/`:axum 服务,`/hooks/github` 验签 → 按 `subscriptions.toml` 过滤 → `store.rs` 持久化事件(按数量/时间/字节上限淘汰);`/api/v1/*` Bearer 鉴权;`restart` 优雅关闭后 `exec` 自身。
 
 平台层面已有的约束:
@@ -57,17 +57,19 @@ Roost 是一个 **Tern 插件**,目标是做成一个**可自升级、可自我�
 ## Key Directories
 
 ```text
-plugin.toml          # id = "roost",block console
-host.luau            # 运行时 + roost.console block
-window.luau          # 命令、状态栏、theme.css 注入
+plugin.toml          # id = "roost",blocks console + sessions
+host.luau            # 运行时 + roost.console / roost.sessions block
+window.luau          # 命令、状态栏、theme.css 注入、agent 启动器、roost:// 路由
 roost.css            # 主题钩子(data-role = roost.*)
 lib/core.luau        # 运行时编排与给视图的动作 API
 lib/runner.luau      # 运行引擎(高风险:状态机/进程/持久化,主会话维护)
+lib/agent.luau       # omp agent 步骤的 host↔window 文件协议(主会话维护)
+lib/launcher.luau    # window 侧:认领/打开/结束 agent 步骤,会话侧栏与 roost:// 链接(主会话维护)
 lib/relay.luau       # 中继客户端(wire 协议,主会话维护)
 lib/model.luau      # 两个配置文件的解析与校验、订阅计算
 lib/store.luau       # runs.json 历史
 lib/match.luau lib/template.luau lib/cron.luau lib/toml.luau lib/util.luau   # 纯函数
-lib/ui.luau lib/ui/  lib/field.luau  # 面板视图与文本输入
+lib/ui.luau lib/sidebar.luau lib/field.luau  # 面板视图、会话侧栏与文本输入
 tests/               # run.py + fake_tern.luau + harness.luau + test_*.luau
 agent/               # roost-agent(Rust):src/{api,store,github,event,config,secret}.rs,deploy/
 ```

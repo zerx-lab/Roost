@@ -28,7 +28,7 @@ tern plugin install github.com/<owner>/<repo>    # 或开发时:tern plugin link
 
 | 文件 | 作用 |
 |---|---|
-| `roost.toml` | 本机绑定:中继地址与令牌、runner 设置(omp 参数、并发、超时、PATH) |
+| `roost.toml` | 本机绑定:中继地址与令牌、runner 设置(omp 参数、agent 会话名、并发、超时、PATH) |
 | `workflows.toml` | 仓库(GitHub 名 → 本机路径)、工作流、触发器、步骤 |
 | `theme.css`(可选) | 自定义样式,实时注入,见「外观定制」 |
 
@@ -71,7 +71,15 @@ run = "gh issue comment \"$ROOST_NUMBER\" --body-file reply.md"
 - **安全默认值**:issues、评论、PR 这类「用户可写内容」事件,默认只接受 `OWNER`/`MEMBER`/`COLLABORATOR` 作者;`associations = ["*"]` 才对所有人开放。`workflow_run`/`check_suite`/`check_run` 这类 CI 事件没有作者关系,默认拒绝代码来自 fork(或无法确认来源仓库)的事件,`forks = true` 才接受。omp 以 yolo 模式运行,放开前请想清楚提示词注入与执行外部代码的风险。
 - **模板**只用于 omp 提示词:`{{repo}} {{event}} {{action}} {{number}} {{title}} {{body}} {{url}} {{ref}} {{sha}} {{branch}} {{sender}} {{comment}} {{label}} {{workflow}} {{run_id}} {{trigger}} {{input.<名>}} {{payload.<路径>}}`(数组下标从 0 开始)。shell 步骤不做模板替换,改读环境变量 `ROOST_*`:`ROOST_REPO`、`ROOST_NUMBER`、`ROOST_SHA`、`ROOST_BRANCH`、`ROOST_SENDER`、`ROOST_URL`、`ROOST_EVENT_PATH`(完整 payload)、`ROOST_INFO_PATH`(归一化事件)、`ROOST_WORKSPACE`、`ROOST_INPUT_<名>` 等,事件文本不会被拼进命令行。
 - **工作区**:有本机路径的仓库,事件运行在 `plugin-data/roost/worktrees/<run>` 的临时 worktree 中(检出 PR 的 `refs/pull/N/head`、push 的 sha 等),结束后自动清理;`workspace = "repo" | "temp"` 可改。
-- 取消或超时会向整个进程组发送 SIGTERM,8 秒后 SIGKILL。插件重载时,仍在运行的步骤会被重新接管。
+- 取消或超时时,shell 步骤会向整个进程组发送 SIGTERM,8 秒后 SIGKILL;omp 步骤直接关闭它的 agent 标签页。插件重载时,仍在运行的步骤会被重新接管。
+
+### omp 步骤与会话侧栏
+
+- omp 步骤以 **Tern 原生 agent block** 运行。Tern 窗口在固定会话(`roost.toml` 的 `[runner] session`,默认 `Roost`,不存在时自动创建)里新开一个标签页执行。打开时不会抢走焦点。这一轮结束后标签页自动关闭,成功或失败都会关;如果被人手动关掉,这一步按失败处理。agent 的最后一条回复会追加到运行日志。
+- agent 只能由窗口打开:插件 host 把任务写进运行目录和 kv,所有窗口用 `mkdir` 认领,保证只有一个窗口去打开。**没有打开的 Tern 窗口时,omp 步骤会一直等待,直到有窗口出现或超时**。agent 已经打开后如果所有窗口都关了,取消和超时要等有窗口重新打开后才会关掉它。
+- omp 以交互式运行,会话保存在运行目录 `runs/<run>/s<步骤>.session/`(`--session-dir`),不会写入 `~/.omp`。这些会话随 `keep_runs` 跟运行一起清理。`-p`、`--session-dir`、`--resume`、`--continue` 等参数由 Roost 管理,写进 `omp_args` 或步骤 `args` 会报配置错误。
+- omp 步骤收不到 `[runner] env`、工作流 `env` 以及 `ROOST_*` 环境变量,环境沿用 Tern 打开 agent 时的环境。需要的信息请通过提示词模板传入。
+- **会话侧栏**:命令面板运行 **Roost:会话侧栏**,或点工作台标题栏的 omp 图标,会在当前标签页左侧打开或关闭 `roost.sessions` 分屏,列出 Roost 跑过的 omp 会话。双击某行或按 Enter:还在运行的会话会跳到它的标签页;已结束的会话会在新标签页中用 `omp --resume` 继续打开。运行详情里的「omp 会话」按钮效果相同。
 
 ## 部署中继 roost-agent
 

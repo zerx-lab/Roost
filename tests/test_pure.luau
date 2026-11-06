@@ -152,14 +152,32 @@ do -- subscriptions: per repo, enabled workflows only, sorted events; manual TOM
 	assert(string.find(text, '[repos."a/one"]\nevents = ["issues", "push"]\nhook = true', 1, true), text)
 end
 
-do -- roost.toml: relay URL trimmed and checked, runner bounds enforced
+do -- roost.toml: relay URL trimmed and checked, runner bounds enforced, Roost-managed omp flags refused
 	local cfg = model.parse_config('[relay]\nurl = "https://r.dev/"\ntoken = "t"\n[runner]\nmax_concurrent = 3\n') :: model.Config
 	eq(cfg.relay.url, "https://r.dev")
 	eq(cfg.runner.max_concurrent, 3)
-	eq(cfg.runner.omp_args[1], "-p", "default omp args")
 	local bad, issues = model.parse_config('[relay]\nurl = "ftp://x"\n[runner]\nmax_concurrent = 0\n')
 	eq(bad, nil)
 	eq(#issues, 2)
+	local managed, why = model.parse_config('[runner]\nomp_args = ["-p", "--session-dir=/tmp/x", "--thinking", "high"]\nsession = ""\n')
+	eq(managed, nil)
+	eq(#why, 3, "-p, --session-dir=… and the empty session name")
+	local _, step_issues = model.parse_workflows('[[workflow]]\nid = "w"\n[[workflow.step]]\nomp = "hi"\nargs = ["--resume", "abc"]\n')
+	eq(#step_issues, 1, "step args can't resume a session either")
+	eq(step_issues[1].path, "workflow.w.step[1].args")
+end
+
+do -- agent command lines survive spaces and quotes; roost:// links round-trip
+	local agent = require("../lib/agent")
+	local dir = "/Users/me/Library/Application Support/Tern/plugin-data/roost/runs/ab12/s1.session"
+	eq(agent.command("omp", dir, { "--model", "it's" }), `omp --session-dir '{dir}' --model 'it'\\''s'`)
+	eq(agent.quote(""), "''", "an empty argument stays an argument")
+	local r = agent.parse_url(agent.session_url("ab12", 3)) :: any
+	eq(r.kind, "session")
+	eq(r.run, "ab12")
+	eq(r.step, 3)
+	eq(agent.parse_url("roost://session/../../x/1"), nil, "only hex run ids")
+	eq((agent.parse_url(agent.SIDEBAR_URL) :: any).kind, "sidebar")
 end
 
 do -- util

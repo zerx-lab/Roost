@@ -32,7 +32,9 @@ See [README.zh-CN.md](README.zh-CN.md) for the full `workflows.toml` reference (
 
 Highlights:
 - Templates apply to omp prompts only; shell steps read `ROOST_*` environment variables, so event text never lands in a command line.
-- Event runs use a temporary git worktree at the event's ref, removed afterwards. Cancel and timeout signal the whole process group. Running steps are adopted again after a plugin reload.
+- Event runs use a temporary git worktree at the event's ref, removed afterwards. Cancel and timeout signal a shell step's whole process group, and close an omp step's agent tab. Running steps are adopted again after a plugin reload.
+- omp steps run as native Tern agent blocks. A window opens each one in a new tab of a fixed session (`[runner] session`, default `Roost`, created if missing) without taking focus. The tab closes when the turn ends, whether the step succeeded or failed. Only windows can open agents: with no Tern window open, an omp step waits until one appears or the step times out. If every window closes after an agent has opened, cancel and timeout close the agent only once a window is back. omp step agents use Tern's environment, not `env` or `ROOST_*`.
+- Each conversation is kept in the run's directory (`--session-dir`), outside `~/.omp`, and pruned with the run (`keep_runs`). **Roost:会话侧栏** (or the omp icon in the console header) toggles a left-hand `roost.sessions` split that lists them: activating a row jumps to a live agent's tab, or resumes a finished conversation with `omp --resume` in a new tab.
 - User-content events (issues, comments, PRs) only fire for `OWNER`/`MEMBER`/`COLLABORATOR` authors unless a trigger sets `associations = ["*"]`. CI events (`workflow_run`, `check_suite`, `check_run`) whose code comes from a fork, or whose origin can't be confirmed, only fire with `forks = true`.
 
 ## Relay agent

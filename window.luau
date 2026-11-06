@@ -1,10 +1,14 @@
 --!strict
--- Window half: the palette command that opens the console, a status-line segment fed by the
--- host's `status` kv record, and the user's theme.css applied live.
+-- Window half: the palette commands (console, sessions sidebar), a status-line segment fed by the
+-- host's `status` kv record, the user's theme.css applied live, and the agent launcher that opens
+-- omp steps as agent blocks (lib/launcher.luau) and answers `roost://` links.
+
+local launcher = require("./lib/launcher")
 
 local KIND = "roost.console"
 local THEME = tern.plugin.data .. "/theme.css"
 local POLL_MS = 2000
+local AGENT_MS = 1000
 local MAX_THEME = 256 * 1024
 
 local function open(cx: WindowCx)
@@ -25,6 +29,36 @@ local function open(cx: WindowCx)
 end
 
 tern.command({ id = "open", title = "Roost:打开工作台", icon = "flow", run = open })
+tern.command({ id = "sessions", title = "Roost:会话侧栏", icon = "omp", run = launcher.toggle_sidebar })
+
+-- Agent steps: claim and watch on a timer, end turns as soon as Tern reports them.
+local L = launcher.new(tern.plugin.data)
+
+local function agent_loop(cx: WindowCx?)
+	-- Rescheduled first: a tick that trips the call budget can't run past this point again.
+	tern.timer(AGENT_MS, agent_loop)
+	if cx then
+		local ok, err = pcall(function(): string?
+			launcher.tick(L, cx)
+			return nil
+		end)
+		if not ok then
+			tern.log.warn("roost: agent tick failed", err)
+		end
+	end
+end
+tern.timer(AGENT_MS, agent_loop)
+
+tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
+	launcher.on_finished(L, ev, cx)
+end)
+
+tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
+	if launcher.route(L, cx, link.url) then
+		return { handled = true }
+	end
+	return nil
+end)
 
 -- Status segment: what the host last published, read on a timer (formatters must stay cheap).
 type Status = { running: number?, queued: number?, relay: string?, failed: number? }

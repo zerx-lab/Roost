@@ -79,8 +79,13 @@ local DEFAULT_CONFIG = [[
 # client_name = "my-mac"   # 在中继状态里显示的本机名称
 
 [runner]
+# omp 步骤以原生 agent 标签页运行:由 Tern 窗口在下面的会话里新开标签页,结束后自动关闭;
+# 会话记录保存在该运行的目录里(--session-dir),随 keep_runs 一起清理。没有打开的 Tern 窗口时,
+# omp 步骤会一直等到窗口出现或超时;已经打开的 agent 若所有窗口都关了,取消/超时要等窗口回来才会关掉它。
+# -p / --session-dir / --resume 等由 Roost 管理,不要写进 omp_args。
 # omp = "omp"
-# omp_args = ["-p", "--approval-mode", "yolo", "--no-title"]
+# omp_args = ["--approval-mode", "yolo"]
+# session = "Roost"
 # max_concurrent = 2
 # default_timeout = "30m"
 # keep_runs = 200
@@ -113,7 +118,7 @@ local DEFAULT_WORKFLOWS = [==[
 # [[workflow.trigger]]          # 主动:定时(本机时区,或 tz = "UTC")
 # cron = "0 9 * * 1-5"
 #
-# [[workflow.step]]
+# [[workflow.step]]                # omp 步骤:提示词可用 {{...}} 模板;不会收到 env / ROOST_* 环境变量
 # omp = "分析 issue #{{number}}:{{title}}\n\n{{body}}"
 #
 # [[workflow.step]]
