@@ -999,11 +999,17 @@ local function runs_split(st: State): boolean
 end
 
 -- A detail pane's head: the item's name and muted facts at the left, its state and actions at
--- the right (the split already frames the pane, so no card around it).
+-- the right (the split already frames the pane, so no card around it). A long title (an issue's
+-- subject) takes two lines at most and gives way; the right side keeps its width (roost.css:
+-- `roost.phead`), or its badge squeezed and its last button was cut off at the pane's edge.
 local function pane_head(title: { any }, right: { Node }): Node
-	return N("row", { key = "head", justify = "between", align = "center", gap = "md" }, {
-		ui.text(title),
-		N("row", { key = "end", gap = "sm", align = "center" }, right),
+	local full = {}
+	for _, s in title do
+		table.insert(full, if type(s) == "string" then s else s.t)
+	end
+	return N("row", { key = "head", role = "roost.phead", justify = "between", align = "center", gap = "md" }, {
+		N("text", { key = "title", spans = title, lines = 2, title = util.trim(table.concat(full, "")) }),
+		N("row", { key = "end", role = "roost.phead.end", gap = "sm", align = "center" }, right),
 	})
 end
 

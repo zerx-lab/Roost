@@ -10,6 +10,7 @@
  *   [data-role='roost.fill']                 every page's body: fills the block below the tabs; the page scrolls inside it
  *   [data-role='roost.runlist']              runs list pane (filter bar, then the scrolling table)
  *   [data-role='roost.run']                  run detail pane (right of the runs list)
+ *   [data-role='roost.phead']                a detail pane's head (title, then [data-role='roost.phead.end']: state and actions)
  *   [data-role='roost.log']                  run log scroller (ansi inside)
  *   [data-role='roost.workflows']            workflows page; each workflow is a card [data-role='roost.workflow']
  *   [data-role='roost.wfgroup']              one group of workflows (head [data-role='roost.wfgroup.head'], then the cards)
@@ -33,8 +34,27 @@
  * --card, --raise), never fixed colors, so light and dark themes both work.
  */
 
+/* The block's outer margin: Tern's region has none at the sides (only 6px top and bottom), so a
+ * page's right-hand toolbar and a card's edge sat against the pane's edge and its last button
+ * looked cut off. Header, tabs, every page and the key legend share the same inset. */
+.sf-main[data-surface='plugin.roost.console'] {
+	padding: 10px 14px 6px;
+}
+.sf-dock[data-surface='plugin.roost.console'] {
+	padding: 0 14px;
+}
+
 [data-surface='plugin.roost.console'] [data-role='roost.header'] {
 	padding: 2px 2px 0;
+}
+
+/* A detail pane's head: the long title wraps (two lines at most) and the state, took and actions
+ * at the right keep their width; shrinking with it squeezed the badge and cut the button off. */
+[data-surface='plugin.roost.console'] [data-role='roost.phead'] > [data-role='roost.phead.end'] {
+	flex: none;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.phead'] > :first-child {
+	flex: 1 1 auto;
 }
 
 /* Only the page scrolls, never the head and tabs above it: the page body fills the block below
