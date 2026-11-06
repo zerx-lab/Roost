@@ -16,7 +16,8 @@
  *   [data-role='roost.form']                 manual-run form overlay
  *   [data-role='roost.editor']               automation editor overlay
  *   [data-role='roost.trigger']              one trigger card inside the editor
- *   [data-role='roost.chips']                filter chips and their add field
+ *   [data-role='roost.chips']                selected filter values (wrapping); each is [data-role='roost.chip']
+ *   [data-role='roost.suggest']              a suggested value not yet selected
  *   [data-role='roost.templates']            template gallery card
  *   [data-role='roost.summary']              validation summary above the editor footer
  *   [data-role='roost.warn']                 a field or card warning
@@ -61,6 +62,16 @@
 }
 [data-surface='plugin.roost.console'] [data-role='roost.chips'] {
 	gap: 4px;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.chip'] {
+	max-width: 100%;
+	border: 1px solid var(--accent);
+	color: var(--accent);
+}
+[data-surface='plugin.roost.console'] [data-role='roost.suggest'] {
+	max-width: 100%;
+	border: 1px dashed var(--l3);
+	color: var(--t2);
 }
 [data-surface='plugin.roost.console'] [data-role='roost.templates'] {
 	border-radius: 6px;

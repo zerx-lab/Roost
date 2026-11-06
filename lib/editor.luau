@@ -988,8 +988,9 @@ local function chip_row(st: any, ed: Editor, i: number, tr: any, f: KeyedFilter)
 			key = `c{j}`,
 			text = `{item} ×`,
 			size = "sm",
-			variant = "quiet",
-			title = "移除",
+			tone = "accent",
+			role = "roost.chip",
+			title = `移除 {item}`,
 			actions = { click = `cdel:{i}:{f.key}:{j}` },
 		}))
 	end
@@ -1025,20 +1026,23 @@ local function chip_row(st: any, ed: Editor, i: number, tr: any, f: KeyedFilter)
 		hint = "选择一个仓库以查看建议"
 	end
 	ed.suggest[sug_key] = items
-	local sug: { any } = {}
+	local status: any = nil
 	if hint then
-		table.insert(sug, txt(hint, "hint", "muted"))
+		status = txt(hint, "hint", "muted")
 	elseif err then
-		table.insert(sug, txt(err, "err", "warning"))
+		status = txt(err, "err", "warning")
 	elseif loading and #items == 0 then
-		table.insert(sug, txt("加载中…", "loading", "muted"))
+		status = txt("加载中…", "loading", "muted")
 	end
+	local sug: { any } = {}
 	for j, item in items do
 		table.insert(sug, N("button", {
 			key = `b{j}`,
-			text = item,
+			text = `+ {item}`,
 			size = "sm",
 			variant = "quiet",
+			role = "roost.suggest",
+			title = `添加 {item}`,
 			actions = { click = `sug:{i}:{f.key}:{j}` },
 		}))
 	end
@@ -1047,11 +1051,17 @@ local function chip_row(st: any, ed: Editor, i: number, tr: any, f: KeyedFilter)
 	end)
 	local children: { any } = {
 		txt(f.label, "lab", "muted"),
-		N("row", { key = "chips", gap = "xs", role = "roost.chips" }, chips),
+		N("row", { key = "chips", gap = "xs", wrap = true, role = "roost.chips" }, chips),
 		input_node(ed, input_id, { key = "add", placeholder = f.hint or "输入后回车添加" }),
 	}
+	if status then
+		table.insert(children, status)
+	end
 	if #sug > 0 then
-		table.insert(children, N("col", { key = "sug", gap = "xs" }, sug))
+		table.insert(children, N("row", { key = "sug", gap = "xs", wrap = true, align = "center" }, {
+			txt("建议", "sl", "muted"),
+			N("row", { key = "items", gap = "xs", wrap = true }, sug),
+		}))
 	end
 	if filter_err then
 		table.insert(children, txt(filter_err, "ferr", "warning"))
@@ -1075,9 +1085,9 @@ local function choice_row(i: number, tr: any, f: KeyedFilter): any
 			actions = { click = `choice:{i}:{f.key}:{j}` },
 		}))
 	end
-	return N("row", { key = f.key, gap = "xs", align = "center" }, {
+	return N("row", { key = f.key, gap = "xs", align = "center", wrap = true }, {
 		txt(f.label, "lab", "muted"),
-		N("row", { key = "opts", gap = "xs" }, buttons),
+		N("row", { key = "opts", gap = "xs", wrap = true }, buttons),
 	})
 end
 
