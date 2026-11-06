@@ -7,6 +7,7 @@
 mod api;
 mod config;
 mod event;
+mod fleet;
 mod github;
 mod secret;
 mod store;
@@ -209,6 +210,7 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
         ExitCode::FAILURE
     })?;
 
+    let data_dir = cfg.data_dir.clone();
     let started_at = Utc::now();
     let boot_id = hex::encode(
         Sha256::digest(
@@ -236,6 +238,7 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
         deliveries: Mutex::new(VecDeque::new()),
         delivery_stats: Mutex::new(api::DeliveryStats::new(started_at)),
         clients: Mutex::new(BTreeMap::new()),
+        fleet: Arc::new(fleet::Fleet::open(data_dir)),
         boot_id: boot_id.clone(),
         started_at,
         shutdown: shutdown_tx.clone(),

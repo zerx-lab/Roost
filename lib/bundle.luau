@@ -101,8 +101,9 @@ function M.encode(b: Bundle, header: string): string
 end
 
 -- Reads an export back. Checks the shape only; whether the workflows are valid is the importer's
--- question (they are checked together with the workflows already here).
-function M.decode(text: string): (Bundle?, string?)
+-- question (they are checked together with the workflows already here). `allow_empty`: a file
+-- without workflows is fine (device sync: the executor may have none).
+function M.decode(text: string, allow_empty: boolean?): (Bundle?, string?)
 	if #text > M.MAX_BYTES then
 		return nil, `文件超过 {M.MAX_BYTES // (1024 * 1024)} MiB`
 	end
@@ -136,7 +137,10 @@ function M.decode(text: string): (Bundle?, string?)
 		b.repos[name] = { branch = branch, worktree = worktree }
 	end
 	local wfs = root.workflow
-	if type(wfs) ~= "table" or #wfs == 0 then
+	if wfs == nil and allow_empty then
+		wfs = {}
+	end
+	if type(wfs) ~= "table" or (#wfs == 0 and not allow_empty) then
 		return nil, "文件中没有 [[workflow]]"
 	end
 	local ids: { [string]: boolean } = {}

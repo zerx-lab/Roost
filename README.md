@@ -79,6 +79,18 @@ Caveats: App tokens are only handed out over an https relay URL (loopback except
 
 Sync model: the plugin computes per-repo event subscriptions from `workflows.toml` (`"*"` for triggers on any repo) and pushes them (`PUT /api/v1/subscriptions`, revision-checked). The status is checked against the revision the relay reports in `/status`: **In sync** when it runs exactly what was last pushed and the local workflows haven't changed, **Using server copy** after keeping the server's version in a conflict, **Checking** until the relay's status arrives. **Push subscriptions** always pushes, even when nothing changed. When the push fails, the console shows the exact `subscriptions.toml` to place on the server; press **Reload** after placing it. **Restart** re-execs the agent in place after an `agent.toml` or binary change. Stored events and cursors survive the restart.
 
+Several machines can share one relay (the GitHub App stays as it is: its credentials live on the server). On the relay page's **设备** card, make one of them the **executor** (two clicks); the others become **observers**:
+
+- Only the executor runs workflows: GitHub events, schedules, manual runs and evolvers. The relay hands App tokens and accepts subscription pushes from the executor alone (403 for anyone else).
+- Observers still read events and list them on the events page, marked with the executor that runs them. They can't run workflows or change workflows, libraries or groups.
+- Configuration sync: the executor uploads every workflow, its files, the libraries in use, the repositories' branch settings and the groups in the export format, without env values. Observers apply it, keeping their own repository `path`s and env values, and remove workflows the executor doesn't have. `state/` is not synced.
+- Run sync: the executor uploads summaries of its latest 100 runs (the newest 20 with their log's last 4 KiB), which the observers' runs page shows read-only.
+- Handover: any machine can make another machine the relay has seen the executor (compare-and-set on a revision). The new executor continues right after the events the old one confirmed it had handled, so events a sleeping or offline executor never handled are not lost; only a batch being handed to the old executor at the moment of reassignment may run on both. Runs already going on the old executor finish there, but their tokens are no longer renewed. Observers count due schedules as fired, so a `once` schedule an offline executor missed is not run after a handover.
+- An unreadable device record (`fleet.json`) on the relay doesn't mean "no executor": nobody may act as one until an executor is assigned again.
+- Whenever an observer's configuration is about to be replaced and it may hold changes of its own (first sync, it was the executor since, or `workflows.toml` was edited by hand), `workflows.toml` is first copied to `workflows.toml.before-sync-<time>` (the newest 10 kept) and the workflows are exported.
+- With no executor assigned, every machine runs, as before. Two machines online without an executor run every event twice.
+- Set `client_name` under `[relay]` in `roost.toml` to name a machine in the list.
+
 API:
 
 - `POST /hooks/github`, signed with the App's webhook secret.
@@ -91,7 +103,9 @@ API:
   - `GET /api/v1/github/{repos,people,labels,branches,workflows}?repo=`
   - `POST /api/v1/github/token` (`{"repo"}`: a run's App token, once the default branch is guarded)
   - `POST /api/v1/events/test`, `DELETE /api/v1/events` (drop cached events; sequence numbers carry on)
-  - `GET /api/v1/status`, `GET|DELETE /api/v1/deliveries` (recent deliveries and counts by outcome, event and repo, in memory since start or the last clear)
+  - `GET /api/v1/status` (includes the devices record `fleet`), `GET|DELETE /api/v1/deliveries` (recent deliveries and counts by outcome, event and repo, in memory since start or the last clear)
+  - `PUT /api/v1/fleet/executor` (`{"client", "base_revision"}`: 409 on a stale revision, 404 for a client the relay hasn't heard from)
+  - `GET|PUT /api/v1/fleet/config` (the executor's configuration in the export format; `?have=` skips an unchanged one) and `GET|PUT /api/v1/fleet/runs` (its run summaries, ≤512 KiB); only the executor writes
 - Unauthenticated: `GET /healthz`.
 
 ## Development

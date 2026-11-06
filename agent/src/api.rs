@@ -10,7 +10,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use tokio::sync::watch;
 
 use crate::config::{AgentConfig, Issue, RepoSub, Subscriptions};
 use crate::event::EventInfo;
+use crate::fleet::{self, Fleet, FleetError};
 use crate::github::{self, Failure, Github};
 use crate::store::{EventStore, MAX_PAGE, StoredEvent};
 
@@ -31,6 +32,8 @@ const MAX_STAT_KEYS: usize = 256;
 const MAX_CLIENTS: usize = 32;
 const MAX_WAIT: Duration = Duration::from_secs(30);
 const ADMIN_BODY_LIMIT: usize = 1024 * 1024;
+/// The configuration upload: up to `fleet::MAX_CONFIG` of text, JSON-escaped.
+const CONFIG_BODY_LIMIT: usize = 4 * fleet::MAX_CONFIG;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shutdown {
@@ -159,6 +162,8 @@ pub struct AppState {
     /// Lock order: `delivery_stats` before `deliveries`.
     pub delivery_stats: Mutex<DeliveryStats>,
     pub clients: Mutex<BTreeMap<String, ClientSeen>>,
+    /// Which client is the executor; the executor's configuration and runs for observers.
+    pub fleet: Arc<Fleet>,
     pub boot_id: String,
     pub started_at: DateTime<Utc>,
     pub shutdown: watch::Sender<Option<Shutdown>>,
@@ -235,6 +240,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/events", get(events).delete(clear_events))
         .route("/events/test", post(test_event))
         .route("/deliveries", get(deliveries).delete(clear_deliveries))
+        .route("/fleet/executor", put(put_executor))
+        .route(
+            "/fleet/config",
+            get(get_config)
+                .put(put_config)
+                .layer(DefaultBodyLimit::max(CONFIG_BODY_LIMIT)),
+        )
+        .route("/fleet/runs", get(get_runs).put(put_runs))
         .layer(DefaultBodyLimit::max(ADMIN_BODY_LIMIT))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
@@ -426,6 +439,7 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<Value> {
         },
         "deliveries": { "total": total, "since": since, "last": last },
         "clients": clients,
+        "fleet": st.fleet.state(),
     }))
 }
 
@@ -440,7 +454,14 @@ struct PutSubs {
     repos: BTreeMap<String, RepoSub>,
 }
 
-async fn put_subs(State(st): State<Arc<AppState>>, Json(body): Json<PutSubs>) -> Response {
+async fn put_subs(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PutSubs>,
+) -> Response {
+    if let Some(denied) = executor_only(&st, &headers) {
+        return denied;
+    }
     let _w = st.subs_write.lock().await;
     let cur = st.subs();
     // A hand edit on the server that hasn't been reloaded yet still counts as a server change.
@@ -637,7 +658,14 @@ struct TokenBody {
 }
 
 /// A token for one run on `repo`, acting as the App (see `Github::app_token`).
-async fn gh_token(State(st): State<Arc<AppState>>, Json(b): Json<TokenBody>) -> Response {
+async fn gh_token(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(b): Json<TokenBody>,
+) -> Response {
+    if let Some(denied) = executor_only(&st, &headers) {
+        return denied;
+    }
     match st.gh.app_token(&b.repo).await {
         Ok(t) => {
             tracing::info!(repo = %t.repository, protection = t.protection, "issued an App token");
@@ -653,6 +681,11 @@ struct EventsQuery {
     limit: Option<usize>,
     wait: Option<u64>,
     payload: Option<bool>,
+    /// Sent by the executor's own polls (not its history reads): the assignment revision it acts
+    /// under. Its `after` is then what it has handled.
+    ack: Option<u64>,
+    /// The store the acked cursor belongs to: an ack for another (wiped) store is ignored.
+    store: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -685,18 +718,66 @@ fn event_out(e: &StoredEvent, with_payload: bool) -> EventOut<'_> {
     }
 }
 
-fn client_id(h: &HeaderMap) -> Option<(String, Option<String>)> {
-    let id = header(h, "x-roost-client")?;
-    let ok = !id.is_empty()
+fn valid_client(id: &str) -> bool {
+    !id.is_empty()
         && id.len() <= 64
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
-    if !ok {
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn client_id(h: &HeaderMap) -> Option<(String, Option<String>)> {
+    let id = header(h, "x-roost-client")?;
+    if !valid_client(id) {
         return None;
     }
     let name = header(h, "x-roost-client-name").map(|n| n.chars().take(64).collect());
     Some((id.to_string(), name))
+}
+
+/// Refuses a request only the executor may make, when it comes from another client.
+fn executor_only(st: &AppState, h: &HeaderMap) -> Option<Response> {
+    let id = client_id(h).map(|(id, _)| id);
+    if st.fleet.allows(id.as_deref()) {
+        None
+    } else {
+        Some(fleet_failure(FleetError::NotExecutor, st))
+    }
+}
+
+fn fleet_failure(e: FleetError, st: &AppState) -> Response {
+    match e {
+        FleetError::NotExecutor => {
+            let s = st.fleet.state();
+            let who = s
+                .executor
+                .as_ref()
+                .map(|ex| ex.name.clone().unwrap_or_else(|| ex.id.clone()))
+                .unwrap_or_else(|| "none assigned".into());
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": format!("only the executor may do this (executor: {who})"),
+                    "code": "not_executor",
+                    "fleet": s,
+                })),
+            )
+                .into_response()
+        }
+        FleetError::Conflict(s) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "the executor changed since you looked",
+                "fleet": s,
+            })),
+        )
+            .into_response(),
+        FleetError::TooLarge(n) => err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("larger than {n} bytes"),
+        ),
+        FleetError::Io(m) => err(StatusCode::INTERNAL_SERVER_ERROR, m),
+    }
 }
 
 async fn events(
@@ -711,7 +792,8 @@ async fn events(
     let after = q.after.unwrap_or(head);
     // A cursor past the head belongs to a wiped store: answer at once so the client resets.
     let wait_ok = after <= head;
-    if let Some((id, name)) = client_id(&headers) {
+    let client = client_id(&headers);
+    if let Some((id, name)) = client.clone() {
         let mut g = lock(&st.clients);
         if !g.contains_key(&id)
             && g.len() >= MAX_CLIENTS
@@ -719,17 +801,31 @@ async fn events(
         {
             g.remove(&oldest);
         }
+        // History reads (`payload=false`) start before the client's cursor: keep its poll's.
+        let cursor = match (q.payload, g.get(&id)) {
+            (Some(false), Some(prev)) => prev.cursor,
+            _ => after,
+        };
         g.insert(
             id.clone(),
             ClientSeen {
                 id,
                 name,
                 last_seen: Utc::now(),
-                cursor: after,
+                cursor,
             },
         );
     }
+    if let (Some((id, _)), Some(rev), Some(a)) = (&client, q.ack, q.after)
+        && wait_ok
+        && q.store.as_deref() == Some(st.store.store_id())
+    {
+        st.fleet.ack(id, rev, st.store.store_id(), a).await;
+    }
     let wait = Duration::from_secs(q.wait.unwrap_or(0)).min(MAX_WAIT);
+    // Subscribed before looking, so a change in between still ends the wait.
+    let mut fleet_rx = st.fleet.subscribe();
+    fleet_rx.borrow_and_update();
     if wait_ok && wait > Duration::ZERO && st.store.page(after, 1).events.is_empty() {
         let mut head_rx = st.store.subscribe();
         let mut stop_rx = st.shutdown.subscribe();
@@ -741,11 +837,13 @@ async fn events(
             tokio::select! {
                 r = head_rx.changed() => if r.is_err() { break },
                 r = stop_rx.changed() => if r.is_err() { break },
+                _ = fleet_rx.changed() => break,
                 _ = tokio::time::sleep_until(deadline) => break,
             }
         }
     }
     let page = st.store.page(after, limit);
+    let fleet = st.fleet.state();
     let list: Vec<EventOut<'_>> = page
         .events
         .iter()
@@ -758,8 +856,99 @@ async fn events(
         "oldest": page.oldest,
         "gap": page.gap,
         "events": list,
+        "fleet": fleet,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Devices: the executor, its configuration and its runs
+
+#[derive(Deserialize)]
+struct ExecutorBody {
+    client: String,
+    base_revision: u64,
+}
+
+/// Makes a client the relay has heard from the executor (compare-and-set on the fleet revision).
+async fn put_executor(State(st): State<Arc<AppState>>, Json(b): Json<ExecutorBody>) -> Response {
+    if !valid_client(&b.client) {
+        return err(StatusCode::BAD_REQUEST, "invalid client id");
+    }
+    let Some(seen) = lock(&st.clients).get(&b.client).cloned() else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "the relay hasn't heard from that client since it started",
+        );
+    };
+    match st
+        .fleet
+        .assign(
+            &b.client,
+            seen.name,
+            b.base_revision,
+            st.store.store_id(),
+            Some(seen.cursor),
+        )
+        .await
+    {
+        Ok(s) => Json(json!({ "fleet": s })).into_response(),
+        Err(e) => fleet_failure(e, &st),
+    }
+}
+
+#[derive(Deserialize)]
+struct HaveQuery {
+    have: Option<String>,
+}
+
+async fn get_config(State(st): State<Arc<AppState>>, Query(q): Query<HaveQuery>) -> Response {
+    let (meta, text) = st.fleet.config();
+    match (meta, text) {
+        (Some(m), Some(t)) if q.have.as_deref() != Some(m.revision.as_str()) => {
+            Json(json!({ "config": m, "text": &*t })).into_response()
+        }
+        (m, _) => Json(json!({ "config": m, "unchanged": true })).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigBody {
+    text: String,
+}
+
+async fn put_config(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(b): Json<ConfigBody>,
+) -> Response {
+    let id = client_id(&headers).map(|(id, _)| id).unwrap_or_default();
+    match st.fleet.put_config(&id, b.text).await {
+        Ok(m) => Json(json!({ "config": m })).into_response(),
+        Err(e) => fleet_failure(e, &st),
+    }
+}
+
+async fn get_runs(State(st): State<Arc<AppState>>, Query(q): Query<HaveQuery>) -> Response {
+    let (meta, body) = st.fleet.runs();
+    match (meta, body) {
+        (Some(m), Some(b)) if q.have.as_deref() != Some(m.revision.as_str()) => {
+            Json(json!({ "runs": m, "body": &*b })).into_response()
+        }
+        (m, _) => Json(json!({ "runs": m, "unchanged": true })).into_response(),
+    }
+}
+
+async fn put_runs(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(b): Json<Box<RawValue>>,
+) -> Response {
+    let id = client_id(&headers).map(|(id, _)| id).unwrap_or_default();
+    match st.fleet.put_runs(&id, b).await {
+        Ok(m) => Json(json!({ "runs": m })).into_response(),
+        Err(e) => fleet_failure(e, &st),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -904,6 +1093,7 @@ mod tests {
             deliveries: Mutex::new(VecDeque::new()),
             delivery_stats: Mutex::new(DeliveryStats::new(Utc::now())),
             clients: Mutex::new(BTreeMap::new()),
+            fleet: Arc::new(Fleet::open(dir.to_path_buf())),
             boot_id: "boot".into(),
             started_at: Utc::now(),
             shutdown: watch::channel(None).0,
@@ -1663,5 +1853,136 @@ mod tests {
         assert_eq!(v["gap"], false);
         let (_, v) = call(&app, signed("issues", "d9", ISSUE, "hush")).await;
         assert_eq!(v["seq"], 3, "sequence numbers are not reused");
+    }
+
+    fn from(client: &str, method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+        let mut r = admin(method, uri, body);
+        r.headers_mut()
+            .insert("x-roost-client", client.parse().unwrap());
+        r
+    }
+
+    #[tokio::test]
+    async fn the_executor_alone_runs_and_hands_over_at_its_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let app = router(st.clone());
+        let subs = || Some(json!({"repos": {"acme/web": {"events": ["issues"]}}}));
+        let token = || Some(json!({"repo": "acme/web"}));
+
+        // Both devices poll; nobody is the executor yet, so either may push subscriptions.
+        let (_, v) = call(&app, from("mac-1", "GET", "/api/v1/events", None)).await;
+        assert_eq!(v["fleet"]["executor"], Value::Null);
+        call(&app, from("mac-2", "GET", "/api/v1/events", None)).await;
+        let (c, _) = call(&app, from("mac-2", "PUT", "/api/v1/subscriptions", subs())).await;
+        assert_eq!(c, StatusCode::OK);
+
+        let assign = |client: &str, base: u64| {
+            from(
+                "mac-2",
+                "PUT",
+                "/api/v1/fleet/executor",
+                Some(json!({"client": client, "base_revision": base})),
+            )
+        };
+        let (c, _) = call(&app, assign("ghost", 0)).await;
+        assert_eq!(c, StatusCode::NOT_FOUND, "only clients the relay has seen");
+        let (c, v) = call(&app, assign("mac-1", 0)).await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["fleet"]["executor"]["id"], "mac-1");
+        let (c, v) = call(&app, assign("mac-2", 0)).await;
+        assert_eq!(c, StatusCode::CONFLICT);
+        assert_eq!(v["fleet"]["revision"], 1);
+
+        let (c, v) = call(&app, from("mac-2", "PUT", "/api/v1/subscriptions", subs())).await;
+        assert_eq!(
+            (c, v["code"].clone()),
+            (StatusCode::FORBIDDEN, json!("not_executor"))
+        );
+        let (c, _) = call(&app, from("mac-2", "POST", "/api/v1/github/token", token())).await;
+        assert_eq!(c, StatusCode::FORBIDDEN, "observers get no App token");
+        let (c, _) = call(&app, from("mac-1", "POST", "/api/v1/github/token", token())).await;
+        assert_ne!(
+            c,
+            StatusCode::FORBIDDEN,
+            "the executor does (GitHub is unreachable here)"
+        );
+        let (c, _) = call(&app, from("mac-1", "PUT", "/api/v1/subscriptions", subs())).await;
+        assert_eq!(c, StatusCode::OK);
+
+        // Configuration and runs: written by the executor, read by anyone.
+        let cfg = || Some(json!({"text": "[roost]\nformat = 1\n"}));
+        let (c, _) = call(&app, from("mac-2", "PUT", "/api/v1/fleet/config", cfg())).await;
+        assert_eq!(c, StatusCode::FORBIDDEN);
+        let (c, v) = call(&app, from("mac-1", "PUT", "/api/v1/fleet/config", cfg())).await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let rev = v["config"]["revision"].as_str().unwrap().to_string();
+        let (_, v) = call(&app, from("mac-2", "GET", "/api/v1/fleet/config", None)).await;
+        assert_eq!(v["text"], "[roost]\nformat = 1\n");
+        let uri = format!("/api/v1/fleet/config?have={rev}");
+        let (_, v) = call(&app, from("mac-2", "GET", &uri, None)).await;
+        assert_eq!(
+            (v["unchanged"].clone(), v["text"].clone()),
+            (json!(true), Value::Null)
+        );
+        let runs = Some(json!({"runs": [{"id": "r1", "status": "ok"}]}));
+        let (c, _) = call(&app, from("mac-1", "PUT", "/api/v1/fleet/runs", runs)).await;
+        assert_eq!(c, StatusCode::OK);
+        let (_, v) = call(&app, from("mac-2", "GET", "/api/v1/fleet/runs", None)).await;
+        assert_eq!(v["body"]["runs"][0]["id"], "r1");
+        assert_eq!(v["runs"]["client"], "mac-1");
+
+        // mac-1 has handled event 1 of 2 (it polls after it, acting under revision 1 on this
+        // store); a poll without `ack`, an old revision or another store say nothing. mac-2 takes
+        // over right after 1.
+        call(&app, signed("issues", "d1", ISSUE, "hush")).await;
+        call(&app, signed("issues", "d2", ISSUE, "hush")).await;
+        let store = st.store.store_id().to_string();
+        let poll =
+            |client: &str, q: &str| from(client, "GET", &format!("/api/v1/events?{q}"), None);
+        call(&app, poll("mac-1", &format!("after=1&ack=1&store={store}"))).await;
+        call(&app, poll("mac-1", "after=2")).await;
+        call(&app, poll("mac-1", &format!("after=2&ack=0&store={store}"))).await;
+        call(&app, poll("mac-1", "after=2&ack=1&store=gone")).await;
+        call(&app, poll("mac-2", "after=2")).await;
+        let (_, v) = call(&app, assign("mac-2", 1)).await;
+        assert_eq!(v["fleet"]["executor"]["id"], "mac-2");
+        assert_eq!(v["fleet"]["executor"]["handover"], 1);
+        let (_, v) = call(&app, poll("mac-1", &format!("after=1&ack=1&store={store}"))).await;
+        assert_eq!(v["events"][0]["seq"], 2);
+        assert_eq!(
+            v["fleet"]["executor"]["id"], "mac-2",
+            "told it no longer runs them"
+        );
+        assert_eq!(
+            v["fleet"]["executor"]["acked"]["seq"], 1,
+            "the old executor's ack no longer counts"
+        );
+        let (c, _) = call(&app, from("mac-1", "PUT", "/api/v1/fleet/config", cfg())).await;
+        assert_eq!(
+            c,
+            StatusCode::FORBIDDEN,
+            "the old executor is an observer now"
+        );
+
+        // A long-poll answers as soon as the executor changes.
+        let waiting = tokio::spawn({
+            let app = app.clone();
+            async move {
+                call(
+                    &app,
+                    from("mac-1", "GET", "/api/v1/events?after=2&wait=20", None),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call(&app, assign("mac-1", 2)).await;
+        let (_, v) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v["fleet"]["executor"]["id"], "mac-1");
+        assert_eq!(v["fleet"]["revision"], 3);
     }
 }

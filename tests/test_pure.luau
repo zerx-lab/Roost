@@ -591,4 +591,49 @@ do -- workflow groups: ids, names, order, sections and tolerant decoding
 	eq(back.of.c, nil)
 end
 
+do -- device sync: run summaries stay under the relay's limit, tails first, and read back
+	local fleet = require("../lib/fleet")
+	local runs = {}
+	local tails: { [string]: string } = {}
+	for i = 1, 120 do
+		local id = string.format("%04x", i)
+		table.insert(runs, {
+			id = id,
+			workflow = "w",
+			workflow_name = "W",
+			title = "t",
+			trigger = { kind = "cron", detail = "每天" },
+			state = if i == 1 then "running" else "success",
+			created_at = 1000 + i,
+			inputs = { SECRET = "x" },
+			steps = { { name = "s", kind = "run", state = "success", exit_code = 0 } },
+			step = 1,
+		})
+		tails[id] = string.rep("y", fleet.TAIL_BYTES)
+	end
+	local small = F.decode(fleet.summaries(runs, tails))
+	eq(#small.runs, fleet.MAX_RUNS, "at most MAX_RUNS")
+	eq(small.runs[1].inputs, nil, "inputs never leave the machine")
+	local back, back_tails = fleet.decode_runs(small)
+	eq(#back, fleet.MAX_RUNS)
+	eq(back[1].steps[1].exit_code, 0)
+	eq(#back_tails["0001"], fleet.TAIL_BYTES, "the newest carry tails")
+	eq(back_tails[string.format("%04x", fleet.TAILS + 1)], nil, "older ones don't")
+
+	-- Too big with tails: they go first, the runs stay.
+	local big = string.rep("z", 30 * 1024)
+	for id in tails do
+		tails[id] = big
+	end
+	local body = fleet.summaries(runs, tails)
+	eq(#body <= fleet.MAX_BODY, true, "under the limit")
+	local dropped = F.decode(body)
+	eq(#dropped.runs, fleet.MAX_RUNS, "every run kept")
+	eq(dropped.runs[1].log, nil, "tails dropped")
+
+	eq(fleet.clean_tail("ial line\nnext\n", false), "next\n", "a cut line is dropped")
+	eq(fleet.clean_tail("\128\129abc", false), "abc", "a cut UTF-8 sequence is dropped")
+	eq(fleet.clean_tail("whole\n", true), "whole\n")
+end
+
 print("ok")

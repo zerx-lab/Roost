@@ -18,6 +18,7 @@ local evolve = require("./evolve")
 local upgrade = require("./upgrade")
 local tabs = require("./tabs")
 local groups = require("./groups")
+local fleet = require("./fleet")
 
 local M = {}
 
@@ -73,6 +74,42 @@ export type AppInfo = {
 	installations: number?,
 	missing: { string }?, -- wanted permissions (`name:level`) some installation hasn't granted
 }
+-- Devices (lib/fleet.luau): what this machine uploads as the executor, or mirrors and shows as
+-- an observer.
+export type Dev = {
+	role: string, -- the role the last device tick saw (a change resets the upload state)
+	-- executor: the configuration (export format) and run summaries last uploaded
+	cfg_text: string?,
+	cfg_built: number?,
+	cfg_dirty: boolean, -- something it holds changed: build it again on the next tick
+	cfg_busy: boolean,
+	cfg_err: string?,
+	cfg_at: number?,
+	cfg_rev: string?, -- the relay's revision of the configuration last uploaded
+	exec_noted: boolean, -- kv `mirror_exec` says this machine has been the executor since its last mirror
+	runs_json: string?,
+	runs_busy: boolean,
+	runs_err: string?,
+	runs_at: number?,
+	-- log tails of recent runs; `failed`: the read failed (tried again after TAIL_RETRY)
+	tails: { [string]: { text: string, at: number, state: string, failed: boolean? } },
+	tailing: { [string]: boolean }, -- tail reads in flight
+	-- observer: the executor's configuration applied here, and its runs
+	mirror_busy: boolean,
+	mirror_err: string?,
+	mirror_at: number?,
+	mirror_failed: { rev: string, at: number }?, -- the last revision that failed to apply
+	mirror_missing: { string }, -- mirrored repos without a local path (runs there use a temp dir)
+	remote: { store.Run },
+	remote_tails: { [string]: string },
+	remote_rev: string?,
+	remote_at: number?, -- when the executor uploaded them
+	remote_from: string?, -- the client that uploaded them
+	remote_exec: string?, -- the executor whose runs these are
+	remote_busy: boolean,
+	remote_err: string?,
+	timer: any?, -- the next device tick
+}
 
 export type Core = {
 	data: string,
@@ -111,6 +148,7 @@ export type Core = {
 	book: evolve.Book, -- evolvers' revisions and firing record (lib/evolve.luau)
 	groups: groups.Groups, -- the workflows page's groups (groups.json, lib/groups.luau)
 	groups_err: string?, -- groups.json exists but can't be read: kept as is, never overwritten
+	dev: Dev,
 }
 
 local DEFAULT_CONFIG = [[
@@ -411,6 +449,7 @@ function M.reload_files(c: Core)
 	local wtext = read_file(c.paths.workflows)
 	if wtext ~= c.workflows_text then
 		c.workflows_text = wtext
+		c.dev.cfg_dirty = true
 		local w, issues = model.parse_workflows(wtext or "")
 		c.workflow_issues = issues
 		if w then
@@ -545,6 +584,40 @@ function M.on_events(c: Core, list: { { [string]: any } })
 				end
 			end
 		end
+		-- Listed before without a run here (observed for the executor, or history), then handed
+		-- over to this machine: its row becomes this one.
+		for i, x in c.events do
+			if x.delivery == delivery and (x.observed or (x.history and #x.runs == 0)) then
+				table.remove(c.events, i)
+				break
+			end
+		end
+		add_event(c, row)
+	end
+	M.changed(c)
+end
+
+-- Events read while another device is the executor: listed with who runs them, never run here
+-- and not marked handled (this machine runs them if it takes over before them).
+function M.on_observed(c: Core, list: { { [string]: any } })
+	local who = fleet.label(relay.executor(c.relay))
+	for _, e in list do
+		local info: { [string]: any } = if type(e.info) == "table" then e.info else {}
+		local delivery = tostring(e.delivery or e.seq)
+		local listed = c.seen[delivery] == true
+		for _, x in c.events do
+			listed = listed or x.delivery == delivery
+		end
+		if listed then
+			continue
+		end
+		local row = event_row(e, info, delivery)
+		row.observed = who
+		row.reasons["*"] = `本机是观察者:由执行者「{who}」运行`
+		if row.event == "roost_test" then
+			c.relay.state.last_test = now()
+			M.notice(c, "success", "中继测试事件已送达本机(观察者,不运行)")
+		end
 		add_event(c, row)
 	end
 	M.changed(c)
@@ -563,7 +636,9 @@ function M.on_history(c: Core, list: { { [string]: any } })
 			table.insert(started[d], r.id)
 		end
 	end
-	-- `seen` can't decide here: runs.json seeds it with these very deliveries.
+	-- Not marked handled: they come before the cursor, so they come back only when this machine
+	-- takes over as executor at an earlier point (lib/relay.luau takeover), and then they are its
+	-- to run. Those that started runs here are marked through runs.json anyway.
 	local listed: { [string]: boolean } = {}
 	for _, x in c.events do
 		listed[x.delivery] = true
@@ -571,7 +646,6 @@ function M.on_history(c: Core, list: { { [string]: any } })
 	for _, e in list do
 		local info: { [string]: any } = if type(e.info) == "table" then e.info else {}
 		local delivery = tostring(e.delivery or e.seq)
-		remember(c, delivery)
 		if not listed[delivery] then
 			listed[delivery] = true
 			local row = event_row(e, info, delivery)
@@ -604,6 +678,10 @@ local function cron_tick(c: Core)
 	local t = now()
 	local minute = t - t % 60
 	local w = c.workflows
+	local observer = relay.role(c.relay) == "observer"
+	-- The relay can't say who the executor is: nobody fires, and nothing counts as fired (the
+	-- executor assigned next still finds a `once` schedule within its grace).
+	local paused = relay.fleet_error(c.relay) ~= nil
 	if w then
 		local last = (function(): { [string]: number }
 			local ok, v = pcall(tern.kv.get, "cron_last")
@@ -629,19 +707,23 @@ local function cron_tick(c: Core)
 					due = last[key] ~= minute and ct.cron ~= nil and cron.matches(ct.cron :: cron.Cron, minute, ct.utc)
 				end
 				keep[key] = last[key]
-				if wf.enabled and due then
+				if wf.enabled and due and not paused then
 					keep[key] = minute
 					fired_any = true
-					local repo = ct.repo
-					local ref = ct.ref or (if repo and w.repos[repo] then w.repos[repo].branch else nil)
-					local run, err = runner.submit(c.runner, wf, {
-						trigger = { kind = "cron", detail = model.describe_trigger(ct) },
-						repo = repo,
-						ref = ref,
-						inputs = defaults(wf),
-					})
-					if not run then
-						M.notice(c, "error", `{wf.name} 定时运行未排队:{err}`)
+					-- An observer counts the schedule as fired (the executor ran it), so a takeover
+					-- within the `once` grace doesn't run it again.
+					if not observer then
+						local repo = ct.repo
+						local ref = ct.ref or (if repo and w.repos[repo] then w.repos[repo].branch else nil)
+						local run, err = runner.submit(c.runner, wf, {
+							trigger = { kind = "cron", detail = model.describe_trigger(ct) },
+							repo = repo,
+							ref = ref,
+							inputs = defaults(wf),
+						})
+						if not run then
+							M.notice(c, "error", `{wf.name} 定时运行未排队:{err}`)
+						end
 					end
 				end
 			end
@@ -676,6 +758,8 @@ local evolve_host: (c: Core) -> evolve.Host
 local on_finished: (c: Core, run: store.Run) -> ()
 local watch_upgrades: (c: Core, run: string?) -> ()
 local check_daemon: (c: Core, done: () -> ()) -> ()
+-- Defined with the device functions at the end.
+local dev_loop: (c: Core) -> ()
 
 function M.housekeep(c: Core, manual: boolean)
 	if manual and not c.store.policy then
@@ -789,6 +873,20 @@ function M.new(data: string): Core
 		book = evolve.load(data),
 		groups = groups.empty(),
 		groups_err = nil,
+		dev = {
+			role = "solo",
+			cfg_dirty = true,
+			cfg_busy = false,
+			exec_noted = false,
+			runs_busy = false,
+			tails = {},
+			tailing = {},
+			mirror_busy = false,
+			mirror_missing = {},
+			remote = {},
+			remote_tails = {},
+			remote_busy = false,
+		},
 	}
 	c.runner = runner.new({
 		data = data,
@@ -849,6 +947,9 @@ function M.new(data: string): Core
 		event = function(e)
 			M.on_events(c, { e })
 		end,
+		observe = function(e)
+			M.on_observed(c, { e })
+		end,
 		history = function(list)
 			M.on_history(c, list)
 		end,
@@ -903,7 +1004,12 @@ function M.start(c: Core)
 	end
 	local saved = eventlog.load(c.events_path)
 	for i = #saved, 1, -1 do
-		remember(c, saved[i].delivery)
+		-- Rows that never ran here (observed for the executor, or history listed without a run)
+		-- are not "handled": see on_observed and on_history.
+		local row = saved[i]
+		if not (row.observed or (row.history and #row.runs == 0)) then
+			remember(c, row.delivery)
+		end
 	end
 	table.move(saved, 1, #saved, 1, c.events)
 	watch_loop(c)
@@ -923,6 +1029,7 @@ function M.start(c: Core)
 		cron_tick(c)
 	end)
 	watch_upgrades(c, nil)
+	dev_loop(c)
 end
 
 -- Called by host.luau once everything is defined: a pending self-upgrade (lib/upgrade.luau)
@@ -986,12 +1093,41 @@ local function pr_repo(wf: model.Workflow): string?
 	return only
 end
 
+-- Why this machine may not start runs: another device is the executor. Nil when it may.
+function M.run_block(c: Core): string?
+	if relay.role(c.relay) == "observer" then
+		local broken = relay.fleet_error(c.relay)
+		if broken then
+			return `中继读不出设备记录({broken}):在「中继」页重新指定执行者之前,任何设备都不运行`
+		end
+		return `本机是观察者:运行只在执行者「{fleet.label(relay.executor(c.relay))}」上进行`
+	end
+	return nil
+end
+
+-- Why this machine may not change the workflow configuration: it mirrors the executor's (files,
+-- libraries and groups included). Nil when it may.
+function M.config_block(c: Core): string?
+	if relay.role(c.relay) == "observer" then
+		local broken = relay.fleet_error(c.relay)
+		if broken then
+			return `中继读不出设备记录({broken}):在「中继」页重新指定执行者之前不能修改工作流配置`
+		end
+		return `本机是观察者:工作流配置以执行者「{fleet.label(relay.executor(c.relay))}」为准,请在执行者上修改`
+	end
+	return nil
+end
+
 -- The workflow a manual run of `id` would use, with its inputs filled from defaults.
 local function manual(c: Core, id: string, inputs: { [string]: string }?): (model.Workflow?, { [string]: string }, string?)
 	local w = c.workflows
 	local wf = w and w.by_id[id]
 	if not w or not wf then
 		return nil, {}, `没有工作流 {id}`
+	end
+	local blocked = M.run_block(c)
+	if blocked then
+		return nil, {}, blocked
 	end
 	if not wf.manual then
 		return nil, {}, `{wf.name} 不允许手动运行(manual = false)`
@@ -1155,6 +1291,10 @@ function M.rerun(c: Core, id: string): string?
 	local wf = run and w and w.by_id[run.workflow]
 	if not run or not wf then
 		return "找不到该运行或其工作流"
+	end
+	local blocked = M.run_block(c)
+	if blocked then
+		return blocked
 	end
 	local _, err = runner.submit(c.runner, wf, runner.request_of(c.runner, run))
 	return err
@@ -1382,12 +1522,17 @@ local function edit_groups(c: Core, fn: (groups.Groups) -> string?): string?
 		return `无法保存分组:{serr}`
 	end
 	c.groups = g
+	c.dev.cfg_dirty = true
 	M.changed(c)
 	return nil
 end
 
 -- Creates a group named `name` (trimmed) at the end; returns its id.
 function M.group_create(c: Core, name: string): (string?, string?)
+	local blocked = M.config_block(c)
+	if blocked then
+		return nil, blocked
+	end
 	local id: string? = nil
 	local err = edit_groups(c, function(g)
 		local gid, gerr = groups.create(g, util.trim(name))
@@ -1398,6 +1543,10 @@ function M.group_create(c: Core, name: string): (string?, string?)
 end
 
 function M.group_rename(c: Core, id: string, name: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
 	return edit_groups(c, function(g)
 		return groups.rename(g, id, util.trim(name))
 	end)
@@ -1405,6 +1554,10 @@ end
 
 -- Deletes a group; its workflows become ungrouped (the workflows themselves stay).
 function M.group_delete(c: Core, id: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
 	return edit_groups(c, function(g)
 		return groups.remove(g, id)
 	end)
@@ -1412,6 +1565,10 @@ end
 
 -- Moves a group `delta` places in the page's order.
 function M.group_move(c: Core, id: string, delta: number): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
 	return edit_groups(c, function(g)
 		return if groups.move(g, id, delta) then nil else "已经到头了"
 	end)
@@ -1425,6 +1582,10 @@ end
 
 -- Puts workflow `wf` in group `gid` (nil: ungrouped).
 function M.group_assign(c: Core, wf: string, gid: string?): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
 	local w = c.workflows
 	if w == nil or w.by_id[wf] == nil then
 		return `没有工作流 {wf}`
@@ -1465,6 +1626,11 @@ function M.save_workflow(
 	wfiles: { [string]: string }?,
 	base: { [string]: string }?
 ): { model.Issue }?
+	local blocked = M.config_block(c)
+	if blocked then
+		return file_issue(blocked)
+	end
+	c.dev.cfg_dirty = true
 	local issues = M.check_workflow(c, old_id, raw, wfiles)
 	if #issues > 0 then
 		return issues
@@ -1543,6 +1709,11 @@ end
 
 -- Removes workflow `id` from workflows.toml, then its own files (its state stays: see M.states).
 function M.delete_workflow(c: Core, id: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
+	c.dev.cfg_dirty = true
 	local old, rerr = current_text(c)
 	if old == nil then
 		return rerr
@@ -1642,6 +1813,11 @@ function M.library_files(c: Core, name: string): (files.Tree?, string?)
 end
 
 function M.create_library(c: Core, name: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
+	c.dev.cfg_dirty = true
 	if not model.valid_lib(name) then
 		return `文件库名 "{name}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`
 	end
@@ -1683,6 +1859,11 @@ end
 -- Writes one library file (`from` given: renames that file to `path` at the same time). The whole
 -- library must stay within the limits.
 function M.save_library_file(c: Core, name: string, path: string, text: string, from: string?): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
+	c.dev.cfg_dirty = true
 	local root, err = lib_root(c, name)
 	if root == nil then
 		return err
@@ -1732,6 +1913,11 @@ function M.save_library_file(c: Core, name: string, path: string, text: string, 
 end
 
 function M.delete_library_file(c: Core, name: string, path: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
+	c.dev.cfg_dirty = true
 	local root, err = lib_root(c, name)
 	if root == nil then
 		return err
@@ -1749,6 +1935,11 @@ end
 
 -- Deletes a library no workflow uses.
 function M.delete_library(c: Core, name: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
+	c.dev.cfg_dirty = true
 	local root, err = lib_root(c, name)
 	if root == nil then
 		return err
@@ -1817,6 +2008,10 @@ function M.orphan_workflow_files(c: Core): { string }
 end
 
 function M.delete_workflow_files(c: Core, id: string): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
 	if table.find(M.orphan_workflow_files(c), id) == nil then
 		return `工作流 "{id}" 仍在使用这些文件`
 	end
@@ -1871,16 +2066,19 @@ local function utf8_text(s: string): boolean
 	return utf8.len(s) ~= nil and string.find(s, "%z") == nil
 end
 
--- Writes workflows `ids` (with their files, the libraries they use, their repositories' branch
--- settings and their groups) to one file under exports/; returns its path. Workflows go in the
--- workflows page's order (groups in order, then the ungrouped); exporting every workflow also
--- keeps the empty groups.
-function M.export_workflows(c: Core, ids: { string }): (string?, string?)
+-- The bundle of workflows `ids` (with their files, the libraries they use, their repositories'
+-- branch settings and their groups), env values blanked (counted in `counts.blanked`). Workflows
+-- go in the workflows page's order (groups in order, then the ungrouped); every workflow also
+-- keeps the empty groups. `every_repo`: all declared repositories, not just the ones triggers name.
+local function make_bundle(
+	c: Core,
+	ids: { string },
+	every_repo: boolean,
+	counts: { blanked: number }
+): (bundle.Bundle?, string?)
 	local w = c.workflows
 	if w == nil then
 		return nil, "workflows.toml 有错误,修好后再导出"
-	elseif #ids == 0 then
-		return nil, "没有要导出的工作流"
 	end
 	local text = read_file(c.paths.workflows)
 	if text == nil then
@@ -1917,7 +2115,6 @@ function M.export_workflows(c: Core, ids: { string }): (string?, string?)
 		end
 	end
 	local libs: { [string]: boolean } = {}
-	local blanked = 0
 	for _, id in ordered do
 		local wf = w.by_id[id]
 		local raw = model.raw_workflow(text, id)
@@ -1930,7 +2127,7 @@ function M.export_workflows(c: Core, ids: { string }): (string?, string?)
 			local blank: { [string]: string } = {}
 			for k in raw.env :: { [string]: any } do
 				blank[k] = ""
-				blanked += 1
+				counts.blanked += 1
 			end
 			raw.env = blank
 		end
@@ -1969,6 +2166,27 @@ function M.export_workflows(c: Core, ids: { string }): (string?, string?)
 			table.insert(b.files, { library = lib, path = p, text = tree.text[p] })
 		end
 	end
+	if every_repo then
+		for name, repo in w.repos do
+			b.repos[name] = { branch = repo.branch, worktree = repo.worktree }
+		end
+	end
+	return b, nil
+end
+
+-- Writes workflows `ids` to one file under exports/ (see make_bundle); returns its path.
+function M.export_workflows(c: Core, ids: { string }): (string?, string?)
+	if c.workflows == nil then
+		return nil, "workflows.toml 有错误,修好后再导出"
+	elseif #ids == 0 then
+		return nil, "没有要导出的工作流"
+	end
+	local counts = { blanked = 0 }
+	local b, berr = make_bundle(c, ids, false, counts)
+	if b == nil then
+		return nil, berr
+	end
+	local blanked = counts.blanked
 	local stamp = os.date("%Y-%m-%d %H:%M", math.floor(now())) :: string
 	local note = if blanked > 0 then `\n工作流 env 里的 {blanked} 个变量只保留了名字,值已清空(可能含令牌),导入后请自行填写。` else ""
 	local out = bundle.encode(b, `Roost 工作流导出({stamp},Roost {M.VERSION})。\n在 Roost「工作流」页用「导入」载入;导入的工作流默认停用。{note}`)
@@ -2092,6 +2310,10 @@ end
 -- replaced only with `overwrite`. Everything is checked before anything is written; files go
 -- first, workflows.toml (with its .bak) last. Returns a summary.
 function M.import_workflows(c: Core, path: string, overwrite: boolean): (string?, string?)
+	local blocked = M.config_block(c)
+	if blocked then
+		return nil, blocked
+	end
 	local b, p, err = read_bundle(c, path)
 	if b == nil then
 		return nil, err
@@ -2712,6 +2934,7 @@ local function save_library_tree(c: Core, name: string, tree: { [string]: string
 	end
 	local ferr = files.replace(root :: string, tree, base)
 	if ferr == nil then
+		c.dev.cfg_dirty = true
 		M.changed(c)
 	end
 	return ferr
@@ -2748,6 +2971,7 @@ function evolve_host(c: Core): evolve.Host
 			end
 			local err = files.replace(files.workflow_root(c.data, id), wfiles, base)
 			if err == nil then
+				c.dev.cfg_dirty = true
 				M.changed(c)
 			end
 			return err
@@ -2780,6 +3004,18 @@ function on_finished(c: Core, run: store.Run)
 	local h = evolve_host(c)
 	local w = c.workflows
 	local wf = if w then w.by_id[run.workflow] else nil
+	-- A run that ends after this machine became an observer (it started as the executor): the
+	-- configuration is the new executor's now, so nothing is applied, undone or started here.
+	local observer = relay.role(c.relay) == "observer"
+	if observer then
+		for _, s in run.steps do
+			if s.kind == "upgrade" and s.state == "success" then
+				watch_upgrades(c, run.id)
+			end
+		end
+		M.changed(c)
+		return
+	end
 	if run.state == "success" and wf and wf.evolve then
 		local lines = evolve.apply(h, c.book, run)
 		if #lines > 0 then
@@ -2905,6 +3141,10 @@ end
 
 -- Undoes revision `n` by hand.
 function M.rollback_revision(c: Core, n: number): string?
+	local blocked = M.config_block(c)
+	if blocked then
+		return blocked
+	end
 	local err = evolve.rollback(evolve_host(c), c.book, n, "手动回滚")
 	if err == nil then
 		M.notice(c, "success", `已回滚迭代修订 #{n}`)
@@ -2916,6 +3156,543 @@ end
 -- Roost's own upgrades, newest first.
 function M.upgrades(c: Core, n: number): { upgrade.Result }
 	return upgrade.results(c.data, n)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Devices (lib/fleet.luau, agent/src/fleet.rs): the executor uploads its configuration and its
+-- recent runs; an observer applies the configuration here and shows the runs.
+
+local DEV_MS = 5000
+-- The executor rebuilds its configuration at least this often (edits mark it dirty sooner).
+local CFG_EVERY = 30
+-- A configuration that failed to apply is retried after this long (or when it changes).
+local MIRROR_RETRY = 60
+-- A running run's log tail is read again after this long; at most this many reads at once.
+local TAIL_EVERY = 5
+local MAX_TAILING = 4
+local TAIL_MS = 5000
+-- A tail read that failed (no log yet, a timeout) is tried again after this long.
+local TAIL_RETRY = 60
+-- Unchanged run summaries are sent again after this long when the relay seems not to have them.
+local RUNS_RECHECK = 60
+
+export type Device = {
+	id: string,
+	name: string?,
+	last_seen: number?,
+	cursor: number?,
+	executor: boolean,
+	me: boolean,
+}
+
+function M.role(c: Core): fleet.Role
+	return relay.role(c.relay)
+end
+
+function M.executor(c: Core): fleet.Executor?
+	return relay.executor(c.relay)
+end
+
+-- Why the relay can't say who the executor is (its device record is unreadable), or nil.
+function M.fleet_error(c: Core): string?
+	return relay.fleet_error(c.relay)
+end
+
+-- The devices the relay has heard from since it started, and the executor even when it hasn't.
+function M.devices(c: Core): { Device }
+	local out: { Device } = {}
+	local ex = relay.executor(c.relay)
+	local me = c.relay.h.client_id
+	local agent = c.relay.state.agent
+	local seen: { [string]: boolean } = {}
+	if agent and type(agent.clients) == "table" then
+		for _, x in agent.clients do
+			if type(x) == "table" and type(x.id) == "string" and not seen[x.id] then
+				seen[x.id] = true
+				table.insert(out, {
+					id = x.id,
+					name = if type(x.name) == "string" and x.name ~= "" then x.name else nil,
+					last_seen = util.rfc3339(x.last_seen),
+					cursor = if type(x.cursor) == "number" then x.cursor else nil,
+					executor = ex ~= nil and ex.id == x.id,
+					me = x.id == me,
+				})
+			end
+		end
+	end
+	if ex and not seen[ex.id] then
+		table.insert(out, { id = ex.id, name = ex.name, executor = true, me = ex.id == me })
+	end
+	table.sort(out, function(a, b)
+		if a.executor ~= b.executor then
+			return a.executor
+		end
+		return (a.last_seen or 0) > (b.last_seen or 0)
+	end)
+	return out
+end
+
+-- Makes device `id` the executor (this machine or another the relay knows).
+function M.assign_executor(c: Core, id: string)
+	relay.assign(c.relay, id, function(ok, msg)
+		if ok then
+			local ex = relay.executor(c.relay)
+			M.notice(c, "success", `执行者已改为「{fleet.label(ex)}」`)
+			c.dev.cfg_dirty = true
+			dev_loop(c)
+		else
+			M.notice(c, "error", `无法指定执行者:{msg}`)
+		end
+	end)
+end
+
+-- The executor's configuration as uploaded: every workflow, its files, the libraries in use, all
+-- repositories (branch settings only) and every group; env values blank. Stable while nothing
+-- changes (no time in it).
+local function sync_text(c: Core): (string?, string?)
+	local w = c.workflows
+	if w == nil or #c.workflow_issues > 0 then
+		return nil, "workflows.toml 有错误,修好后才会同步配置"
+	end
+	local ids: { string } = {}
+	for _, wf in w.list do
+		table.insert(ids, wf.id)
+	end
+	local b, err = make_bundle(c, ids, true, { blanked = 0 })
+	if b == nil then
+		return nil, err
+	end
+	b.exported_at = 0
+	local text = bundle.encode(b, "Roost 设备同步:执行者的工作流配置(env 的值不上传)")
+	if #text > bundle.MAX_BYTES then
+		return nil, `配置超过 {bundle.MAX_BYTES // (1024 * 1024)} MiB,无法同步给观察者`
+	end
+	return text, nil
+end
+
+local function upload_config(c: Core)
+	local d = c.dev
+	local t = now()
+	if d.cfg_busy or (not d.cfg_dirty and d.cfg_built and t - d.cfg_built < CFG_EVERY) then
+		return
+	end
+	d.cfg_dirty, d.cfg_built = false, t
+	local text, err = sync_text(c)
+	if text == nil then
+		if d.cfg_err ~= err then
+			d.cfg_err = err
+			M.changed(c)
+		end
+		return
+	end
+	-- Unchanged and still what the relay holds: nothing to send. A relay that lost it (its files
+	-- were reset) gets it again.
+	local f = relay.fleet(c.relay)
+	local held = if f and type(f.config) == "table" then f.config.revision else nil
+	if text == d.cfg_text and held ~= nil and held == d.cfg_rev then
+		return
+	end
+	d.cfg_busy = true
+	relay.put_config(c.relay, text, function(ok, body, perr)
+		d.cfg_busy = false
+		if ok then
+			local meta = if type(body) == "table" then body.config else nil
+			d.cfg_text, d.cfg_err, d.cfg_at = text, nil, now()
+			d.cfg_rev = if type(meta) == "table" and type(meta.revision) == "string" then meta.revision else nil
+		else
+			d.cfg_err = perr or "上传失败"
+			d.cfg_dirty = true
+		end
+		M.changed(c)
+	end)
+end
+
+-- Reads the last bytes of run `r`'s log into the tail cache.
+local function read_tail(c: Core, r: store.Run)
+	local d = c.dev
+	local id, state = r.id, r.state
+	d.tailing[id] = true
+	local path = `{store.run_dir(c.store, id)}/log.txt`
+	local ok = pcall(function(): string?
+		tern.process.run(
+			{ "/usr/bin/tail", "-c", tostring(fleet.TAIL_BYTES + 1), path },
+			{ timeout_ms = TAIL_MS },
+			function(res: ProcessResult)
+				d.tailing[id] = nil
+				local got = res.status == 0 and not res.timed_out
+				local raw = if got then res.stdout or "" else ""
+				local full = #raw <= fleet.TAIL_BYTES
+				if not full then
+					raw = string.sub(raw, -fleet.TAIL_BYTES)
+				end
+				local text = fleet.clean_tail(raw, full)
+				if utf8.len(text) == nil then
+					text = "(日志结尾不是有效的 UTF-8 文本)"
+				end
+				d.tails[id] = { text = text, at = now(), state = state, failed = not got }
+			end
+		)
+		return nil
+	end)
+	if not ok then
+		d.tailing[id] = nil
+	end
+end
+
+-- Keeps the tails of the newest runs current: read again when a run's state changed, and every
+-- TAIL_EVERY seconds while it runs. Tails of runs no longer among the newest are dropped.
+local function refresh_tails(c: Core, list: { store.Run })
+	local d = c.dev
+	local keep: { [string]: boolean } = {}
+	local busy = 0
+	for _ in d.tailing do
+		busy += 1
+	end
+	local t = now()
+	for i = 1, math.min(fleet.TAILS, #list) do
+		local r = list[i]
+		keep[r.id] = true
+		local have = d.tails[r.id]
+		local stale = have == nil
+			or have.state ~= r.state
+			or (r.state == "running" and t - have.at >= TAIL_EVERY)
+			or (have.failed == true and t - have.at >= TAIL_RETRY)
+		if stale and r.state ~= "queued" and not d.tailing[r.id] and busy < MAX_TAILING then
+			busy += 1
+			read_tail(c, r)
+		end
+	end
+	for id in d.tails do
+		if not keep[id] then
+			d.tails[id] = nil
+		end
+	end
+end
+
+local function upload_runs(c: Core)
+	local d = c.dev
+	if d.runs_busy then
+		return
+	end
+	local list = store.list(c.store, fleet.MAX_RUNS, nil)
+	refresh_tails(c, list)
+	local tails: { [string]: string } = {}
+	for id, x in d.tails do
+		tails[id] = x.text
+	end
+	-- A log that isn't valid UTF-8 can't be encoded: send the runs without tails then.
+	local ok, json = pcall(fleet.summaries, list, tails)
+	if not ok then
+		ok, json = pcall(fleet.summaries, list, {})
+	end
+	-- Unchanged: sent already, unless the relay no longer has it (checked at most every minute;
+	-- its record of the runs comes with the status, not at once).
+	local f = relay.fleet(c.relay)
+	local held = f ~= nil and type(f.runs) == "table"
+	if not ok or (json == d.runs_json and (held or now() - (d.runs_at or 0) < RUNS_RECHECK)) then
+		return
+	end
+	d.runs_busy = true
+	relay.put_runs(c.relay, json, function(pok, _body, err)
+		d.runs_busy = false
+		if pok then
+			d.runs_json, d.runs_err, d.runs_at = json, nil, now()
+		else
+			d.runs_err = err or "上传失败"
+		end
+		M.changed(c)
+	end)
+end
+
+-- How many `workflows.toml.before-sync-<time>` copies are kept (oldest go first).
+local MAX_SYNC_BACKUPS = 10
+
+-- Before this machine's configuration is replaced by the executor's, when it may hold something
+-- of its own: it never mirrored (no `workflows.toml.mirrored`), it has been the executor since the
+-- last mirror, or workflows.toml changed since the mirror wrote it. Then workflows.toml (env values
+-- included) is copied to `workflows.toml.before-sync-<time>` and the workflows are exported.
+local function backup_before_mirror(c: Core, old: string)
+	local oke, ran = pcall(tern.kv.get, "mirror_exec")
+	local executed = oke and type(ran) == "string" and ran ~= ""
+	if not executed and read_file(`{c.data}/workflows.toml.mirrored`) == old then
+		return
+	end
+	local stamp = os.date("%Y%m%d-%H%M%S", math.floor(now())) :: string
+	local path = `{c.data}/workflows.toml.before-sync-{stamp}`
+	if old ~= "" then
+		pcall(tern.fs.write, path, old)
+	end
+	local okl, names = pcall(tern.fs.list, c.data)
+	if okl and type(names) == "table" then
+		local copies: { string } = {}
+		for _, n in names do
+			if string.match(n, "^workflows%.toml%.before%-sync%-%d+%-%d+$") then
+				table.insert(copies, n)
+			end
+		end
+		table.sort(copies)
+		for i = 1, #copies - MAX_SYNC_BACKUPS do
+			pcall(tern.fs.remove, `{c.data}/{copies[i]}`)
+		end
+	end
+	local w = c.workflows
+	if w and #w.list > 0 and #c.workflow_issues == 0 then
+		local ids: { string } = {}
+		for _, wf in w.list do
+			table.insert(ids, wf.id)
+		end
+		local p, err = M.export_workflows(c, ids)
+		if p then
+			M.notice(c, "warning", `同步执行者的配置前,已备份本机的工作流:{path},并导出到 {p}`)
+		elseif err then
+			M.notice(c, "error", `同步前导出本机工作流失败(workflows.toml 已另存为 {path}):{err}`)
+		end
+	end
+end
+
+-- Makes this machine's configuration the executor's (`text`, export format, revision `rev`):
+-- libraries and workflow files it carries are written, workflows.toml replaced (repo paths and
+-- env values kept, see fleet.mirror_text), files of workflows it no longer has removed, groups
+-- replaced. Everything is checked before anything is written.
+local function apply_mirror(c: Core, text: string, rev: string): string?
+	local b, berr = bundle.decode(text, true)
+	if b == nil then
+		return `执行者的配置无法读取:{berr}`
+	end
+	local old, rerr = current_text(c)
+	if old == nil then
+		return rerr
+	end
+	local new, missing = fleet.mirror_text(b, old, fleet.label(relay.executor(c.relay)))
+	local w, issues = model.parse_workflows(new)
+	if w == nil then
+		return `执行者的配置在本机无效:{issues_text(issues)}`
+	end
+	local wftrees, libtrees = trees(b)
+	for _, raw in b.workflows do
+		local id = tostring(raw.id)
+		if not model.valid_lib(id) then
+			return `工作流 id "{id}" 无效`
+		elseif store.pending(c.store, files.workflow_home(c.data, id)) then
+			return `工作流 {id} 的旧文件正在删除,稍后再同步`
+		end
+		local bad = files.check(wftrees[id] or {})
+		if bad then
+			return `{id} 的文件:{bad}`
+		end
+	end
+	for name, tree in libtrees do
+		if store.pending(c.store, files.lib_root(c.data, name)) then
+			return `文件库 "{name}" 正在删除,稍后再同步`
+		end
+		local bad = files.check(tree)
+		if bad then
+			return `文件库 "{name}":{bad}`
+		end
+	end
+	backup_before_mirror(c, old)
+	for _, name in util.keys(libtrees) do
+		local cur = M.library_files(c, name)
+		if cur == nil or not exists(files.lib_root(c.data, name)) or not same_tree(cur.text, libtrees[name]) then
+			local ferr = files.replace(files.lib_root(c.data, name), libtrees[name])
+			if ferr then
+				return `写入文件库 "{name}" 失败:{ferr}`
+			end
+		end
+	end
+	local mirrored: { [string]: boolean } = {}
+	for _, raw in b.workflows do
+		local id = tostring(raw.id)
+		mirrored[id] = true
+		local tree = wftrees[id] or {}
+		local cur = M.workflow_files(c, id)
+		if cur == nil or not same_tree(cur.text, tree) then
+			local ferr = files.replace(files.workflow_root(c.data, id), tree)
+			if ferr then
+				return `写入 {id} 的文件失败:{ferr}`
+			end
+		end
+	end
+	local before = c.workflows
+	if new ~= old then
+		local werr = write_workflows(c, old, new)
+		if werr then
+			return werr
+		end
+	end
+	-- What the next mirror compares with to tell whether this machine changed anything since;
+	-- written now, so a step failing below doesn't make every retry back up again.
+	pcall(tern.fs.write, `{c.data}/workflows.toml.mirrored`, new)
+	pcall(tern.kv.set, "mirror_exec", false)
+	if before then
+		for _, wf in before.list do
+			local home = files.workflow_home(c.data, wf.id)
+			if not mirrored[wf.id] and model.valid_lib(wf.id) and exists(home) then
+				store.discard(c.store, home)
+			end
+		end
+	end
+	if c.groups_err == nil then
+		local g = groups.empty()
+		local all: { [string]: boolean } = {}
+		for id in mirrored do
+			all[id] = true
+		end
+		groups.merge(g, b.groups, all)
+		-- Folding is this machine's view: kept by group name.
+		for _, x in g.list do
+			for _, y in c.groups.list do
+				if y.name == x.name then
+					x.collapsed = y.collapsed
+				end
+			end
+		end
+		if groups.encode(g) ~= groups.encode(c.groups) then
+			local serr = groups.save(c.paths.groups, g)
+			if serr then
+				return `无法保存分组:{serr}`
+			end
+			c.groups = g
+		end
+	end
+	c.dev.mirror_missing = missing
+	pcall(tern.kv.set, "mirror", { url = c.relay.cfg.url, revision = rev })
+	return nil
+end
+
+local function fetch_config(c: Core)
+	local d = c.dev
+	local f = relay.fleet(c.relay)
+	local meta = if f and type(f.config) == "table" then f.config else nil
+	if d.mirror_busy or meta == nil or type(meta.revision) ~= "string" then
+		return
+	end
+	local rev = meta.revision :: string
+	local okk, applied = pcall(tern.kv.get, "mirror")
+	if okk and type(applied) == "table" and applied.url == c.relay.cfg.url and applied.revision == rev then
+		return
+	end
+	local failed = d.mirror_failed
+	if failed and failed.rev == rev and now() - failed.at < MIRROR_RETRY then
+		return
+	end
+	d.mirror_busy = true
+	relay.get_config(c.relay, nil, function(ok, body, err)
+		d.mirror_busy = false
+		local cfg = if type(body) == "table" then body.config else nil
+		local merr: string?
+		if not ok or type(body) ~= "table" or type(body.text) ~= "string" or type(cfg) ~= "table" then
+			merr = err or "中继没有返回配置"
+		elseif relay.role(c.relay) ~= "observer" then
+			-- Took over while this was in flight: this machine's configuration is the truth now.
+			M.changed(c)
+			return
+		else
+			local ok2, res = pcall(apply_mirror, c, body.text :: string, tostring(cfg.revision))
+			merr = if ok2 then res else `同步执行者的配置时出错:{res}`
+		end
+		if merr then
+			d.mirror_err = merr
+			d.mirror_failed = { rev = rev, at = now() }
+		else
+			d.mirror_err, d.mirror_failed, d.mirror_at = nil, nil, now()
+			M.notice(c, "success", "已同步执行者的工作流配置")
+		end
+		M.changed(c)
+	end)
+end
+
+local function fetch_runs(c: Core)
+	local d = c.dev
+	if d.remote_busy then
+		return
+	end
+	d.remote_busy = true
+	relay.get_runs(c.relay, d.remote_rev, function(ok, body, err)
+		d.remote_busy = false
+		if not ok or type(body) ~= "table" then
+			if d.remote_err ~= err then
+				d.remote_err = err or "响应无效"
+				M.changed(c)
+			end
+			return
+		end
+		d.remote_err = nil
+		local meta = body.runs
+		if type(meta) ~= "table" then
+			-- Nothing uploaded yet.
+			if d.remote_rev ~= nil or #d.remote > 0 then
+				d.remote, d.remote_tails, d.remote_rev, d.remote_at, d.remote_from = {}, {}, nil, nil, nil
+				M.changed(c)
+			end
+			return
+		end
+		if body.unchanged == true then
+			return
+		end
+		-- Still the previous executor's upload (the new one hasn't sent its own yet): show none.
+		local ex = relay.executor(c.relay)
+		if ex and meta.client ~= ex.id then
+			d.remote, d.remote_tails = {}, {}
+		else
+			d.remote, d.remote_tails = fleet.decode_runs(body.body)
+		end
+		d.remote_rev = if type(meta.revision) == "string" then meta.revision else nil
+		d.remote_at = util.rfc3339(meta.at)
+		d.remote_from = if type(meta.client) == "string" then meta.client else nil
+		M.changed(c)
+	end)
+end
+
+local function dev_tick(c: Core)
+	local d = c.dev
+	local role = relay.role(c.relay)
+	if role ~= d.role then
+		d.role = role
+		-- New role: upload everything afresh, fetch everything afresh.
+		d.cfg_text, d.cfg_dirty, d.runs_json, d.exec_noted = nil, true, nil, false
+		d.remote_rev, d.mirror_failed = nil, nil
+		M.changed(c)
+	end
+	if role == "executor" and not d.exec_noted then
+		-- Edits made here from now on exist nowhere else until uploaded: a later mirror backs up first.
+		d.exec_noted = pcall(tern.kv.set, "mirror_exec", c.relay.cfg.url)
+	end
+	local ex = relay.executor(c.relay)
+	local exid = if ex then ex.id else nil
+	if d.remote_exec ~= exid then
+		-- Another executor: the runs shown were the previous one's.
+		d.remote_exec = exid
+		d.remote, d.remote_tails, d.remote_rev, d.remote_at, d.remote_from = {}, {}, nil, nil, nil
+		M.changed(c)
+	end
+	if not c.relay.state.connected then
+		return
+	end
+	if role == "executor" then
+		upload_config(c)
+		upload_runs(c)
+	elseif role == "observer" then
+		fetch_config(c)
+		fetch_runs(c)
+	end
+end
+
+-- One tick now (errors logged, never fatal), and the loop's next when none is scheduled.
+function dev_loop(c: Core)
+	local ok, err = pcall(function(): string?
+		dev_tick(c)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: device sync failed", err)
+	end
+	if c.dev.timer == nil then
+		c.dev.timer = tern.timer(DEV_MS, function()
+			c.dev.timer = nil
+			dev_loop(c)
+		end)
+	end
 end
 
 return M
