@@ -55,7 +55,10 @@ export type CronTrigger = {
 	ref: string?,
 	line: number?,
 }
-export type Trigger = CronTrigger | GithubTrigger
+-- Fires when a run of a workflow this one evolves (`evolve`) ends badly: `streak` such runs in a
+-- row (failed or timed out), optionally only for the listed workflows.
+export type RoostTrigger = { kind: "roost", on: "run_failed", workflows: { string }, streak: number, line: number? }
+export type Trigger = CronTrigger | GithubTrigger | RoostTrigger
 -- A GitHub trigger of kind `on` (see GITHUB_KINDS); every list filter is "any" when empty.
 export type GithubTrigger = {
 	kind: "github",
@@ -85,12 +88,24 @@ export type GithubTrigger = {
 export type When = { source: "out" | "input", key: string, negate: boolean }
 -- A `file` step's script: one of the workflow's own files, or `@<库>/<路径>` in the file library.
 export type FileRef = { lib: string?, path: string }
+-- A `tab` step: opens a Tern tab under `key` (keys belong to the workflow), or closes the tab this
+-- workflow opened under it. Only tabs Roost opened are ever closed.
+export type TabStep = {
+	action: "open" | "close",
+	key: string,
+	command: string?, -- open: a shell command line for the tab (else a shell)
+	title: string?, -- open: the tab's name (default the step name)
+	keep: boolean, -- open: stays open after the run (default: closed when the run ends)
+	focus: boolean, -- open: shown and focused (default: opened in the background)
+}
 export type Step = {
 	name: string,
-	kind: "omp" | "run" | "file",
+	-- upgrade: applies the run's worktree commits to Roost itself (lib/upgrade.luau)
+	kind: "omp" | "run" | "file" | "tab" | "upgrade",
 	prompt: template.Template?,
 	script: string?,
 	file: FileRef?,
+	tab: TabStep?,
 	model: string?,
 	args: { string },
 	timeout: number?,
@@ -118,6 +133,9 @@ export type Workflow = {
 	libs: { string },
 	-- The state group (`state/<名>/`, $ROOST_STATE) kept across runs; the workflow id unless set.
 	state: string,
+	-- The workflows this one may change (lib/evolve.luau): ids, or "*" for every workflow that
+	-- evolves none itself. Nil: it evolves nothing.
+	evolve: { string }?,
 	line: number?,
 }
 export type Workflows = {
@@ -142,6 +160,8 @@ local RESERVED_OMP_FLAGS = {
 	["--restore"] = true,
 }
 M.DEFAULT_EXTRA_PATH = { "~/.local/bin", "~/.bun/bin", "~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin" }
+-- Keys only `tab` steps take.
+local TAB_KEYS = { "key", "command", "title", "keep", "focus" }
 
 -- ---------------------------------------------------------------------------------------------
 -- Trigger catalogue: what the editor offers and what each trigger kind accepts.
@@ -526,6 +546,51 @@ M.TEMPLATES = {
 					omp = "总结当前仓库本周合并的 PR、关闭的 Issue 和仍未解决的问题,列出下周的优先事项。",
 				},
 			},
+		},
+	},
+	{
+		id = "workflow-doctor",
+		name = "工作流自迭代",
+		description = "其他工作流失败时(以及每天凌晨巡检),读运行日志找根因,直接改脚本或提示词;之后的运行变差会自动回滚。",
+		icon = "repeat",
+		group = "自迭代",
+		raw = {
+			name = "工作流自迭代",
+			icon = "repeat",
+			workspace = "temp",
+			concurrency = "skip",
+			evolve = { "*" },
+			trigger = { { roost = "run_failed" }, { schedule = "daily", time = "04:00" } } :: { any },
+			step = {
+				{
+					name = "诊断与修复",
+					omp = "你负责让 Roost 的工作流越跑越好。迭代材料在 {{evolve_dir}}:先读 README.md 与 digest.md,失败日志在 logs/。\n\n本次触发的工作流:{{evolve_target}}(运行 {{evolve_run}};为空表示定时巡检,检查所有工作流)。\n\n找出失败或表现差的根因。只有确定原因在工作流的脚本、提示词或 workflow.toml 里时,才在 edit/ 下做最小修改;不要改 base/,不要改 id,不要加 evolve。最后用几句话说明看到了什么、改了什么(或为什么没改)。",
+				},
+			},
+		},
+	},
+	{
+		id = "roost-upgrade",
+		name = "Roost 自升级",
+		description = "在 Roost 源码克隆里挑一个问题修好并提交,scripts/check.sh 通过后自动应用到插件,加载失败自动回退。需要先声明源码克隆仓库(见工作流说明)。",
+		icon = "flow",
+		group = "自迭代",
+		raw = {
+			name = "Roost 自升级",
+			icon = "flow",
+			description = "先 git clone 插件目录到 plugin-data/roost/repos/roost,在 workflows.toml 声明 [repos.\"local/roost\"] path = 该目录、branch = \"main\",再把定时触发器的仓库设为 local/roost。",
+			identity = "local",
+			concurrency = "skip",
+			workspace = "worktree",
+			evolve = { "*" },
+			trigger = { { schedule = "weekly", days = { "sun" }, time = "03:00" } },
+			step = {
+				{
+					name = "改进",
+					omp = "你在 Roost 自己的源码里工作(当前目录是它的 git worktree)。先读 AGENTS.md 与 .omp/memory/MEMORY.md,再看 {{evolve_dir}} 里本机工作流的运行摘要与失败日志。\n\n挑一个影响最大、改动最小的 Roost 自身问题修好,补上能证明修复的测试,运行 scripts/check.sh 直到通过,然后 git commit(不要 push)。没有值得改的就不要提交。下一步会自动检查并应用你的提交;新版本加载失败会自动回退。",
+				},
+				{ name = "应用升级", upgrade = true },
+			} :: { any },
 		},
 	},
 } :: { Template }
@@ -1226,18 +1291,41 @@ local function compile_github(c: Ctx, t: { [string]: any }, path: string, line: 
 	return trig
 end
 
+M.ROOST_KINDS = {
+	{ id = "run_failed", label = "被迭代的工作流运行失败", detail = "当本工作流迭代的工作流连续失败或超时达到次数时触发。" },
+}
+
+local function compile_roost(c: Ctx, t: { [string]: any }, path: string, line: number?): RoostTrigger?
+	check_keys(c, t, path, { "roost", "workflows", "streak" })
+	local on = get_string(c, t, "roost", path) or ""
+	if on ~= "run_failed" then
+		issue(c, `{path}.roost`, `未知的 Roost 触发器 "{on}"(可用:run_failed)`, line_of(c, t, "roost") or line)
+		return nil
+	end
+	local wfs = get_strings(c, t, "workflows", path)
+	for _, id in wfs do
+		if not valid_id(id) then
+			issue(c, `{path}.workflows`, `工作流 id "{id}" 无效`, line_of(c, t, "workflows") or line)
+		end
+	end
+	return { kind = "roost", on = "run_failed", workflows = wfs, streak = get_int(c, t, "streak", path, 1, 1, 20), line = line }
+end
+
 local function compile_trigger(c: Ctx, t: any, path: string, line: number?, repos: { [string]: Repo }): Trigger?
 	if type(t) ~= "table" then
 		issue(c, path, "应为表", line)
 		return nil
 	end
-	if t.github ~= nil and t.schedule ~= nil then
-		issue(c, path, "github 与 schedule 只能二选一", line)
+	local n = (if t.github ~= nil then 1 else 0) + (if t.schedule ~= nil then 1 else 0) + (if t.roost ~= nil then 1 else 0)
+	if n > 1 then
+		issue(c, path, "github、schedule 与 roost 只能选一个", line)
 		return nil
 	elseif t.github ~= nil then
 		return compile_github(c, t, path, line)
 	elseif t.schedule ~= nil then
 		return compile_schedule(c, t, path, line, repos)
+	elseif t.roost ~= nil then
+		return compile_roost(c, t, path, line)
 	end
 	issue(
 		c,
@@ -1292,7 +1380,7 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		local base = `workflow.{if id ~= "" then id else tostring(wi)}`
 		check_keys(c, w, base, {
 			"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace",
-			"identity", "daily_budget", "state", "libs", "env", "input", "trigger", "step",
+			"identity", "daily_budget", "state", "libs", "evolve", "env", "input", "trigger", "step",
 		})
 		if not valid_id(id) then
 			issue(c, `{base}.id`, `id "{id}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, w, "id") or wline)
@@ -1365,10 +1453,15 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		for si, s in rawsteps do
 			local spath = `{base}.step[{si}]`
 			local sline = line_of(c, rawsteps, si)
-			check_keys(c, s, spath, { "name", "omp", "run", "file", "model", "args", "timeout", "continue_on_error", "when" })
+			check_keys(c, s, spath, {
+				"name", "omp", "run", "file", "tab", "upgrade", "key", "command", "title", "keep", "focus", "model", "args",
+				"timeout", "continue_on_error", "when",
+			})
 			local prompt = get_string(c, s, "omp", spath)
 			local script = get_string(c, s, "run", spath)
 			local fileref = get_string(c, s, "file", spath)
+			local tabact = get_string(c, s, "tab", spath)
+			local upgrade = s.upgrade ~= nil
 			local step: Step = {
 				name = get_string(c, s, "name", spath) or "",
 				kind = "run",
@@ -1380,8 +1473,62 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 				continue_on_error = get_bool(c, s, "continue_on_error", spath, false),
 				when = get_when(c, s, spath, input_names),
 			}
-			if (if prompt then 1 else 0) + (if script then 1 else 0) + (if fileref then 1 else 0) > 1 then
-				issue(c, spath, "omp、run 与 file 只能选一个", sline)
+			if not tabact then
+				for _, k in TAB_KEYS do
+					if s[k] ~= nil then
+						issue(c, `{spath}.{k}`, `{k} 只用于 tab 步骤`, line_of(c, s, k) or sline)
+					end
+				end
+			end
+			local kinds = (if prompt then 1 else 0) + (if script then 1 else 0) + (if fileref then 1 else 0)
+				+ (if tabact then 1 else 0) + (if upgrade then 1 else 0)
+			if kinds > 1 then
+				issue(c, spath, "omp、run、file、tab 与 upgrade 只能选一个", sline)
+			elseif tabact then
+				if step.model or #step.args > 0 then
+					issue(c, spath, "tab 步骤不接受 model 与 args", sline)
+				end
+				local key = get_string(c, s, "key", spath) or ""
+				if not valid_id(key) then
+					issue(c, `{spath}.key`, `标签页键 "{key}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, s, "key") or sline)
+				end
+				if tabact ~= "open" and tabact ~= "close" then
+					issue(c, `{spath}.tab`, "应为 open 或 close", line_of(c, s, "tab"))
+				elseif tabact == "close" then
+					for _, k in { "command", "title", "keep", "focus" } do
+						if s[k] ~= nil then
+							issue(c, `{spath}.{k}`, `{k} 只用于 tab = "open"`, line_of(c, s, k) or sline)
+						end
+					end
+				end
+				local command = get_string(c, s, "command", spath)
+				local title = get_string(c, s, "title", spath)
+				if command and #command > 4096 then
+					issue(c, `{spath}.command`, "命令最长 4096 字节", line_of(c, s, "command") or sline)
+				end
+				if title and (utf8.len(title) or #title) > 200 then
+					issue(c, `{spath}.title`, "标题最长 200 个字符", line_of(c, s, "title") or sline)
+				end
+				step.kind = "tab"
+				step.tab = {
+					action = if tabact == "close" then "close" else "open",
+					key = key,
+					command = if command and util.trim(command) ~= "" then command else nil,
+					title = if title and util.trim(title) ~= "" then title else nil,
+					keep = get_bool(c, s, "keep", spath, false),
+					focus = get_bool(c, s, "focus", spath, false),
+				}
+			elseif upgrade then
+				if s.upgrade ~= true then
+					issue(c, `{spath}.upgrade`, "应为 true", line_of(c, s, "upgrade"))
+				end
+				if step.model or #step.args > 0 then
+					issue(c, spath, "upgrade 步骤不接受 model 与 args", sline)
+				end
+				if ws ~= "auto" and ws ~= "worktree" then
+					issue(c, `{spath}.upgrade`, "upgrade 步骤需要 workspace = \"worktree\"(在 Roost 源码克隆的 worktree 里运行)", line_of(c, s, "upgrade"))
+				end
+				step.kind = "upgrade"
 			elseif prompt then
 				local tpl, err = template.parse(prompt)
 				if not tpl then
@@ -1423,7 +1570,12 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 					end
 				end
 			else
-				issue(c, spath, "步骤需要 omp = \"<提示词>\"、run = \"<shell 脚本>\" 或 file = \"<脚本文件>\"", sline)
+				issue(
+					c,
+					spath,
+					"步骤需要 omp = \"<提示词>\"、run = \"<shell 脚本>\"、file = \"<脚本文件>\"、tab = \"open|close\" 或 upgrade = true",
+					sline
+				)
 			end
 			if step.name == "" then
 				step.name = `{step.kind} #{si}`
@@ -1433,7 +1585,19 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		if #steps == 0 then
 			issue(c, base, "工作流至少需要一个 [[workflow.step]]", wline)
 		end
-
+		local evolve: { string }? = nil
+		if w.evolve ~= nil then
+			local list_ = get_strings(c, w, "evolve", base)
+			for _, e in list_ do
+				if e ~= "*" and not valid_id(e) then
+					issue(c, `{base}.evolve`, `工作流 id "{e}" 无效(或用 "*" 表示全部)`, line_of(c, w, "evolve"))
+				end
+			end
+			if #list_ == 0 then
+				issue(c, `{base}.evolve`, "evolve 至少要有一个工作流 id,或 \"*\" 表示全部", line_of(c, w, "evolve") or wline)
+			end
+			evolve = list_
+		end
 		local name = get_string(c, w, "name", base)
 		local icon = get_string(c, w, "icon", base)
 		local wf: Workflow = {
@@ -1455,11 +1619,51 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 			steps = steps,
 			libs = util.keys(libs),
 			state = state or id,
+			evolve = evolve,
 			line = wline,
 		}
 		table.insert(list, wf)
 		if id ~= "" and by_id[id] == nil then
 			by_id[id] = wf
+		end
+	end
+	-- `evolve` and `roost` triggers name other workflows: checked once all are known.
+	for _, wf in list do
+		local base = `workflow.{wf.id}`
+		local scope = wf.evolve
+		local named: { [string]: boolean } = {}
+		if scope then
+			for _, e in scope do
+				if e == "*" then
+					continue
+				end
+				named[e] = true
+				local target = by_id[e]
+				if e == wf.id then
+					issue(c, `{base}.evolve`, "工作流不能迭代自己", wf.line)
+				elseif target == nil then
+					issue(c, `{base}.evolve`, `没有工作流 "{e}"`, wf.line)
+				elseif target.evolve ~= nil then
+					issue(c, `{base}.evolve`, `"{e}" 自己也在迭代别的工作流,不能被迭代`, wf.line)
+				end
+			end
+		end
+		for i, t in wf.triggers do
+			if t.kind ~= "roost" then
+				continue
+			end
+			local rt = t :: RoostTrigger
+			local path = `{base}.trigger[{i}]`
+			if scope == nil then
+				issue(c, path, "roost 触发器只用于设置了 evolve 的工作流", rt.line)
+				continue
+			end
+			local all = table.find(scope, "*") ~= nil
+			for _, id in rt.workflows do
+				if not all and not named[id] then
+					issue(c, `{path}.workflows`, `"{id}" 不在 evolve 范围内`, rt.line)
+				end
+			end
 		end
 	end
 	if #c.issues > 0 then
@@ -1580,6 +1784,14 @@ function M.describe_trigger(t: Trigger, omit_repos: boolean?): string
 		end
 		return s
 	end
+	if t.kind == "roost" then
+		local rt = t :: RoostTrigger
+		local s = if rt.streak > 1 then `被迭代的工作流连续 {rt.streak} 次失败` else "被迭代的工作流运行失败"
+		if #rt.workflows > 0 then
+			s ..= ` · {table.concat(rt.workflows, "、")}`
+		end
+		return s
+	end
 	local gt = t :: GithubTrigger
 	local meta = KIND_BY_ID[gt.on]
 	if meta == nil then
@@ -1619,7 +1831,27 @@ function M.trigger_repos(t: Trigger): { string }
 		local ct = t :: CronTrigger
 		return if ct.repo then { ct.repo } else {}
 	end
+	if t.kind == "roost" then
+		return {}
+	end
 	return (t :: GithubTrigger).repos
+end
+
+-- The workflows `wf` may change: its `evolve` list with "*" expanded to every workflow that evolves
+-- none itself (never `wf`), in file order.
+function M.evolve_targets(w: Workflows, wf: Workflow): { string }
+	local scope = wf.evolve
+	if scope == nil then
+		return {}
+	end
+	local all = table.find(scope, "*") ~= nil
+	local out: { string } = {}
+	for _, x in w.list do
+		if x.id ~= wf.id and x.evolve == nil and (all or table.find(scope, x.id) ~= nil) then
+			table.insert(out, x.id)
+		end
+	end
+	return out
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1703,23 +1935,27 @@ end
 
 local WF_ORDER = {
 	"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace", "identity",
-	"daily_budget", "state", "libs", "env",
+	"daily_budget", "state", "libs", "evolve", "env",
 }
 local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify = true, concurrency = "queue", workspace = "auto" }
 local SUB_ORDER: { [string]: { string } } = {
 	input = { "name", "description", "default", "required" },
 	trigger = {
+		"roost", "streak",
 		"schedule", "at", "days", "between", "day", "date", "time", "cron", "tz", "repo", "ref",
 		"github", "event", "repos", "authors", "assignees", "actions", "branches", "labels", "label_actions",
 		"conclusions", "workflows", "review_states", "thread_actions", "comment",
 		"skip_drafts", "include_closed", "ignore_bots", "ignore_self", "forks", "associations",
 	},
-	step = { "name", "when", "omp", "run", "file", "model", "args", "timeout", "continue_on_error" },
+	step = {
+		"name", "when", "omp", "run", "file", "tab", "key", "title", "command", "keep", "focus", "upgrade", "model", "args",
+		"timeout", "continue_on_error",
+	},
 }
 local SUB_DEFAULTS: { [string]: { [string]: any } } = {
 	input = { required = false },
 	trigger = { tz = "local" },
-	step = { continue_on_error = false },
+	step = { continue_on_error = false, keep = false, focus = false },
 }
 for key, f in M.FILTERS do
 	if f.kind == "toggle" then

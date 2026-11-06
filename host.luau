@@ -92,3 +92,6 @@ tern.block.define("sessions", {
 		return sidebar.save(st)
 	end,
 })
+
+-- Last: the whole host half loaded.
+core.booted(C)

@@ -28,6 +28,9 @@ Install with `tern plugin install …` (or `tern plugin link .` while developing
 | `workflows.toml` | Repos (GitHub name → local path), automations, triggers, steps; the editor reads and writes it |
 | `runs.json`, `runs/<id>/`, `worktrees/<id>/` | Run history; each run's log, event payload and omp sessions; event worktrees |
 | `events.json` | The events page: each relayed event and the runs it started (or why none) |
+| `tabs/` | Tab operations queued for windows (`ops/`) and the tabs Roost opened (`open/<workflow>.<key>.json`) |
+| `revisions.json`, `revisions/<n>/` | Evolvers' revisions and their before/after snapshots (latest 100) |
+| `upgrades/<run>.json`, `upgrade/`, `boot.txt` | Self-upgrade outcomes, logs and per-run apply scripts, and the marker a loaded host writes |
 | `theme.css` (optional) | Your styles, applied live |
 
 The editor writes back only the edited `[[workflow]]` block. Comments and the rest of the file stay as they were, and the previous file is kept as `workflows.toml.bak`. See [README.zh-CN.md](README.zh-CN.md) for the full reference: schedule kinds, GitHub trigger kinds and their filters, templates, `ROOST_*` environment, workspaces and safety defaults.
@@ -46,6 +49,9 @@ Highlights:
 - User-content events only fire for `OWNER`/`MEMBER`/`COLLABORATOR` authors unless a trigger sets `associations = ["*"]`. CI events whose code comes from a fork only fire with `forks = true`.
 - Retention: `[retention]` in `roost.toml` (`runs = 200`, `run_age = "30d"`, `events = 200`, `event_age = "30d"`; `"0"` turns an age limit off). Cleanup runs at start, hourly and after the policy changes, and only removes finished runs, with their logs, payloads, omp sessions and leftover worktrees. **Config → 存储与清理** shows disk usage and cleans up on demand; a run's detail deletes that run, and the events page clears its list. Every delete takes two clicks.
 - The relay page lists the webhooks GitHub sent, counted by outcome, event and repo, including the ignored ones that never reach this machine. It can also clear the relay's event cache and those counters.
+- Tab steps (`tab = "open" | "close"`, `key`, optional `command`, `title`, `keep`, `focus`) open and close Tern tabs through a window. Keys belong to the workflow, every opened tab is recorded with its pane and block kind, and a close only closes a recorded pane that is still that block: tabs Roost didn't open are never touched. Without `keep`, a run's tabs close when it ends.
+- Self-iteration: a workflow with `evolve = ["*"]` (or ids) may change the others. Its runs get material under `runs/<id>/evolve/` (digest of recent runs, failed log tails, `base/` and editable `edit/` copies of the targets' `[[workflow]]` blocks, files and their private libraries); when such a run succeeds, what `edit/` changed is validated and applied like an editor save and recorded as a revision (`revisions/<n>/before|after`). The touched workflows' next runs are watched: at least two failures and a failure rate 25 points above the one before undo it automatically; five runs or seven days keep it. `roost = "run_failed"` triggers (with `streak`, optional `workflows`) start an evolver when a target fails, at most once per 30 minutes per target and 20 times a day.
+- Self-upgrade: an `upgrade = true` step, run in a worktree of a clone of Roost's own repo, checks that the new commits follow the plugin checkout's HEAD and that the checkout is clean, runs `scripts/check.sh` on the commit in a fresh worktree, then hands off to a detached script that fast-forwards the plugin checkout, reloads Roost and waits for the new host's `boot.txt`; a failed reload moves the checkout back (`git reset --keep`). Outcomes land in `upgrades/<run>.json` and are reported on the next start. This is the only place Roost writes its own plugin directory.
 
 ## Relay agent
 

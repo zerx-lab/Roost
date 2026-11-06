@@ -19,6 +19,8 @@ local agent = require("./agent")
 local stats = require("./stats")
 local loginenv = require("./loginenv")
 local files = require("./files")
+local tabs = require("./tabs")
+local upgrade = require("./upgrade")
 
 local M = {}
 
@@ -84,6 +86,10 @@ local TAIL_CHUNK = 512 * 1024
 local AUTH_TIMEOUT = 90
 local TOKEN_RENEW = 900
 local RENEW_RETRY = 60
+-- How long a tab operation may wait for a window to claim it, and how long a run-end close waits
+-- for one at all.
+local TAB_WAIT = 120
+local TAB_END_TTL = 86400
 
 -- What an agent step cost: every *.jsonl under its session dir (subagents are files one level
 -- down), summing each usage record's `cost.total` and `totalTokens`. Text inside JSON strings has
@@ -144,7 +150,19 @@ export type Request = {
 	event: { [string]: any }?,
 	payload: string?, -- raw JSON text of the webhook payload
 	rerun_of: string?,
+	-- An evolver started by a target's failure (lib/evolve.luau).
+	evolve: { target: string, run: string }?,
 }
+
+-- Copies the tails of run logs into an evolver's material: `sh -c EVOLVE_LOGS roost DST SRC ...`.
+M.EVOLVE_LOGS = [[
+n=0
+while [ $# -ge 2 ]; do
+	tail -c 49152 "$2" >"$1" 2>/dev/null && n=$((n + 1))
+	shift 2
+done
+echo "[roost] 迭代材料已写入 $ROOST_RUN_DIR/evolve($n 份日志)"
+]]
 
 -- An installation token the relay handed out for one run (POST /api/v1/github/token).
 export type AppToken = {
@@ -171,6 +189,13 @@ export type Env = {
 	now: () -> number,
 	-- Asks the relay for an App token for one repository (core.app_token).
 	app_token: (repo: string, cb: (AppToken?, string?) -> ()) -> (),
+	-- Roost's own checkout (tern.plugin.dir), which `upgrade` steps move forward.
+	plugin_dir: string,
+	-- Writes an evolver run's material (lib/evolve.luau prepare): log tails still to copy, as
+	-- destination/source pairs, or why it couldn't.
+	evolve_prepare: (run: store.Run, wf: model.Workflow) -> ({ string }, string?),
+	-- Told once a run has finished (after its record is final), outside the runner's own call.
+	finished: (run: store.Run) -> (),
 }
 
 -- Per-run state that isn't persisted.
@@ -190,7 +215,13 @@ type Live = {
 	renewing: boolean?, -- the run's App token is being renewed
 	renew_at: number?, -- last renewal attempt
 	renew_failed: boolean?, -- a renewal failure was logged (said once until one succeeds)
+	settling: { [number]: boolean }, -- tab step -> its result is being logged before the exit file
+	queued_at: { [number]: number }, -- tab step -> when its op was first seen unclaimed in this VM
 }
+
+-- A queued tab operation (lib/tabs.luau): a step's, or a run-end close (no step).
+-- `claimed`: when a run-end close was first seen claimed with no answer.
+type TabOp = { run: string, step: number?, created: number, claimed: number? }
 
 export type Runner = {
 	env: Env,
@@ -199,6 +230,8 @@ export type Runner = {
 	timer: any?,
 	save_timer: any?,
 	jobs_json: string?, -- what kv `agent_jobs` was last set to
+	tab_ops: { [string]: TabOp },
+	tabs_json: string?, -- what kv `tab_ops` was last set to
 }
 
 local function now(r: Runner): number
@@ -240,6 +273,27 @@ local function publish_jobs(r: Runner)
 	end
 end
 
+-- Lists the tab operations not yet done for the windows (kv `tab_ops`), when that list changed.
+local function publish_tabs(r: Runner)
+	local ids: { string } = {}
+	for id in r.tab_ops do
+		table.insert(ids, id)
+	end
+	table.sort(ids)
+	local enc = tern.json.encode(tern.json.array(table.move(ids, 1, #ids, 1, {})))
+	if enc ~= r.tabs_json then
+		local ok, err = pcall(function(): string?
+			tern.kv.set(tabs.KV, ids)
+			return nil
+		end)
+		if ok then
+			r.tabs_json = enc
+		else
+			tern.log.warn("roost: cannot publish tab operations", err)
+		end
+	end
+end
+
 -- Saves runs.json: at once when `now_` (before spawning a step), else coalesced.
 local function persist(r: Runner, now_: boolean?)
 	if now_ then
@@ -255,6 +309,7 @@ local function persist(r: Runner, now_: boolean?)
 		end)
 	end
 	publish_jobs(r)
+	publish_tabs(r)
 	r.env.changed()
 end
 
@@ -290,6 +345,13 @@ local function append_log(r: Runner, id: string, lines: { string }, tail: string
 		if done then
 			done()
 		end
+	end
+end
+
+-- Appends `lines` to run `id`'s log (core: what applying an evolver's changes did).
+function M.log(r: Runner, id: string, lines: { string })
+	if r.env.store.by_id[id] then
+		append_log(r, id, lines)
 	end
 end
 
@@ -336,6 +398,8 @@ local function live(r: Runner, id: string): Live
 			tail_done = {},
 			tally = {},
 			note = {},
+			settling = {},
+			queued_at = {},
 		}
 		r.live[id] = l
 	end
@@ -343,7 +407,7 @@ local function live(r: Runner, id: string): Live
 end
 
 function M.new(env: Env): Runner
-	return { env = env, live = {}, seq = 0, timer = nil, save_timer = nil, jobs_json = nil }
+	return { env = env, live = {}, seq = 0, timer = nil, save_timer = nil, jobs_json = nil, tab_ops = {}, tabs_json = nil }
 end
 
 local function new_id(r: Runner): string
@@ -436,6 +500,8 @@ local function title_for(wf: Workflow, req: Request): string
 		return match.summary(req.event)
 	elseif req.trigger.kind == "cron" then
 		return `定时 {req.trigger.detail}`
+	elseif req.trigger.kind == "roost" then
+		return `迭代 {req.trigger.detail}`
 	end
 	return `{if req.trigger.kind == "rerun" then "重跑" else "手动"} {wf.name}`
 end
@@ -478,6 +544,9 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 	if mode == "worktree" then
 		table.insert(steps, { name = "准备 worktree", kind = "prepare", state = "pending" })
 	end
+	if wf.evolve then
+		table.insert(steps, { name = "准备迭代材料", kind = "evolve", state = "pending" })
+	end
 	for _, s in wf.steps do
 		table.insert(steps, { name = s.name, kind = s.kind :: string, state = "pending" })
 	end
@@ -504,6 +573,8 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 		event = slim(req.event),
 		rerun_of = req.rerun_of,
 		identity = if as_app then "app" else nil,
+		evolve_target = if req.evolve then req.evolve.target else nil,
+		evolve_run = if req.evolve then req.evolve.run else nil,
 	}
 	local others = busy(r, wf.id)
 	if #others > 0 and wf.concurrency == "skip" then
@@ -551,6 +622,7 @@ function M.request_of(r: Runner, run: Run): Request
 		event = if run.event then full_event(r, run) else nil,
 		payload = payload,
 		rerun_of = run.id,
+		evolve = if run.evolve_target and run.evolve_run then { target = run.evolve_target, run = run.evolve_run } else nil,
 	}
 end
 
@@ -573,7 +645,37 @@ local function finish(r: Runner, run: Run, state: string, reason: string?)
 	end
 	-- Scratch ($ROOST_TMP) goes out of process; the run's file copies stay with its directory.
 	store.discard(r.env.store, `{dir_of(r, run.id)}/tmp`)
+	-- Tabs this run opened for itself (`keep` off) close now, unless a later run took the key over.
+	-- Any open step that got as far as queuing its operation: a failed or lost one may still have
+	-- opened its tab, and `only_run` keeps a tab another run took over.
+	for i, s in run.steps do
+		if s.kind == "tab" and s.tab_op and s.tab_keep == false and s.tab_key then
+			local id = tabs.end_id(run.id, i)
+			local err = tabs.write_op(r.env.data, {
+				id = id,
+				action = "close",
+				workflow = run.workflow,
+				key = s.tab_key :: string,
+				run = run.id,
+				only_run = true,
+				session = r.env.config().runner.session,
+				created = now(r),
+			})
+			if err then
+				tern.log.warn("roost: cannot queue tab close", err)
+			else
+				r.tab_ops[id] = { run = run.id, created = now(r) }
+			end
+		end
+	end
 	r.live[run.id] = nil
+	local ok, err = pcall(function(): string?
+		r.env.finished(run)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: finished hook failed", err)
+	end
 end
 
 local function read_pid(path: string): number?
@@ -677,6 +779,9 @@ local function template_ctx(r: Runner, run: Run, wf: Workflow, needs_payload: bo
 		input = run.inputs,
 		out = run.outputs or {},
 		payload = payload,
+		evolve_dir = if wf.evolve then `{dir_of(r, run.id)}/evolve` else nil,
+		evolve_target = run.evolve_target,
+		evolve_run = run.evolve_run,
 	}
 end
 
@@ -900,10 +1005,13 @@ end
 local check: (Runner, Run) -> ()
 local next_step: (Runner, Run, Workflow) -> ()
 
--- The definition of user step `i` (auth/prepare/cleanup have none), matched by name and kind.
+-- The definition of user step `i` (auth/prepare/evolve/cleanup have none), matched by name and kind.
 local function definition(run: Run, wf: Workflow, i: number): model.Step?
 	local offset = 0
-	while run.steps[offset + 1] and (run.steps[offset + 1].kind == "auth" or run.steps[offset + 1].kind == "prepare") do
+	local function internal(s: store.StepRec?): boolean
+		return s ~= nil and (s.kind == "auth" or s.kind == "prepare" or s.kind == "evolve")
+	end
+	while internal(run.steps[offset + 1]) do
 		offset += 1
 	end
 	local def = wf.steps[i - offset]
@@ -1088,6 +1196,207 @@ local function watch_agent(r: Runner, run: Run, i: number)
 	end
 end
 
+-- What a tab step's command sources: the run's ROOST_* variables (no login environment, no
+-- tokens: the tab runs in Tern's own login shell).
+local function tab_script(r: Runner, run: Run, wf: Workflow): string
+	local d = dir_of(r, run.id)
+	local v: { [string]: string } = {
+		ROOST_RUN_ID = run.id,
+		ROOST_WORKFLOW = wf.id,
+		ROOST_RUN_DIR = d,
+		ROOST_WORKSPACE = run.cwd or "",
+		ROOST_REPO = run.repo or "",
+		ROOST_REF = run.ref or run.fetch_ref or "",
+		ROOST_FILES = `{d}/files`,
+		ROOST_LIB = `{d}/lib`,
+		ROOST_STATE = files.state_dir(r.env.data, wf.state),
+	}
+	for k, x in run.inputs do
+		v["ROOST_INPUT_" .. string.upper((string.gsub(k, "[^%w]", "_")))] = x
+	end
+	for k, x in run.outputs or ({} :: { [string]: string }) do
+		v["ROOST_OUT_" .. string.upper(k)] = x
+	end
+	local lines = { "# Roost: this tab's run variables." }
+	for _, k in util.keys(v) do
+		table.insert(lines, `export {k}={util.shq(v[k])}`)
+	end
+	return table.concat(lines, "\n") .. "\n"
+end
+
+-- Queues step `i`'s tab operation for the windows; the window's result ends the step (watch_tab).
+local function start_tab(r: Runner, run: Run, wf: Workflow, i: number, ts: model.TabStep)
+	local s = run.steps[i]
+	local d = dir_of(r, run.id)
+	local cfg = r.env.config().runner
+	local id = tabs.step_id(run.id, i)
+	local exitf = `{d}/s{i}.exit`
+	local function fail(why: string)
+		append_log(r, run.id, { `\27[1;36m▶ {s.name}\27[0m`, `[roost] {why}` }, nil, function()
+			pcall(tern.fs.write, exitf, "1")
+			M.schedule(r, 200)
+		end)
+	end
+	local command: string? = nil
+	if ts.action == "open" and ts.command then
+		local envf = `{d}/s{i}.env`
+		local ok = pcall(tern.fs.write, envf, tab_script(r, run, wf))
+		if not ok then
+			persist(r, true)
+			fail("无法写入标签页的环境文件")
+			return
+		end
+		command = agent.with_env(envf, `{agent.quote(cfg.shell)} -c {agent.quote(ts.command :: string)}`)
+	end
+	s.tab_op = id
+	s.tab_key = ts.key
+	-- A close step leaves nothing for the run's end to close.
+	s.tab_keep = ts.action ~= "open" or ts.keep
+	live(r, run.id).queued_at[i] = nil
+	local err = tabs.write_op(r.env.data, {
+		id = id,
+		action = ts.action,
+		workflow = wf.id,
+		key = ts.key,
+		run = run.id,
+		-- A kept tab outlives the run's temporary directories.
+		cwd = if ts.keep then (run.repo_path or r.env.home or d) else (run.cwd or d),
+		command = command,
+		title = ts.title or s.name,
+		focus = ts.focus,
+		keep = ts.keep,
+		session = cfg.session,
+		created = now(r),
+	})
+	if err then
+		persist(r, true)
+		fail(`无法写入标签页操作:{err}`)
+		return
+	end
+	r.tab_ops[id] = { run = run.id, step = i, created = now(r) }
+	persist(r, true)
+	append_log(r, run.id, {
+		`\27[1;36m▶ {s.name}\27[0m`,
+		`[roost] 等待 Tern 窗口{if ts.action == "open" then "打开" else "关闭"}标签页「{ts.key}」`,
+	})
+	M.schedule(r, 500)
+end
+
+-- A tab step's operation: the window's result (or none in time) becomes the step's exit file,
+-- after the log says how it went.
+local function watch_tab(r: Runner, run: Run, i: number)
+	local l = live(r, run.id)
+	if l.settling[i] then
+		return
+	end
+	local s = run.steps[i]
+	local d = dir_of(r, run.id)
+	local id = s.tab_op
+	local runid = run.id
+	-- `withdraw`: no window carried it out; its op goes at once so none starts it now. A result's op
+	-- stays until the exit file is written, so a reload in between reads the result again.
+	local function settle(code: number, line: string, withdraw: boolean?)
+		l.settling[i] = true
+		local function drop()
+			if id then
+				tabs.remove(r.env.data, id)
+				r.tab_ops[id] = nil
+			end
+		end
+		if withdraw then
+			drop()
+		end
+		append_log(r, runid, { line }, nil, function()
+			l.settling[i] = nil
+			pcall(tern.fs.write, `{d}/s{i}.exit`, tostring(code))
+			drop()
+			persist(r)
+			local cur = r.env.store.by_id[runid]
+			if cur and cur.state == "running" and cur.step == i then
+				check(r, cur)
+			end
+		end)
+		persist(r)
+	end
+	if id == nil then
+		settle(1, "[roost] 标签页操作丢失(插件重载前没有记录)")
+		return
+	end
+	local p = tabs.paths(r.env.data, id)
+	if tern.fs.exists(p.done) then
+		local res = tabs.read_result(p.done)
+		if res == nil then
+			settle(1, "[roost] 窗口写入的标签页结果读不出")
+		else
+			settle(if res.ok then 0 else 1, `[roost] {res.message}`)
+		end
+		return
+	end
+	if not tern.fs.exists(p.op) then
+		settle(1, "[roost] 标签页操作文件不见了")
+		return
+	end
+	local t = now(r)
+	if tern.fs.exists(p.claim) then
+		-- A window is on it: let it finish, unless it never does.
+		local since = l.claim_at[i] or t
+		l.claim_at[i] = since
+		if t - since >= CLAIM_GRACE then
+			settle(agent.CODE.lost, "[roost] 窗口认领了标签页操作但没有完成", true)
+		end
+		return
+	end
+	l.claim_at[i] = nil
+	-- Unclaimed, so no window opened anything: nothing for the run's end to close either.
+	if run.stop then
+		s.tab_key = nil
+		settle(agent.CODE.stopped, "[roost] 已停止,标签页操作没有执行", true)
+		return
+	end
+	local since = l.queued_at[i] or t
+	l.queued_at[i] = since
+	if t - since >= TAB_WAIT then
+		s.tab_key = nil
+		settle(1, `[roost] {TAB_WAIT} 秒内没有 Tern 窗口处理标签页操作(需要打开一个本机窗口)`, true)
+	end
+end
+
+-- Run-end closes and ops left behind: a close is dropped once a window answered it (or after a
+-- day without a window); a step's op whose step is no longer current is removed. Returns whether
+-- any are still waiting.
+local function sweep_tabs(r: Runner): boolean
+	local changed = false
+	for id, op in table.clone(r.tab_ops) do
+		local drop = false
+		if op.step == nil then
+			local p = tabs.paths(r.env.data, id)
+			drop = tern.fs.exists(p.done) or now(r) - op.created >= TAB_END_TTL
+			if not drop and tern.fs.exists(p.claim) then
+				-- A window that claimed it and never answered (closed meanwhile): let another take it.
+				op.claimed = op.claimed or now(r)
+				if now(r) - (op.claimed :: number) >= CLAIM_GRACE then
+					pcall(tern.fs.remove, p.claim)
+					op.claimed = nil
+				end
+			else
+				op.claimed = nil
+			end
+		else
+			local run = r.env.store.by_id[op.run]
+			drop = run == nil or run.state ~= "running" or run.step ~= op.step
+		end
+		if drop then
+			tabs.remove(r.env.data, id)
+			r.tab_ops[id] = nil
+			changed = true
+		end
+	end
+	if changed then
+		publish_tabs(r)
+	end
+	return next(r.tab_ops) ~= nil
+end
+
 -- Gets the run's App token from the relay and saves it for the steps after it; the exit file
 -- (written once the log says how it went) ends the step.
 local function start_auth(r: Runner, run: Run, i: number)
@@ -1218,14 +1527,32 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	end
 	local argv: { string } = {}
 	local job: agent.Job? = nil
+	local tabstep: model.TabStep? = nil
 	local cwd = run.cwd or d
 	local def: model.Step? = nil
+	local function refuse(msg: string): { string }
+		return { "/bin/sh", "-c", 'echo "$1" >&2; exit 1', "roost", `[roost] {msg}` }
+	end
 	if s.kind == "prepare" then
 		argv = { cfg.shell, "-c", M.PREPARE_WORKTREE }
 		cwd = run.repo_path or d
 	elseif s.kind == "cleanup" then
 		argv = { cfg.shell, "-c", M.CLEANUP_WORKTREE }
 		cwd = run.repo_path or d
+	elseif s.kind == "evolve" then
+		-- The material is written now; only the log tails are copied by the step's process.
+		cwd = d
+		local ok, pairs_, perr = pcall(function(): ({ string }, string?)
+			return r.env.evolve_prepare(run, wf)
+		end)
+		if not ok then
+			argv = refuse(`准备迭代材料失败:{pairs_}`)
+		elseif perr then
+			argv = refuse(perr)
+		else
+			argv = { cfg.shell, "-c", M.EVOLVE_LOGS, "roost" }
+			table.move(pairs_ :: { string }, 1, #(pairs_ :: { string }), #argv + 1, argv)
+		end
 	else
 		def = definition(run, wf, i)
 		if def == nil then
@@ -1250,7 +1577,19 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 			next_step(r, run, wf)
 			return
 		end
-		if step.kind == "omp" and step.prompt then
+		if step.kind == "tab" and step.tab then
+			-- Tabs act in Tern, not on GitHub: no App identity needed.
+			tabstep = step.tab
+		elseif step.kind == "upgrade" then
+			if run.workspace ~= "worktree" then
+				argv = refuse("upgrade 步骤需要在 Roost 源码克隆的 worktree 里运行(给工作流配置该仓库,workspace = \"worktree\")")
+			else
+				local apply, aerr = upgrade.install(r.env.data, run.id)
+				argv = if apply
+					then { cfg.shell, "-c", upgrade.CHECK, "roost", r.env.plugin_dir, r.env.data, run.id, apply }
+					else refuse(`无法写入升级脚本:{aerr or "?"}`)
+			end
+		elseif step.kind == "omp" and step.prompt then
 			local args = table.clone(cfg.omp_args)
 			for _, a in step.args do
 				table.insert(args, a)
@@ -1321,10 +1660,14 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 		start_agent(r, run, i, job)
 		return
 	end
+	if tabstep then
+		start_tab(r, run, wf, i, tabstep :: model.TabStep)
+		return
+	end
 	pcall(tern.fs.remove, `{d}/s{i}.pid`)
 	pcall(tern.fs.remove, `{d}/s{i}.pid.w`)
 	local log = `{d}/log.txt`
-	local app = run.app ~= nil and s.kind ~= "prepare" and s.kind ~= "cleanup"
+	local app = run.app ~= nil and s.kind ~= "prepare" and s.kind ~= "cleanup" and s.kind ~= "evolve"
 	local env = step_env(r, run, wf, app)
 	if def then
 		env.ROOST_OUTPUT = `{d}/s{i}.out`
@@ -1519,6 +1862,10 @@ function check(r: Runner, run: Run)
 		run.stop = "timeout"
 		persist(r)
 	end
+	if cur.kind == "tab" then
+		watch_tab(r, run, i)
+		return
+	end
 	if cur.kind == "auth" then
 		if run.stop or not l.spawned[i] then
 			-- Stopped, or begun by an earlier VM: its relay request died with it.
@@ -1632,9 +1979,13 @@ function M.tick(r: Runner)
 			break
 		end
 	end
+	local waiting = sweep_tabs(r)
 	if active then
 		M.pump(r)
 		M.schedule(r, 1000)
+	elseif waiting then
+		-- Only run-end closes are left: look again now and then until a window answers them.
+		M.schedule(r, 5000)
 	end
 end
 
@@ -1650,6 +2001,27 @@ end
 -- After a reload: runs that were running are adopted; `check` probes their step's processes
 -- (nobody in this VM gets their callback) and carries on or ends them.
 function M.recover(r: Runner)
+	-- Tab operations on disk: a step's while its step is current (watch_tab follows it), a
+	-- run-end close until answered; anything else is left over from an earlier VM.
+	local found, leftover = tabs.scan(r.env.data)
+	for _, id in leftover do
+		tabs.remove(r.env.data, id)
+	end
+	for _, f in found do
+		local run, step = string.match(f.id, "^(%x+)%-s(%d+)$")
+		local erun = string.match(f.id, "^(%x+)%-end%d+$")
+		local cur = if run then r.env.store.by_id[run] else nil
+		if cur and cur.state == "running" and cur.step == tonumber(step) then
+			if not f.done then
+				r.tab_ops[f.id] = { run = cur.id, step = cur.step, created = now(r) }
+			end
+		elseif erun and not f.done then
+			local op = tabs.read_op(tabs.paths(r.env.data, f.id).op)
+			r.tab_ops[f.id] = { run = erun, created = if op then op.created else now(r) }
+		else
+			tabs.remove(r.env.data, f.id)
+		end
+	end
 	for _, run in r.env.store.runs do
 		if run.state == "running" and run.step < 1 then
 			finish(r, run, "interrupted", "插件重载时尚未开始")

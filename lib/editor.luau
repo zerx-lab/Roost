@@ -23,6 +23,7 @@ local PROMPT_WHEN_ID = ROOT .. ".body.prompt.when.input"
 local BUDGET_ID = ROOT .. ".body.advanced.budget.input"
 local STATE_ID = ROOT .. ".body.advanced.state.input"
 local LIBS_ADD_ID = ROOT .. ".body.advanced.libs.add"
+local EVOLVE_ADD_ID = ROOT .. ".body.advanced.evolve.add"
 local FILE_ADD_ID = ROOT .. ".body.files.add.input"
 local FILE_REN_ID = ROOT .. ".body.files.ren.input"
 local FILE_EDIT_ID = ROOT .. ".body.files.edit.input"
@@ -131,9 +132,17 @@ local function triggers_of(raw: { [string]: any }): { any }
 	return list_of(raw, "trigger")
 end
 
+local TAB_KEYS = { "tab", "key", "command", "title", "keep", "focus" }
+
 local function step_kind(step: any): string
 	if type(step) ~= "table" then
 		return "omp"
+	end
+	if type(step.tab) == "string" then
+		return "tab"
+	end
+	if step.upgrade == true then
+		return "upgrade"
 	end
 	if type(step.file) == "string" and type(step.omp) ~= "string" and type(step.run) ~= "string" then
 		return "file"
@@ -172,7 +181,7 @@ local function step_text(step: any): string
 	local kind = step_kind(step)
 	if kind == "run" then
 		return if type(step.run) == "string" then step.run else ""
-	elseif kind == "file" then
+	elseif kind == "file" or kind == "tab" or kind == "upgrade" then
 		return ""
 	end
 	return if type(step.omp) == "string" then step.omp else ""
@@ -502,7 +511,26 @@ local function sync_steps(ed: Editor)
 				if args_f and args_f.text ~= args_text(step) then
 					step.args = parse_args(args_f.text)
 				end
-			else
+			elseif kind == "tab" then
+				local key_f = ed.buf[sid(i, "key", "input")]
+				if key_f then
+					step.key = util.trim(key_f.text)
+				end
+				if step.tab == "open" then
+					local title_f = ed.buf[sid(i, "title", "input")]
+					if title_f then
+						local title = util.trim(title_f.text)
+						step.title = if title == "" then nil else title
+					end
+					local cmd_f = ed.buf[sid(i, "command", "input")]
+					if cmd_f then
+						local command = util.trim(cmd_f.text)
+						step.command = if command == "" then nil else command
+					end
+				else
+					step.title, step.command, step.keep, step.focus = nil, nil, nil, nil
+				end
+			elseif kind == "run" or kind == "omp" then
 				local text_f = ed.buf[sid(i, "text", "input")]
 				if text_f then
 					if kind == "run" then
@@ -763,40 +791,64 @@ local function ensure_prompt(ed: Editor): any
 	return step
 end
 
+local function clear_named(step: any, keys: { string })
+	for _, key in keys do
+		step[key] = nil
+	end
+end
+
 local function set_step_kind(ed: Editor, i: number, kind: string)
 	local step = steps_of(ed.raw)[i]
-	if type(step) ~= "table" or (kind ~= "omp" and kind ~= "run" and kind ~= "file") then
+	if type(step) ~= "table" or (kind ~= "omp" and kind ~= "run" and kind ~= "file" and kind ~= "tab" and kind ~= "upgrade") then
 		return
 	end
 	local prev = step_kind(step)
 	local text = step_text(step)
 	step.kind = nil
-	if kind == "file" then
+	if kind == "tab" then
+		step.tab = "open"
+		step.key = if type(step.key) == "string" and step.key ~= "" then step.key else "main"
+		step.upgrade = nil
+		step.omp, step.run, step.file, step.model, step.args = nil, nil, nil, nil, nil
+	elseif kind == "upgrade" then
+		step.upgrade = true
+		step.omp, step.run, step.file, step.model, step.args = nil, nil, nil, nil, nil
+		clear_named(step, TAB_KEYS)
+	elseif kind == "file" then
+		clear_named(step, TAB_KEYS)
+		step.upgrade = nil
 		step.file = if type(step.file) == "string" then step.file else ""
 		step.omp = nil
 		step.run = nil
 		step.model = nil
-		-- Keep existing args for file steps; drop omp/run-only text.
 	elseif kind == "omp" then
-		step.omp = if prev == "file" then "" else text
+		clear_named(step, TAB_KEYS)
+		step.upgrade = nil
+		step.omp = if prev == "file" or prev == "tab" or prev == "upgrade" then "" else text
 		step.run = nil
 		step.file = nil
 		step.args = nil
 	else
-		step.run = if prev == "file" then "" else text
+		clear_named(step, TAB_KEYS)
+		step.upgrade = nil
+		step.run = if prev == "file" or prev == "tab" or prev == "upgrade" then "" else text
 		step.omp = nil
 		step.file = nil
-		-- Only omp steps take a model or omp args; leaving them would make the step unsavable.
 		step.model = nil
 		step.args = nil
 	end
 	local f = ed.buf[sid(i, "text", "input")]
 	if f then
-		f.text = if kind == "file" then "" else (if prev == "file" then "" else text)
-		f.lines = kind ~= "file"
+		local blank = kind == "file" or kind == "tab" or kind == "upgrade" or prev == "file" or prev == "tab" or prev == "upgrade"
+		f.text = if blank then "" else text
+		f.lines = kind == "omp" or kind == "run"
 	end
 	if kind ~= "file" then
 		ed.buf[sid(i, "args", "input")] = nil
+	end
+	local key_f = ed.buf[sid(i, "key", "input")]
+	if key_f and kind == "tab" then
+		key_f.text = if type(step.key) == "string" then step.key else "main"
 	end
 	touch(ed)
 end
@@ -857,7 +909,7 @@ local function seed_open(ed: Editor)
 	seed(ed, PROMPT_ID, if prompt then step_text(prompt) else "", true)
 	-- A hand-written schedule from before `schedule` existed: show it as the cron it is.
 	for _, tr in triggers_of(raw) do
-		if type(tr) == "table" and tr.schedule == nil and tr.github == nil and type(tr.cron) == "string" then
+		if type(tr) == "table" and tr.schedule == nil and tr.github == nil and tr.roost == nil and type(tr.cron) == "string" then
 			tr.schedule = "cron"
 		end
 	end
@@ -1451,9 +1503,150 @@ local function github_card(st: any, ed: Editor, i: number, tr: any): any
 	return N("col", { key = "card", role = "roost.trigger", gap = "sm" }, body)
 end
 
+local function catalogue_ids(st: any): { string }
+	local ids: { string } = {}
+	local cat = if type(st) == "table" and type(st.core) == "table" then st.core.workflows else nil
+	if type(cat) == "table" and type(cat.list) == "table" then
+		for _, wf in cat.list do
+			if type(wf) == "table" and type(wf.id) == "string" then
+				table.insert(ids, wf.id)
+			end
+		end
+	end
+	return ids
+end
+
+local function roost_meta(on: string): (string, string)
+	for _, kind in model.ROOST_KINDS do
+		if kind.id == on then
+			return kind.label, kind.detail
+		end
+	end
+	return if on ~= "" then on else "未知触发器", ""
+end
+
+-- Chips for a roost trigger's `workflows`, suggesting other workflow ids from the catalogue.
+local function roost_workflows(st: any, ed: Editor, i: number, tr: any): any
+	local values = str_list(tr.workflows)
+	local chips: { any } = {}
+	for j, item in values do
+		table.insert(chips, N("button", {
+			key = `c{j}`,
+			text = `{item} ×`,
+			size = "sm",
+			tone = "accent",
+			role = "roost.chip",
+			title = `移除 {item}`,
+			actions = { click = `cdel:{i}:workflows:{j}` },
+		}))
+	end
+	local input_id = tid(i, "card", "workflows", "add")
+	seed(ed, input_id, "")
+	local seen: { [string]: boolean } = {}
+	for _, item in values do
+		seen[string.lower(item)] = true
+	end
+	local self_id = if type(ed.raw.id) == "string" then ed.raw.id else ed.old_id
+	if type(self_id) == "string" then
+		seen[string.lower(self_id)] = true
+	end
+	local q = string.lower(buf(ed, input_id).text)
+	local items: { string } = {}
+	for _, id in catalogue_ids(st) do
+		local low = string.lower(id)
+		if not seen[low] and (q == "" or string.find(low, q, 1, true)) then
+			table.insert(items, id)
+			if #items >= 8 then
+				break
+			end
+		end
+	end
+	ed.suggest[`{i}:workflows`] = items
+	local sug: { any } = {}
+	for j, item in items do
+		table.insert(sug, N("button", {
+			key = `b{j}`,
+			text = `+ {item}`,
+			size = "sm",
+			variant = "quiet",
+			role = "roost.suggest",
+			title = `添加 {item}`,
+			actions = { click = `sug:{i}:workflows:{j}` },
+		}))
+	end
+	local filter_err = field_error(ed, function(path)
+		return string.find(path, `.trigger[{i}].workflows`, 1, true) ~= nil
+	end)
+	local children: { any } = {
+		txt("工作流", "lab", "muted"),
+		N("row", { key = "chips", gap = "xs", wrap = true, role = "roost.chips" }, chips),
+		input_node(ed, input_id, { key = "add", placeholder = "工作流 id,回车添加" }),
+	}
+	if #sug > 0 then
+		table.insert(children, N("row", { key = "sug", gap = "xs", wrap = true, align = "center" }, {
+			txt("建议", "sl", "muted"),
+			N("row", { key = "items", gap = "xs", wrap = true }, sug),
+		}))
+	end
+	if filter_err then
+		table.insert(children, txt(filter_err, "ferr", "warning"))
+	end
+	return N("col", { key = "workflows", gap = "xs" }, children)
+end
+
+local function roost_card(st: any, ed: Editor, i: number, tr: any): any
+	local on = if type(tr.roost) == "string" then tr.roost else ""
+	local label, detail = roost_meta(on)
+	local streak = if type(tr.streak) == "number" then tostring(tr.streak) else "1"
+	local opts: { any } = {}
+	for n = 1, 10 do
+		local v = tostring(n)
+		table.insert(opts, { value = v, label = v })
+	end
+	local body: { any } = {
+		N("row", { key = "h", gap = "sm", align = "center" }, {
+			N("button", { key = "ic", icon = "activity", text = "", title = label, size = "sm", variant = "quiet" }),
+			txt(label, "lab"),
+			N("button", {
+				key = "del",
+				icon = "trash",
+				text = "",
+				title = "删除触发器",
+				size = "sm",
+				variant = "quiet",
+				actions = { click = `trig-del:{i}` },
+			}),
+		}),
+		txt(detail, "detail", "muted"),
+		roost_workflows(st, ed, i, tr),
+		N("field", { key = "streak", label = "连续失败次数", variant = "row" }, {
+			N("select", {
+				key = "sel",
+				value = streak,
+				options = with_current(opts, streak, streak),
+				open = ed.opens[tid(i, "card", "streak", "sel")] == true,
+			}),
+		}),
+	}
+	local err: string? = nil
+	for _, issue in ed.issues do
+		if string.find(issue.path, `.trigger[{i}]`, 1, true) and not string.find(issue.path, ".workflows", 1, true) then
+			err = issue.message
+			break
+		end
+	end
+	if err then
+		table.insert(body, txt(err, "err", "warning"))
+	end
+	return N("col", { key = "card", role = "roost.trigger", gap = "sm" }, body)
+end
+
 local function trigger_node(st: any, ed: Editor, i: number, tr: any): any
 	if type(tr) == "table" and type(tr.github) == "string" then
 		return N("col", { key = `t{i}`, gap = "xs" }, { github_card(st, ed, i, tr) })
+	end
+	if type(tr) == "table" and type(tr.roost) == "string" then
+		return N("col", { key = `t{i}`, gap = "xs" }, { roost_card(st, ed, i, tr) })
 	end
 	local row, err = schedule_sentence(ed, i, if type(tr) == "table" then tr else {})
 	local parts: { any } = { row }
@@ -1471,6 +1664,10 @@ local function add_menu(ed: Editor): any
 	table.insert(items, { header = "GitHub" })
 	for _, kind in model.GITHUB_KINDS do
 		table.insert(items, { id = `gh:{kind.id}`, label = kind.label, detail = kind.detail, icon = kind.icon })
+	end
+	table.insert(items, { header = "Roost" })
+	for _, kind in model.ROOST_KINDS do
+		table.insert(items, { id = `roost:{kind.id}`, label = kind.label, detail = kind.detail, icon = "activity" })
 	end
 	return N("menu", { key = "add", text = "添加触发器", icon = "plus", items = items, open = ed.opens[ROOT .. ".body.triggers.add"] == true })
 end
@@ -1604,6 +1801,8 @@ local function steps_section(ed: Editor): any
 							{ value = "omp", label = "指令" },
 							{ value = "run", label = "命令" },
 							{ value = "file", label = "文件" },
+							{ value = "tab", label = "标签页" },
+							{ value = "upgrade", label = "升级 Roost" },
 						},
 						open = ed.opens[sid(i, "bar", "kind")] == true,
 					}),
@@ -1631,6 +1830,50 @@ local function steps_section(ed: Editor): any
 				table.insert(body, N("field", { key = "args", label = "参数", hint = "空格分隔,写入 args 数组" }, {
 					input_node(ed, args_id, { key = "input", placeholder = "--flag value" }),
 				}))
+			elseif kind == "tab" then
+				local action = if step.tab == "close" then "close" else "open"
+				table.insert(body, N("field", { key = "tabact", label = "动作" }, {
+					N("select", {
+						key = "sel",
+						value = action,
+						options = {
+							{ value = "open", label = "打开" },
+							{ value = "close", label = "关闭" },
+						},
+						open = ed.opens[sid(i, "tabact", "sel")] == true,
+					}),
+				}))
+				local key_id = sid(i, "key", "input")
+				seed(ed, key_id, if type(step.key) == "string" then step.key else "")
+				table.insert(body, N("field", { key = "key", label = "键" }, {
+					input_node(ed, key_id, { key = "input", placeholder = "main" }),
+				}))
+				if action == "open" then
+					local title_id = sid(i, "title", "input")
+					local cmd_id = sid(i, "command", "input")
+					seed(ed, title_id, if type(step.title) == "string" then step.title else "")
+					seed(ed, cmd_id, if type(step.command) == "string" then step.command else "")
+					table.insert(body, N("field", { key = "title", label = "标题" }, {
+						input_node(ed, title_id, { key = "input", placeholder = "标签页标题" }),
+					}))
+					table.insert(body, N("field", { key = "command", label = "命令", hint = "可用 $ROOST_RUN_DIR 等变量;留空则打开 shell" }, {
+						input_node(ed, cmd_id, { key = "input", placeholder = "shell 命令" }),
+					}))
+					table.insert(body, N("switch", {
+						key = "keep",
+						variant = "compact",
+						label = "运行结束后保留",
+						on = step.keep == true,
+					}))
+					table.insert(body, N("switch", {
+						key = "focus",
+						variant = "compact",
+						label = "打开后切换过去",
+						on = step.focus == true,
+					}))
+				end
+			elseif kind == "upgrade" then
+				table.insert(body, txt("检查本运行 worktree 里的新提交(须是 Roost 源码克隆的仓库),scripts/check.sh 通过后由后台脚本应用到插件目录;加载失败自动回退。", "note", "muted"))
 			else
 				seed(ed, text_id, step_text(step), true)
 				local f = ed.buf[text_id]
@@ -1923,6 +2166,92 @@ local function advanced_section(st: any, ed: Editor): any
 	}, {
 		input_node(ed, STATE_ID, { key = "input", placeholder = "默认:工作流 id" }),
 	}))
+	local evolve = str_list(raw.evolve)
+	local evolve_all = false
+	for _, item in evolve do
+		if item == "*" then
+			evolve_all = true
+			break
+		end
+	end
+	table.insert(children, N("switch", {
+		key = "evolveall",
+		variant = "compact",
+		label = "全部工作流",
+		hint = "迭代除自身以外、且自己不迭代别人的工作流",
+		on = evolve_all,
+	}))
+	if not evolve_all then
+		local ev_chips: { any } = {}
+		local shown: { string } = {}
+		for _, name in evolve do
+			if name ~= "*" then
+				table.insert(shown, name)
+			end
+		end
+		for j, name in shown do
+			table.insert(ev_chips, N("button", {
+				key = `e{j}`,
+				text = `{name} ×`,
+				size = "sm",
+				tone = "accent",
+				role = "roost.chip",
+				title = `移除 {name}`,
+				actions = { click = `evolve-del:{j}` },
+			}))
+		end
+		seed(ed, EVOLVE_ADD_ID, if ed.buf[EVOLVE_ADD_ID] then ed.buf[EVOLVE_ADD_ID].text else "")
+		local self_id = if type(raw.id) == "string" then raw.id else ed.old_id
+		local seen: { [string]: boolean } = {}
+		for _, name in shown do
+			seen[string.lower(name)] = true
+		end
+		if type(self_id) == "string" then
+			seen[string.lower(self_id)] = true
+		end
+		local q = string.lower(buf(ed, EVOLVE_ADD_ID).text)
+		local sug_ids: { string } = {}
+		for _, id in catalogue_ids(st) do
+			local low = string.lower(id)
+			if not seen[low] and (q == "" or string.find(low, q, 1, true)) then
+				table.insert(sug_ids, id)
+				if #sug_ids >= 8 then
+					break
+				end
+			end
+		end
+		ed.suggest.evolve = sug_ids
+		local sug: { any } = {}
+		for j, id in sug_ids do
+			table.insert(sug, N("button", {
+				key = `b{j}`,
+				text = `+ {id}`,
+				size = "sm",
+				variant = "quiet",
+				role = "roost.suggest",
+				title = `添加 {id}`,
+				actions = { click = `evolve-sug:{j}` },
+			}))
+		end
+		local evolve_err = field_error(ed, function(path)
+			return path == "evolve" or string.find(path, ".evolve", 1, true) ~= nil
+		end)
+		local ev_kids: { any } = {
+			txt("迭代的工作流", "lab", "muted"),
+			N("row", { key = "chips", gap = "xs", wrap = true, role = "roost.chips" }, ev_chips),
+			input_node(ed, EVOLVE_ADD_ID, { key = "add", placeholder = "工作流 id,回车添加" }),
+		}
+		if #sug > 0 then
+			table.insert(ev_kids, N("row", { key = "sug", gap = "xs", wrap = true, align = "center" }, {
+				txt("建议", "sl", "muted"),
+				N("row", { key = "items", gap = "xs", wrap = true }, sug),
+			}))
+		end
+		if evolve_err then
+			table.insert(ev_kids, txt(evolve_err, "ferr", "warning"))
+		end
+		table.insert(children, N("col", { key = "evolve", gap = "xs" }, ev_kids))
+	end
 	local tz_opts = {
 		{ value = "", label = "本机时区" },
 		{ value = "UTC", label = "UTC" },
@@ -2230,6 +2559,24 @@ local function on_select(st: any, ed: Editor, id: string, value: string)
 		if si then
 			set_step_kind(ed, si, value)
 		end
+	elseif string.find(id, ".tabact.sel", 1, true) then
+		local si = index_in(id, "%.s")
+		local step = if si then steps_of(ed.raw)[si] else nil
+		if type(step) == "table" and step_kind(step) == "tab" then
+			if value == "close" then
+				step.tab = "close"
+				step.title, step.command, step.keep, step.focus = nil, nil, nil, nil
+			else
+				step.tab = "open"
+			end
+			touch(ed)
+		end
+	elseif tr and string.find(id, ".streak.sel", 1, true) then
+		local n = tonumber(value)
+		if n and n >= 1 and n <= 10 then
+			tr.streak = if n == 1 then nil else n
+		end
+		touch(ed)
 	elseif string.find(id, ".file.sel", 1, true) then
 		local si = index_in(id, "%.s")
 		local step = if si then steps_of(ed.raw)[si] else nil
@@ -2270,10 +2617,14 @@ local function on_menu(st: any, ed: Editor, act: string)
 	local sched = string.match(act, "^sched:(.+)$")
 	local gh = string.match(act, "^gh:(.+)$")
 	local icon = string.match(act, "^icon:(.+)$")
+	local roost = string.match(act, "^roost:(.+)$")
 	if sched then
 		add_trigger(ed, sched)
 	elseif gh then
 		add_trigger(ed, gh)
+	elseif roost then
+		table.insert(triggers_of(ed.raw), { roost = roost })
+		touch(ed)
 	elseif icon then
 		ed.raw.icon = icon
 		touch(ed)
@@ -2552,7 +2903,72 @@ local function on_action(st: any, ed: Editor, act: string)
 		end
 		return
 	end
-	if string.sub(act, 1, 5) == "icon:" or string.sub(act, 1, 6) == "sched:" or string.sub(act, 1, 3) == "gh:" then
+	local evolve_del = string.match(act, "^evolve%-del:(%d+)$")
+	if evolve_del then
+		local shown: { string } = {}
+		for _, item in str_list(ed.raw.evolve) do
+			if item ~= "*" then
+				table.insert(shown, item)
+			end
+		end
+		table.remove(shown, tonumber(evolve_del) :: number)
+		ed.raw.evolve = if #shown == 0 then nil else shown
+		touch(ed)
+		check_now(st)
+		return
+	end
+	local evolve_sug = string.match(act, "^evolve%-sug:(%d+)$")
+	if evolve_sug then
+		local items = ed.suggest.evolve
+		local value = items and items[tonumber(evolve_sug) :: number]
+		if type(value) == "string" then
+			local cur: { string } = {}
+			for _, item in str_list(ed.raw.evolve) do
+				if item ~= "*" then
+					table.insert(cur, item)
+				end
+			end
+			if add_chip({ ids = cur }, "ids", value) then
+				ed.raw.evolve = cur
+				local f = ed.buf[EVOLVE_ADD_ID]
+				if f then
+					f.text = ""
+					f.cursor = 0
+				end
+				touch(ed)
+				check_now(st)
+			end
+		end
+		return
+	end
+	if act == "evolve-add" then
+		local f = ed.buf[EVOLVE_ADD_ID]
+		local name = util.trim(if f then f.text else "")
+		if name == "" then
+			return
+		end
+		if name == "*" then
+			ed.raw.evolve = { "*" }
+		else
+			local cur: { string } = {}
+			for _, item in str_list(ed.raw.evolve) do
+				if item ~= "*" then
+					table.insert(cur, item)
+				end
+			end
+			if add_chip({ ids = cur }, "ids", name) then
+				ed.raw.evolve = cur
+			end
+		end
+		if f then
+			f.text = ""
+			f.cursor = 0
+		end
+		touch(ed)
+		check_now(st)
+		return
+	end
+	if string.sub(act, 1, 5) == "icon:" or string.sub(act, 1, 6) == "sched:" or string.sub(act, 1, 3) == "gh:" or string.sub(act, 1, 6) == "roost:" then
 		on_menu(st, ed, act)
 	end
 end
@@ -2585,6 +3001,33 @@ local function on_switch(st: any, ed: Editor, id: string, value: boolean)
 		ed.raw.manual = value
 		touch(ed)
 		check_now(st)
+		return
+	end
+	if string.find(id, ".advanced.evolveall", 1, true) then
+		if value then
+			ed.raw.evolve = { "*" }
+		else
+			local cur: { string } = {}
+			for _, item in str_list(ed.raw.evolve) do
+				if item ~= "*" then
+					table.insert(cur, item)
+				end
+			end
+			ed.raw.evolve = if #cur == 0 then nil else cur
+		end
+		touch(ed)
+		check_now(st)
+		return
+	end
+	local step_i = index_in(id, "%.s")
+	if step_i and (string.sub(id, -5) == ".keep" or string.sub(id, -6) == ".focus") then
+		local step = steps_of(ed.raw)[step_i]
+		if type(step) == "table" and step_kind(step) == "tab" and step.tab ~= "close" then
+			local key = if string.sub(id, -5) == ".keep" then "keep" else "focus"
+			step[key] = if value then true else nil
+			touch(ed)
+			check_now(st)
+		end
 		return
 	end
 	local assoc = string.match(id, "assoc(%d+)$")
@@ -2657,8 +3100,8 @@ function M.event(st: any, ev: any): boolean
 end
 
 local function commit_chip(st: any, ed: Editor, id: string): boolean
-	if id == LIBS_ADD_ID then
-		on_action(st, ed, "lib-add")
+	if id == LIBS_ADD_ID or id == EVOLVE_ADD_ID then
+		on_action(st, ed, if id == LIBS_ADD_ID then "lib-add" else "evolve-add")
 		return true
 	end
 	if id == FILE_ADD_ID then

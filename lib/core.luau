@@ -14,6 +14,9 @@ local loginenv = require("./loginenv")
 local files = require("./files")
 local bundle = require("./bundle")
 local toml = require("./toml")
+local evolve = require("./evolve")
+local upgrade = require("./upgrade")
+local tabs = require("./tabs")
 
 local M = {}
 
@@ -104,6 +107,7 @@ export type Core = {
 	omp_models: OmpModels?,
 	login: loginenv.State, -- the login-shell environment local tools and shell steps inherit
 	login_waiters: { () -> () }, -- actions waiting for the first capture
+	book: evolve.Book, -- evolvers' revisions and firing record (lib/evolve.luau)
 }
 
 local DEFAULT_CONFIG = [[
@@ -664,6 +668,11 @@ end
 
 -- Defined with the export functions below.
 local prune_exports: (c: Core) -> number
+-- Defined with the self-iteration functions at the end.
+local evolve_host: (c: Core) -> evolve.Host
+local on_finished: (c: Core, run: store.Run) -> ()
+local watch_upgrades: (c: Core, run: string?) -> ()
+local check_daemon: (c: Core, done: () -> ()) -> ()
 
 function M.housekeep(c: Core, manual: boolean)
 	if manual and not c.store.policy then
@@ -679,6 +688,7 @@ function M.housekeep(c: Core, manual: boolean)
 	end
 	local exports = if c.store.policy then prune_exports(c) else 0
 	local orphans = store.sweep(c.store, SWEEP_CAP)
+	evolve.expire(evolve_host(c), c.book)
 	if runs > 0 then
 		runner.save(c.runner)
 	end
@@ -772,6 +782,7 @@ function M.new(data: string): Core
 		omp_models = nil,
 		login = loginenv.new(),
 		login_waiters = {},
+		book = evolve.load(data),
 	}
 	c.runner = runner.new({
 		data = data,
@@ -793,6 +804,30 @@ function M.new(data: string): Core
 		now = now,
 		app_token = function(repo, cb)
 			M.app_token(c, repo, cb)
+		end,
+		plugin_dir = tern.plugin.dir,
+		evolve_prepare = function(run, wf)
+			return evolve.prepare(evolve_host(c), c.book, run, wf)
+		end,
+		finished = function(run)
+			-- Outside the runner's call: applying a revision saves workflows.toml, and firing
+			-- submits runs.
+			local id = run.id
+			tern.timer(0, function()
+				local cur = c.store.by_id[id]
+				if cur then
+					local ok, err = pcall(function(): string?
+						on_finished(c, cur :: store.Run)
+						return nil
+					end)
+					if not ok then
+						tern.log.warn("roost: after-run hook failed", err)
+						M.notice(c, "error", `运行结束后的自迭代处理出错:{err}`)
+						-- A revision it was writing stays "applying": undo it now, not at the next start.
+						pcall(evolve.recover, evolve_host(c), c.book)
+					end
+				end
+			end)
 		end,
 	})
 	local client_id = (function(): string
@@ -862,13 +897,28 @@ function M.start(c: Core)
 	end
 	table.move(saved, 1, #saved, 1, c.events)
 	watch_loop(c)
+	-- A revision cut off part way by the last VM is undone before anything else runs.
+	evolve.recover(evolve_host(c), c.book)
 	login_loop(c)
-	runner.recover(c.runner)
+	-- Tab records are checked against the running daemon before a recovered run-end close can
+	-- use one.
+	-- Operations left from the last VM wait (not announced) until then: recover publishes them again.
+	pcall(tern.kv.set, tabs.KV, {})
+	check_daemon(c, function()
+		runner.recover(c.runner)
+	end)
 	housekeep_loop(c)
 	local wait = 60 - (now() % 60) + 1
 	tern.timer(wait * 1000, function()
 		cron_tick(c)
 	end)
+	watch_upgrades(c, nil)
+end
+
+-- Called by host.luau once everything is defined: a pending self-upgrade (lib/upgrade.luau)
+-- takes this as the new version having loaded.
+function M.booted(c: Core)
+	upgrade.write_boot(c.data, now())
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -885,7 +935,7 @@ local function default_repo(w: model.Workflows, wf: model.Workflow): string?
 			if repo then
 				found[repo] = true
 			end
-		else
+		elseif t.kind == "github" then
 			local repos = (t :: model.GithubTrigger).repos
 			open = open or #repos == 0
 			for _, name in repos do
@@ -1184,7 +1234,7 @@ local function runtime_issues(c: Core, wf: model.Workflow, out: { model.Issue })
 			if ct.schedule == "once" and ct.at and ct.at <= now() then
 				table.insert(out, { file = "workflows.toml", path = `{path}.at`, message = "这个时间已经过去,不会再触发", line = ct.line })
 			end
-		elseif known and me == nil then
+		elseif tr.kind == "github" and known and me == nil then
 			local gt = tr :: model.GithubTrigger
 			local uses_me = table.find(gt.authors, "@me") ~= nil or table.find(gt.assignees, "@me") ~= nil
 			if uses_me or gt.ignore_self then
@@ -2466,6 +2516,239 @@ function M.clear_relay_events(c: Core)
 		local n = if type(body) == "table" and type(body.removed) == "number" then body.removed else 0
 		M.notice(c, if ok then "success" else "error", if ok then `已删除中继缓存的 {n} 个事件` else msg)
 	end)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Self-iteration: evolvers' revisions (lib/evolve.luau) and Roost's own upgrades (lib/upgrade.luau).
+
+local function issues_text(issues: { model.Issue }): string
+	local parts: { string } = {}
+	for i, it in issues do
+		if i > 3 then
+			table.insert(parts, `等 {#issues} 个问题`)
+			break
+		end
+		table.insert(parts, `{it.path}:{it.message}`)
+	end
+	return table.concat(parts, ";")
+end
+
+-- A library's files replaced like an editor save: only what was in `base` goes, and a file
+-- changed on disk since `base` stops it.
+local function save_library_tree(c: Core, name: string, tree: { [string]: string }, base: { [string]: string }): string?
+	local root, err = lib_root(c, name)
+	if root == nil then
+		return err
+	end
+	if store.pending(c.store, root :: string) then
+		return `文件库 "{name}" 正在删除`
+	end
+	local ferr = files.replace(root :: string, tree, base)
+	if ferr == nil then
+		M.changed(c)
+	end
+	return ferr
+end
+
+function evolve_host(c: Core): evolve.Host
+	return {
+		data = c.data,
+		store = c.store,
+		workflows = function()
+			return c.workflows
+		end,
+		valid = function()
+			return c.workflows ~= nil and #c.workflow_issues == 0
+		end,
+		text = function()
+			local text = current_text(c)
+			return text
+		end,
+		now = now,
+		save_workflow = function(id, raw, wfiles, base)
+			local issues = M.save_workflow(c, id, raw, wfiles, base)
+			return if issues and #issues > 0 then issues_text(issues) else nil
+		end,
+		save_library = function(name, tree, base)
+			return save_library_tree(c, name, tree, base)
+		end,
+		save_files = function(id, wfiles, base)
+			if not model.valid_lib(id) then
+				return `工作流 id "{id}" 无效`
+			end
+			if store.pending(c.store, files.workflow_home(c.data, id)) then
+				return `工作流 "{id}" 的文件正在删除`
+			end
+			local err = files.replace(files.workflow_root(c.data, id), wfiles, base)
+			if err == nil then
+				M.changed(c)
+			end
+			return err
+		end,
+		check = function(id)
+			local raw = M.workflow_raw(c, id)
+			if raw == nil then
+				return `workflows.toml 里没有工作流 {id}`
+			end
+			local issues = M.check_workflow(c, id, raw)
+			return if #issues > 0 then issues_text(issues) else nil
+		end,
+		discard = function(path)
+			store.discard(c.store, path)
+			M.changed(c)
+		end,
+		notice = function(level, text)
+			M.notice(c, level, text)
+		end,
+		log = function(id, lines)
+			runner.log(c.runner, id, lines)
+		end,
+	}
+end
+
+-- After a run finished: an evolver's success applies its changes; the run counts toward the
+-- revisions watching its workflow (which may undo one); a failure may start an evolver (not when
+-- it just undid a revision of that workflow: the cause is known).
+function on_finished(c: Core, run: store.Run)
+	local h = evolve_host(c)
+	local w = c.workflows
+	local wf = if w then w.by_id[run.workflow] else nil
+	if run.state == "success" and wf and wf.evolve then
+		local lines = evolve.apply(h, c.book, run)
+		if #lines > 0 then
+			runner.log(c.runner, run.id, lines)
+		end
+	end
+	for _, s in run.steps do
+		if s.kind == "upgrade" and s.state == "success" then
+			-- The handoff happened (or there was nothing to apply): say how it ends.
+			watch_upgrades(c, run.id)
+		end
+	end
+	local rolled = evolve.observe(h, c.book, run)
+	if table.find(rolled, run.workflow) == nil then
+		for _, f in evolve.fire(h, c.book, run) do
+			local ws = c.workflows
+			local repo = if ws then default_repo(ws, f.workflow) else nil
+			local _, err = runner.submit(c.runner, f.workflow, {
+				trigger = { kind = "roost", detail = f.detail },
+				repo = repo,
+				ref = if repo and ws and ws.repos[repo] then ws.repos[repo].branch else nil,
+				inputs = defaults(f.workflow),
+				evolve = { target = f.target, run = f.run },
+			})
+			if err then
+				M.notice(c, "error", `无法启动 {f.workflow.name}:{err}`)
+			end
+		end
+	end
+	M.changed(c)
+end
+
+-- Says once how the latest self-upgrade ended (its result file outlives the reload it caused).
+-- False while there is nothing final to say yet: it is still being applied, or `want` (a run
+-- whose upgrade step just handed off) has no result yet.
+local function report_upgrades(c: Core, want: string?): boolean
+	local r = upgrade.results(c.data, 1)[1]
+	if r == nil or (want and r.run ~= want) then
+		return want == nil
+	elseif r.state == "applying" then
+		return false
+	end
+	local key = `{r.run}:{r.state}`
+	local ok, seen = pcall(tern.kv.get, "upgrade_seen")
+	if ok and seen == key then
+		return true
+	end
+	pcall(tern.kv.set, "upgrade_seen", key)
+	local level = if r.state == "applied"
+		then "success"
+		elseif r.state == "rolled_back" or r.state == "failed" then "error"
+		else "warning"
+	M.notice(c, level, `Roost 自升级:{upgrade.describe(r)}`)
+	M.changed(c)
+	return true
+end
+
+-- How long an upgrade's outcome is waited for, and how often it is looked at meanwhile.
+local UPGRADE_WATCH = 300
+local UPGRADE_POLL_MS = 3000
+local upgrade_watch: { until_: number, want: string? }? = nil
+
+-- Reports the latest upgrade's outcome, looking again every few seconds until there is one (at
+-- most UPGRADE_WATCH); `run`: the run whose upgrade step just handed off. One loop at a time.
+function watch_upgrades(c: Core, run: string?)
+	local running = upgrade_watch ~= nil
+	upgrade_watch = { until_ = now() + UPGRADE_WATCH, want = run }
+	if running then
+		return
+	end
+	local function look()
+		local w = upgrade_watch
+		if w == nil or report_upgrades(c, w.want) or now() >= w.until_ then
+			upgrade_watch = nil
+			return
+		end
+		tern.timer(UPGRADE_POLL_MS, look)
+	end
+	look()
+end
+
+-- Tabs Roost recorded belong to the Tern daemon that showed them: once another daemon runs (a
+-- restart may hand the same pane ids to new panes), the records are dropped so no pane is closed
+-- by mistake. The daemon is told apart by its pid and start time (the parent of our processes);
+-- when it can't be told, the records go too. `done` runs once that is settled.
+function check_daemon(c: Core, done: () -> ())
+	local function purge()
+		for _, path in tabs.entries(c.data) do
+			pcall(tern.fs.remove, path)
+		end
+	end
+	local ok, err = pcall(function(): string?
+		tern.process.run(
+			{ "/bin/sh", "-c", 'l=$(ps -o lstart= -p "$PPID") && [ -n "$l" ] && printf "%s %s" "$PPID" "$l"' },
+			{ timeout_ms = 5000 },
+			function(res)
+				local id = util.trim(res.stdout or "")
+				if res.status ~= 0 or res.timed_out or id == "" then
+					purge()
+				else
+					local okk, was = pcall(tern.kv.get, "daemon")
+					if not (okk and was == id) then
+						purge()
+					end
+					pcall(tern.kv.set, "daemon", id)
+				end
+				done()
+			end
+		)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot identify the Tern daemon", err)
+		purge()
+		done()
+	end
+end
+
+-- Evolvers' revisions, newest first.
+function M.revisions(c: Core): { evolve.Revision }
+	return evolve.list(c.book)
+end
+
+-- Undoes revision `n` by hand.
+function M.rollback_revision(c: Core, n: number): string?
+	local err = evolve.rollback(evolve_host(c), c.book, n, "手动回滚")
+	if err == nil then
+		M.notice(c, "success", `已回滚迭代修订 #{n}`)
+	end
+	M.changed(c)
+	return err
+end
+
+-- Roost's own upgrades, newest first.
+function M.upgrades(c: Core, n: number): { upgrade.Result }
+	return upgrade.results(c.data, n)
 end
 
 return M

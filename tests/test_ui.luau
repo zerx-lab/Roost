@@ -690,4 +690,46 @@ do -- storage lists the new areas and clears exports with two clicks
 	eq(#w.core.exports(w.c), 0, "exports cleared")
 end
 
+do -- overview lists evolver revisions and a self-upgrade; only a watching one rolls back
+	local book = [[{"revs":[{"n":1,"at":1793870000,"run":"bbb","reviewer":"evolver","workflows":["plain"],"libs":[],"watch":["plain"],"state":"rolled_back","baseline":{},"seen":{}},{"n":2,"at":1793880000,"run":"aaa","reviewer":"evolver","workflows":["triage"],"libs":["kit"],"watch":["triage"],"state":"watching","baseline":{},"seen":{},"note":"tighten the prompt"}],"next":3,"last":{},"day":{}}]]
+	local up = [[{"run":"abc","old":"1111111111aaaa","new":"2222222222bbbb","state":"applied","message":"upgraded roost","at":1793881000}]]
+	local w = world({
+		[DATA .. "/workflows.toml"] = WORKFLOWS,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/revisions.json"] = book,
+		[DATA .. "/upgrades/ab.json"] = up,
+	})
+	w.st.tab = "overview"
+	local got: { number } = {}
+	w.core.rollback_revision = function(_c: any, n: number): string?
+		table.insert(got, n)
+		return "refused"
+	end
+	local page = view(w)
+	local text = F.text(page.main)
+	truthy(string.find(text, "自迭代", 1, true), "card title")
+	truthy(string.find(text, "#2", 1, true) and string.find(text, "观察中", 1, true), "watching revision")
+	truthy(string.find(text, "@kit", 1, true), "changed library")
+	truthy(string.find(text, "已回滚", 1, true), "rolled back revision")
+	truthy(string.find(text, "已升级", 1, true) and string.find(text, "upgraded roost", 1, true), "upgrade row")
+	eq(string.find(text, "还没有迭代修订", 1, true), nil)
+	eq(string.find(text, "还没有自升级记录", 1, true), nil)
+	local actions: { string } = {}
+	F.walk(page.main, function(x)
+		local click = x.p and x.p.actions and x.p.actions.click
+		if type(click) == "string" and string.find(click, "rollback-rev:", 1, true) then
+			table.insert(actions, click)
+		end
+	end)
+	eq(#actions, 1, "only the watching revision offers rollback")
+	eq(actions[1], "confirm=rollback-rev:2")
+	w.ui.event(w.st, { ev = "action", act = "confirm", value = "rollback-rev:2" })
+	eq(#got, 0, "the first click only arms it")
+	w.env.advance(1000)
+	w.ui.event(w.st, { ev = "action", act = "confirm", value = "rollback-rev:2" })
+	eq(#got, 1, "the second click rolls back")
+	eq(got[1], 2)
+	truthy(string.find(w.cx.toasts[#w.cx.toasts].text, "refused", 1, true), "rollback error is toasted")
+end
+
 print("ok")

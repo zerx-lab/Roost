@@ -166,6 +166,63 @@ args = ["triage-scan"]        # 作为命令行参数传给脚本
 - **导入**:「导入」填路径或 exports 里的文件名,先预览再导入。导入的工作流一律**停用**,需检查后手动启用;已存在的工作流、内容不同的库只在「覆盖导入」时替换。仓库的本机检出路径需要自己在 `workflows.toml` 里填。校验全部通过才开始写,先写文件、最后写 `workflows.toml`(带 `.bak`)。
 - 老的 FluxDown 流水线可以用 `scripts/migrate-fluxdown.py` 一次性迁入文件库 `fluxdown`(有排队或运行中的 FluxDown 运行时拒绝执行)。
 
+### 标签页、自迭代与自升级
+
+**标签页步骤**:工作流可以开关 Tern 标签页,但只能关 Roost 自己开的。
+
+```toml
+[[workflow.step]]
+name = "打开日志"
+tab = "open"                       # open | close
+key = "logs"                       # 标签页的键,按工作流区分(别的工作流关不到它)
+command = "tail -f \"$ROOST_RUN_DIR/log.txt\""   # 可选;留空则打开 shell
+title = "运行日志"                 # 可选,默认步骤名
+keep = false                       # 默认 false:运行结束时自动关闭;true 则保留到 tab = "close"
+focus = false                      # 默认在 Roost 会话后台打开;true 则在当前会话打开并切过去
+
+[[workflow.step]]
+tab = "close"
+key = "logs"
+```
+
+- 由 Tern 窗口执行:host 把操作写进 `tabs/ops/`,窗口用 `mkdir` 认领(多个窗口只有一个执行),120 秒内没有本机窗口处理则该步失败。
+- 每个打开的标签页登记在 `tabs/open/<工作流>.<键>.json`(pane id 与块类型);关闭前核对 pane 仍在、类型没变,对不上就只删登记不关。手动关掉的标签页会从登记里移除。同一个键再次 open 会先关掉旧的。
+- `command` 不做模板替换,经一个只含 `ROOST_*`(运行 id、目录、工作区、文件、状态、输入与输出)的环境文件启动,不含令牌。
+
+**工作流自迭代**:设置了 `evolve` 的工作流是「迭代者」,可以改其他工作流的脚本、提示词和 `[[workflow]]` 块。
+
+```toml
+[[workflow]]
+id = "doctor"
+evolve = ["*"]                     # 或具体 id;不能包括自己,被迭代的工作流不能再有 evolve
+concurrency = "skip"
+
+[[workflow.trigger]]
+roost = "run_failed"               # 被迭代的工作流失败或超时时触发(中断、取消不算)
+streak = 1                         # 连续这么多次才触发
+# workflows = ["triage"]           # 可选:只对这些工作流
+
+[[workflow.trigger]]               # 也可以定时巡检
+schedule = "daily"
+time = "04:00"
+
+[[workflow.step]]
+omp = "迭代材料在 {{evolve_dir}},先读 README.md……触发的工作流 {{evolve_target}},运行 {{evolve_run}}"
+```
+
+- 迭代者的每次运行先有一步「准备迭代材料」,写进 `runs/<id>/evolve/`:`digest.md`/`digest.json`(最近 10 次运行、近 7 天健康度、以往修订)、`logs/`(失败日志末尾各 48 KiB)、`base/` 与可编辑的 `edit/`(`workflows/<id>/workflow.toml` + `files/`,以及只被这些工作流使用的文件库)。
+- 运行**成功**结束后,Roost 比较 `edit/` 与 `base/`,和编辑器保存走同一套校验后自动应用;期间被别处改过的工作流跳过,改 id、加 `evolve` 的改动丢弃。每次应用记为一个修订,修订前后的快照在 `revisions/<n>/`。
+- **自动回滚**:之后被改动工作流(和用到被改文件库的工作流)的运行会被观察:至少 2 次失败且失败率比修订前高 25% 以上就恢复修订前的快照(修订后又被别处改过的不自动恢复);观察 5 次运行或 7 天后保留。总览页「自迭代」卡片列出修订,可手动回滚。
+- 防止空转:同一迭代者对同一工作流 30 分钟内只触发一次,每天最多 20 次;迭代者自己的失败不触发;刚被自动回滚的那次失败也不触发。费用用工作流的 `daily_budget` 限制。
+- 模板库「自迭代」组里有现成的「工作流自迭代」。
+
+**Roost 自升级**:`upgrade = true` 步骤把本次运行 worktree 里的新提交应用到 Roost 自己的插件目录,这是插件唯一会写插件目录的地方,而且只在插件进程外进行。
+
+1. 先克隆插件目录作为源码仓库,并在 `workflows.toml` 声明:`git clone <插件目录> ~/Library/Application\ Support/Tern/plugin-data/roost/repos/roost`,`[repos."local/roost"] path = "<上面的目录>"`、`branch = "main"`。
+2. 工作流在这个仓库的 worktree 里运行(`workspace = "worktree"`,`identity = "local"`):omp 步骤改代码、跑 `scripts/check.sh`、`git commit`,最后一步 `upgrade = true`。模板「Roost 自升级」就是这样。
+3. `upgrade` 步骤检查:`tern` 在 PATH 上,提交必须是插件目录当前 HEAD 的后续、插件目录没有未提交的修改且在分支上,然后在一个干净的 worktree 里用**插件当前版本**的 `scripts/check.sh` 检查这个提交(提交改不了评判自己的检查)。通过后交给后台脚本(`upgrade/<运行>.apply.sh`,结束时自删)。
+4. 后台脚本 fast-forward 插件目录,执行 `tern plugin reload roost`,等新版本 host 加载完写出 `boot.txt`;重载失败或 90 秒内没有新的 boot,就 `git reset --keep` 回到旧提交并再重载。结果写进 `upgrades/<运行>.json`,下次启动时以通知报告,总览页「自迭代」卡片也列出最近的升级。
+
 ### 数据保留与清理
 
 长期积累的数据都有自动清理和手动清理两种方式:

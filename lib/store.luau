@@ -17,7 +17,7 @@ local M = {}
 
 export type StepRec = {
 	name: string,
-	kind: string, -- auth | prepare | omp | run | cleanup
+	kind: string, -- auth | prepare | evolve | omp | run | file | tab | upgrade | cleanup
 	state: string, -- pending | running | success | failed | skipped
 	exit_code: number?,
 	started_at: number?,
@@ -29,6 +29,11 @@ export type StepRec = {
 	replied: boolean?, -- agent step: the log already holds the final answer
 	cost: number?, -- agent step: estimated USD from its session files (subagents included), once it ended
 	tokens: number?, -- agent step: total tokens from the same files
+	tab_op: string?, -- tab step: its queued operation (lib/tabs.luau)
+	-- tab step: the key whose tab the run's end may close (nil once no window ever took the
+	-- operation), and whether it outlives the run (close steps: always)
+	tab_key: string?,
+	tab_keep: boolean?,
 }
 
 export type Run = {
@@ -63,6 +68,9 @@ export type Run = {
 	app: { login: string, email: string, expires: number }?,
 	-- `key=value` lines steps appended to $ROOST_OUTPUT (later steps see them as out.<key>).
 	outputs: { [string]: string }?,
+	-- A run an evolver started because a target failed (lib/evolve.luau): that workflow and its run.
+	evolve_target: string?,
+	evolve_run: string?,
 }
 
 export type Store = {
@@ -262,7 +270,7 @@ local function plain_name(name: string): boolean
 end
 
 -- Top-level directories whose entries Roost may delete (one plain name below them).
-local OWNED = { "runs", "worktrees", "workflows", "library", "state", "exports" }
+local OWNED = { "runs", "worktrees", "workflows", "library", "state", "exports", "revisions" }
 
 -- A path Roost may delete: exactly `<sub>/<name>` for a sub in OWNED, or a run's scratch
 -- directory `runs/<name>/tmp`, under an absolute data dir.

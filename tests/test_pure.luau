@@ -501,4 +501,43 @@ do -- file steps: own files or @library/path, run by extension; libraries they n
 	eq(again.step[1].args[1], "x")
 end
 
+do -- tab / upgrade steps, evolve scopes and roost triggers
+	local function first(text: string): string?
+		local _, issues = model.parse_workflows(text)
+		return if issues[1] then `{issues[1].path}: {issues[1].message}` else nil
+	end
+	local tabwf = '[[workflow]]\nid = "t"\n[[workflow.step]]\ntab = "open"\nkey = "logs"\ncommand = "tail -f x"\nkeep = true\n'
+		.. '[[workflow.step]]\ntab = "close"\nkey = "logs"\n'
+	local w = model.parse_workflows(tabwf) :: model.Workflows
+	local open = w.by_id.t.steps[1]
+	eq(open.kind, "tab")
+	eq((open.tab :: model.TabStep).action, "open")
+	eq((open.tab :: model.TabStep).keep, true)
+	eq((open.tab :: model.TabStep).focus, false, "background by default")
+	eq((w.by_id.t.steps[2].tab :: model.TabStep).action, "close")
+	local again = model.parse_workflows(model.encode_workflow(model.raw_workflow(tabwf, "t") :: any)) :: model.Workflows
+	eq((again.by_id.t.steps[1].tab :: model.TabStep).command, "tail -f x", "tab steps survive the encoder")
+	assert(string.find(first('[[workflow]]\nid = "t"\n[[workflow.step]]\ntab = "close"\nkey = "a"\nkeep = true\n') or "", "只用于 tab = \"open\"", 1, true))
+	assert(string.find(first('[[workflow]]\nid = "t"\n[[workflow.step]]\ntab = "open"\nkey = "a b"\n') or "", "标签页键", 1, true))
+	assert(string.find(first('[[workflow]]\nid = "t"\n[[workflow.step]]\nrun = "x"\nkey = "a"\n') or "", "只用于 tab 步骤", 1, true))
+	assert(string.find(first('[[workflow]]\nid = "t"\n[[workflow.step]]\nrun = "x"\ntab = "open"\nkey = "a"\n') or "", "只能选一个", 1, true))
+	assert(string.find(first('[[workflow]]\nid = "u"\nworkspace = "temp"\n[[workflow.step]]\nupgrade = true\n') or "", "worktree", 1, true))
+	eq((model.parse_workflows('[[workflow]]\nid = "u"\n[[workflow.step]]\nupgrade = true\n') :: model.Workflows).by_id.u.steps[1].kind, "upgrade")
+
+	local base = '[[workflow]]\nid = "a"\n[[workflow.step]]\nrun = "true"\n[[workflow]]\nid = "b"\n[[workflow.step]]\nrun = "true"\n'
+	local ev = model.parse_workflows(base .. '[[workflow]]\nid = "d"\nevolve = ["*"]\n[[workflow.trigger]]\nroost = "run_failed"\nstreak = 2\n[[workflow.step]]\nrun = "true"\n') :: model.Workflows
+	local targets = model.evolve_targets(ev, ev.by_id.d)
+	eq(table.concat(targets, ","), "a,b", "* is every workflow that evolves none itself")
+	eq((ev.by_id.d.triggers[1] :: model.RoostTrigger).streak, 2)
+	eq(model.describe_trigger(ev.by_id.d.triggers[1]), "被迭代的工作流连续 2 次失败")
+	assert(string.find(first(base .. '[[workflow]]\nid = "d"\nevolve = ["d"]\n[[workflow.step]]\nrun = "true"\n') or "", "不能迭代自己", 1, true))
+	assert(string.find(first(base .. '[[workflow]]\nid = "d"\nevolve = ["zz"]\n[[workflow.step]]\nrun = "true"\n') or "", "没有工作流", 1, true))
+	assert(string.find(first(base .. '[[workflow]]\nid = "d"\nevolve = ["*"]\n[[workflow.step]]\nrun = "true"\n[[workflow]]\nid = "e"\nevolve = ["d"]\n[[workflow.step]]\nrun = "true"\n') or "", "不能被迭代", 1, true))
+	assert(string.find(first(base .. '[[workflow]]\nid = "d"\n[[workflow.trigger]]\nroost = "run_failed"\n[[workflow.step]]\nrun = "true"\n') or "", "evolve", 1, true))
+	assert(string.find(first(base .. '[[workflow]]\nid = "d"\nevolve = ["a"]\n[[workflow.trigger]]\nroost = "run_failed"\nworkflows = ["b"]\n[[workflow.step]]\nrun = "true"\n') or "", "不在 evolve 范围内", 1, true))
+	local evraw = model.raw_workflow(base .. '[[workflow]]\nid = "d"\nevolve = ["a"]\n[[workflow.trigger]]\nroost = "run_failed"\n[[workflow.step]]\nrun = "true"\n', "d") :: any
+	local enc = model.encode_workflow(evraw)
+	assert(string.find(enc, 'evolve = ["a"]', 1, true) and string.find(enc, 'roost = "run_failed"', 1, true), enc)
+end
+
 print("ok")

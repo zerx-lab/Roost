@@ -53,6 +53,17 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	launcher.on_finished(L, ev, cx)
 end)
 
+-- A tab Roost opened was closed (by hand or otherwise): it leaves the registry.
+tern.on("pane_closed", function(ev: PaneEvent, _cx: WindowCx)
+	local ok, err = pcall(function(): string?
+		launcher.on_pane_closed(L, ev)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: pane_closed failed", err)
+	end
+end)
+
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	if launcher.route(L, cx, link.url) then
 		return { handled = true }

@@ -16,6 +16,8 @@ local util = require("./util")
 local agent = require("./agent")
 local editor = require("./editor")
 local stats = require("./stats")
+local evolve = require("./evolve")
+local upgrade = require("./upgrade")
 local files = require("./files")
 
 local ui = tern.ui
@@ -146,7 +148,34 @@ local STATE_TONE: { [string]: string } = {
 }
 local TRIGGER_LABEL: { [string]: string } = { github = "GitHub", cron = "定时", manual = "手动", rerun = "重跑" }
 local TRIGGER_ICON: { [string]: string } = { github = "branch", cron = "clock", manual = "user", rerun = "redo" }
-local STEP_ICON: { [string]: string } = { auth = "plug", omp = "omp", run = "terminal", file = "file-code", prepare = "folder-plus", cleanup = "trash" }
+local STEP_ICON: { [string]: string } = {
+	auth = "plug",
+	omp = "omp",
+	run = "terminal",
+	file = "file-code",
+	prepare = "folder-plus",
+	cleanup = "trash",
+	evolve = "pen",
+	tab = "open",
+	upgrade = "repeat",
+}
+-- Step kinds whose icon alone doesn't say what they are.
+local STEP_LABEL: { [string]: string } = { evolve = "迭代材料", tab = "标签页", upgrade = "升级 Roost" }
+local REV_LABEL: { [string]: string } = {
+	applying = "应用中",
+	watching = "观察中",
+	kept = "已保留",
+	rolled_back = "已回滚",
+	superseded = "已被取代",
+	failed = "失败",
+}
+local REV_TONE: { [string]: string } = {
+	watching = "accent",
+	kept = "success",
+	rolled_back = "warning",
+	superseded = "muted",
+	failed = "error",
+}
 local SYNC_LABEL: { [string]: string } = {
 	idle = "待核对",
 	pushing = "推送中",
@@ -707,6 +736,59 @@ local function health_table(st: State, t: number): Node
 	)
 end
 
+local function changed_line(workflows: { string }, libs: { string }): string
+	local parts: { string } = table.clone(workflows)
+	for _, lib in libs do
+		table.insert(parts, `@{lib}`)
+	end
+	return if #parts == 0 then "—" else table.concat(parts, "、")
+end
+
+-- Revisions an evolver applied, and Roost's own upgrades. Lists, not tables: a card must not wrap a table.
+local function evolve_card(st: State, t: number): Node
+	local c = st.core
+	local rows: { Node } = {}
+	local revs = core.revisions(c)
+	local shown = math.min(#revs, 20)
+	for i = 1, shown do
+		local rev: evolve.Revision = revs[i]
+		local bits: { Node } = {
+			keyed(ui.badge(REV_LABEL[rev.state] or rev.state, REV_TONE[rev.state] or "muted"), "state"),
+			keyed(ui.text({
+				ui.span(`#{rev.n}`, "mono"),
+				ui.span(`  {changed_line(rev.workflows, rev.libs)}`),
+				ui.span(`  {rev.reviewer}`, "muted"),
+			}), "what"),
+			keyed(muted(util.clock(rev.at)), "at"),
+		}
+		if rev.note and rev.note ~= "" then
+			table.insert(bits, keyed(muted(util.clip(rev.note, 80)), "note"))
+		end
+		if rev.state == "watching" or rev.state == "kept" then
+			table.insert(bits, confirm_btn(st, "回滚", "确认回滚", `rollback-rev:{rev.n}`, { key = "rollback", variant = "quiet" }))
+		end
+		table.insert(rows, N("row", { key = `r{rev.n}`, gap = "sm", align = "center" }, bits))
+	end
+	if #rows == 0 then
+		table.insert(rows, keyed(muted("还没有迭代修订"), "none"))
+	end
+	local ups: { Node } = {}
+	for i, r in core.upgrades(c, 10) do
+		table.insert(ups, N("row", { key = `u{i}_{r.run}`, gap = "sm", align = "center" }, {
+			keyed(muted(util.clock(r.at)), "at"),
+			keyed(ui.text({ ui.span(upgrade.describe(r)) }), "what"),
+		}))
+	end
+	if #ups == 0 then
+		table.insert(ups, keyed(muted("还没有自升级记录"), "none"))
+	end
+	return ui.card("自迭代", {
+		N("col", { key = "revs", gap = "xs" }, rows),
+		keyed(ui.text({ ui.span("Roost 自升级") }), "up-h"),
+		N("col", { key = "ups", gap = "xs" }, ups),
+	}, { key = "evolve", icon = "repeat" })
+end
+
 local function overview(st: State): Node
 	local c = st.core
 	local t = now()
@@ -800,6 +882,7 @@ local function overview(st: State): Node
 			N("list", { key = "notices" }, notice_items),
 		}))
 	end
+	table.insert(children, evolve_card(st, t))
 	return N("col", { key = "overview", role = "roost.overview", gap = "lg" }, children)
 end
 
@@ -850,10 +933,16 @@ local function steps_table(r: store.Run, t: number): Node
 				ui.span(`  {fmt_usd(s.cost or 0)} · {fmt_tokens(s.tokens)}`, "muted"),
 			}
 		end
+		-- The kinds without an obvious icon say what they are.
+		local kind_label = STEP_LABEL[s.kind]
+		local name_cell: any = {
+			text = if kind_label then { ui.span(s.name), ui.span(`  {kind_label}`, "muted") } else s.name,
+			icon = STEP_ICON[s.kind] or "dot",
+		}
 		table.insert(rows, {
 			id = `s{i}`,
 			cells = list_of(
-				{ text = s.name, icon = STEP_ICON[s.kind] or "dot" },
+				name_cell,
 				state,
 				bar,
 				duration(s.started_at, s.finished_at)
@@ -1153,6 +1242,10 @@ local function workflow_card(st: State, wf: model.Workflow, health: stats.Health
 			table.insert(step_spans, ui.span("  →  ", "muted"))
 		end
 		table.insert(step_spans, ui.span(s.name, if s.kind == "omp" then "accent" else nil))
+		local kind_label = STEP_LABEL[s.kind]
+		if kind_label then
+			table.insert(step_spans, ui.span(` {kind_label}`, "muted"))
+		end
 		if s.when then
 			table.insert(step_spans, ui.span(` {when_label(s.when)}`, "muted"))
 		end
@@ -2573,6 +2666,11 @@ local function confirmed(st: State, what: string)
 		toast_err(st, core.delete_state(c, string.sub(what, 11)))
 	elseif string.sub(what, 1, 11) == "orphan-del:" then
 		toast_err(st, core.delete_workflow_files(c, string.sub(what, 12)))
+	else
+		local n = string.match(what, "^rollback%-rev:(%d+)$")
+		if n then
+			toast_err(st, core.rollback_revision(c, tonumber(n) :: number))
+		end
 	end
 end
 

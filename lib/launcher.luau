@@ -1,14 +1,17 @@
 --!strict
--- Window side of agent steps (protocol in lib/agent.luau). Every window runs one launcher: it
--- claims the jobs the host lists in kv `agent_jobs` (a `mkdir` claim, so exactly one window opens
--- each), opens each as a native agent block in a new tab of the Roost session, and records how it
--- ended; the block is then closed whatever the result. Any window that knows the pane (from
--- s<i>.pane) may record the end, so a reloaded or second window carries on where another left.
+-- Window side of agent steps (protocol in lib/agent.luau) and tab steps (lib/tabs.luau). Every
+-- window runs one launcher: it claims the jobs the host lists in kv `agent_jobs` (a `mkdir` claim,
+-- so exactly one window opens each), opens each as a native agent block in a new tab of the Roost
+-- session, and records how it ended; the block is then closed whatever the result. Any window that
+-- knows the pane (from s<i>.pane) may record the end, so a reloaded or second window carries on
+-- where another left. Tab operations (kv `tab_ops`) are claimed the same way and carried out at
+-- once; the tabs they open are recorded so only those are ever closed.
 --
 -- Also handles the `roost://` links the console and the sidebar open: toggling the sidebar, and
 -- showing a step's conversation (its live tab, or the saved session resumed in a new tab).
 
 local agent = require("./agent")
+local tabs = require("./tabs")
 
 local M = {}
 
@@ -30,10 +33,14 @@ export type Launcher = {
 	data: string,
 	tracked: { [string]: Tracked },
 	claiming: { [string]: boolean },
+	tab_claiming: { [string]: boolean },
+	swept: boolean, -- the tab registry was checked against this window's panes
+	sweep: { list: { string }, at: number }?, -- that check, while it runs a slice per tick
+	index: { [number]: string }, -- pane → registry entry, for the tabs this window knows of
 }
 
 function M.new(data: string): Launcher
-	return { data = data, tracked = {}, claiming = {} }
+	return { data = data, tracked = {}, claiming = {}, tab_claiming = {}, swept = false, sweep = nil, index = {} }
 end
 
 local function key_of(run: string, step: number): string
@@ -346,6 +353,240 @@ function M.tick(L: Launcher, cx: WindowCx)
 		if not listed[key] then
 			untrack(L, t)
 			stop_pane(cx, t.pane)
+		end
+	end
+	M.tab_tick(L, cx)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Tab operations
+
+local function is_local(cx: WindowCx): boolean
+	local ok, cur = pcall(function(): ManagedHost
+		return cx.hosts:current()
+	end)
+	return ok and (cur :: ManagedHost).kind == "local"
+end
+
+local function pane_info(cx: WindowCx, pane: number): PaneInfo?
+	local ok, info = pcall(function(): PaneInfo?
+		return cx.session:pane(pane)
+	end)
+	return if ok then info :: PaneInfo? else nil
+end
+
+local function forget(L: Launcher, path: string, pane: number?)
+	pcall(tern.fs.remove, path)
+	if pane and L.index[pane] == path then
+		L.index[pane] = nil
+	end
+end
+
+-- Closes the tab an entry records, if its pane is still the one Roost opened; the entry goes either
+-- way (after the close, so a reload in between leaves it recorded). Returns what happened.
+local function close_entry(L: Launcher, cx: WindowCx, path: string, e: tabs.Entry): string
+	local info = pane_info(cx, e.pane)
+	if info == nil then
+		forget(L, path, e.pane)
+		return `标签页「{e.key}」已经不在了`
+	elseif info.kind ~= e.kind then
+		forget(L, path, e.pane)
+		return `标签页「{e.key}」记录的 pane 已不是 Roost 打开的那个,没有关闭`
+	end
+	cx.layout:close(e.pane)
+	forget(L, path, e.pane)
+	return `已关闭标签页「{e.key}」`
+end
+
+-- Entries checked against this window's panes per tick, so the first look stays within budget.
+local SWEEP_SLICE = 20
+
+-- The first ticks of a window: drops registry entries whose pane is gone, or now names another
+-- kind of block, and indexes the rest by pane (for pane_closed). A slice per call.
+local function sweep_entries(L: Launcher, cx: WindowCx)
+	if L.sweep == nil then
+		L.sweep = { list = tabs.entries(L.data), at = 1 }
+	end
+	local sw = L.sweep :: { list: { string }, at: number }
+	local stop = math.min(#sw.list, sw.at + SWEEP_SLICE - 1)
+	for k = sw.at, stop do
+		local path = sw.list[k]
+		local e = tabs.read_entry(path)
+		local info = if e then pane_info(cx, e.pane) else nil
+		if e == nil or info == nil or info.kind ~= e.kind then
+			pcall(tern.fs.remove, path)
+		else
+			L.index[e.pane] = path
+		end
+	end
+	sw.at = stop + 1
+	if sw.at > #sw.list then
+		L.swept = true
+		L.sweep = nil
+	end
+end
+
+local function home(): string
+	return tern.getenv("HOME") or "/"
+end
+
+local function open_tab(L: Launcher, cx: WindowCx, op: tabs.Op): tabs.Result
+	local path = tabs.entry_path(L.data, op.workflow, op.key)
+	local old = tabs.read_entry(path)
+	local replaced = ""
+	if old then
+		replaced = close_entry(L, cx, path, old) .. ";"
+	end
+	if #tabs.entries(L.data) >= tabs.MAX_ENTRIES then
+		return { ok = false, message = `Roost 记录的标签页已达 {tabs.MAX_ENTRIES} 个,先关闭一些` }
+	end
+	local cwd = if op.cwd and tern.fs.exists(op.cwd) then op.cwd else home()
+	local focused = cx.session:focused()
+	local pane = cx.layout:new_tab({ cwd = cwd, command = op.command }, { focus = op.focus == true })
+	if pane == nil then
+		return { ok = false, message = `{replaced}无法打开标签页「{op.key}」` }
+	end
+	local where = "当前会话"
+	local tab: number? = nil
+	if not op.focus then
+		-- In the background: the Roost session, with focus left where it was.
+		local sid = roost_session(cx, op.session, cwd)
+		local shown_ok, shown = pcall(function(): ManagedSession
+			return cx.sessions:current()
+		end)
+		if sid and not (shown_ok and (shown :: ManagedSession).id == sid) then
+			local moved_ok, moved, _why = pcall(function(): (number?, string?)
+				return cx.layout:move_to_new_tab(pane, sid, { focus = false })
+			end)
+			if moved_ok and moved then
+				tab = moved :: number
+				where = `会话「{op.session}」`
+			end
+		elseif sid then
+			where = `会话「{op.session}」`
+		end
+		if focused then
+			pcall(function(): string?
+				cx.layout:focus(focused)
+				return nil
+			end)
+		end
+	end
+	local title = op.title or op.key
+	if tab then
+		pcall(function(): string?
+			cx.layout:name_tab(tab :: number, title)
+			return nil
+		end)
+	else
+		name_tab(cx, pane, title)
+	end
+	local info = pane_info(cx, pane)
+	local err = tabs.write_entry(L.data, {
+		workflow = op.workflow,
+		key = op.key,
+		pane = pane,
+		kind = if info and info.kind then info.kind else "terminal",
+		run = op.run,
+		keep = op.keep == true,
+		at = os.time(),
+	})
+	if err then
+		-- Unrecorded, it could never be closed by Roost: don't leave it open.
+		cx.layout:close(pane)
+		return { ok = false, message = `{replaced}无法记录标签页,已关掉它:{err}` }
+	end
+	L.index[pane] = path
+	return { ok = true, message = `{replaced}已在{where}打开标签页「{title}」`, pane = pane }
+end
+
+local function close_tab(L: Launcher, cx: WindowCx, op: tabs.Op): tabs.Result
+	local path = tabs.entry_path(L.data, op.workflow, op.key)
+	local e = tabs.read_entry(path)
+	if e == nil then
+		return { ok = true, message = `没有打开的标签页「{op.key}」` }
+	elseif op.only_run and (e.run ~= op.run or e.keep) then
+		-- A run-end close: the tab was taken over by a later run, or reopened to stay.
+		return { ok = true, message = `标签页「{op.key}」已由后来的运行或保留的步骤接管,保留` }
+	end
+	return { ok = true, message = close_entry(L, cx, path, e :: tabs.Entry) }
+end
+
+local function carry_out(L: Launcher, cx: WindowCx, id: string)
+	local p = tabs.paths(L.data, id)
+	local op = tabs.read_op(p.op)
+	if op == nil then
+		-- The host withdrew it meanwhile.
+		pcall(tern.fs.remove, p.claim)
+		return
+	end
+	local o = op :: tabs.Op
+	if not (string.match(o.workflow, "^[%w_%-]+$") and string.match(o.key, "^[%w_%-]+$")) then
+		tabs.write_result(p.done, { ok = false, message = "标签页操作的工作流或键无效" })
+		return
+	end
+	local ok, res = pcall(function(): tabs.Result
+		return if o.action == "open" then open_tab(L, cx, o) else close_tab(L, cx, o)
+	end)
+	tabs.write_result(p.done, if ok then res :: tabs.Result else { ok = false, message = `标签页操作失败:{res}` })
+end
+
+local function claim_tab(L: Launcher, id: string, claim: string)
+	L.tab_claiming[id] = true
+	local ok, err = pcall(function(): string?
+		tern.process.run({ "/bin/mkdir", claim }, { timeout_ms = 5000 }, function(res: ProcessResult, cx: WindowCx?)
+			L.tab_claiming[id] = nil
+			if res.status == 0 and not res.timed_out then
+				if cx and is_local(cx) then
+					carry_out(L, cx, id)
+				else
+					-- Nowhere to carry it out: let go, so a later tick (or another window) takes it.
+					pcall(tern.fs.remove, claim)
+				end
+			end
+		end)
+		return nil
+	end)
+	if not ok then
+		L.tab_claiming[id] = nil
+		tern.log.warn("roost: cannot claim tab operation", err)
+	end
+end
+
+-- One pass over kv `tab_ops`: claims the operations nobody took yet. Only a window showing this
+-- machine takes them (it sees the panes Roost opened here).
+function M.tab_tick(L: Launcher, cx: WindowCx)
+	if not is_local(cx) then
+		return
+	end
+	if not L.swept then
+		sweep_entries(L, cx)
+	end
+	local ok, v = pcall(tern.kv.get, tabs.KV)
+	if not ok or type(v) ~= "table" then
+		return
+	end
+	for _, id in v do
+		if type(id) == "string" and tabs.valid_id(id) and not L.tab_claiming[id] then
+			local p = tabs.paths(L.data, id)
+			if tern.fs.exists(p.op) and not tern.fs.exists(p.done) and not tern.fs.exists(p.claim) then
+				claim_tab(L, id, p.claim)
+			end
+		end
+	end
+end
+
+-- `pane_closed`: a tab this window recorded (or found in its first sweep) was closed by hand or
+-- otherwise; forget it. Entries other windows recorded are dropped by them, or when a close
+-- finds their pane gone.
+function M.on_pane_closed(L: Launcher, ev: PaneEvent)
+	local path = L.index[ev.pane]
+	if path then
+		L.index[ev.pane] = nil
+		-- Another window may have reopened the key under a new pane since: only this pane's record goes.
+		local e = tabs.read_entry(path)
+		if e and e.pane == ev.pane then
+			pcall(tern.fs.remove, path)
 		end
 	end
 end

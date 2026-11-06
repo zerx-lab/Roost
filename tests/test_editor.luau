@@ -731,4 +731,124 @@ do -- an argument with a space survives opening and saving a file step untouched
 	eq(file_step.args[2], "/tmp/my file")
 end
 
+do -- tab, upgrade, roost and evolve survive a save without omp/run keys
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "keep"',
+		'name = "保留"',
+		"[[workflow.step]]",
+		'omp = "stay"',
+		"[[workflow]]",
+		'id = "iter"',
+		'name = "迭代"',
+		'evolve = ["*"]',
+		"[[workflow.trigger]]",
+		'roost = "run_failed"',
+		'workflows = ["keep"]',
+		"streak = 2",
+		"[[workflow.step]]",
+		'name = "open"',
+		'tab = "open"',
+		'key = "main"',
+		'title = "日志"',
+		'command = "echo hi"',
+		"keep = true",
+		"focus = true",
+		"[[workflow.step]]",
+		'name = "shut"',
+		'tab = "close"',
+		'key = "side"',
+		"[[workflow.step]]",
+		"upgrade = true",
+	}, "\n")
+	local w = world({ [DATA .. "/workflows.toml"] = wf })
+	click(w, "edit=iter")
+	local layer = view(w)
+	truthy(find(layer.layer, function(x)
+		return x.k == "text" and x.p and type(x.p.spans) == "table" and x.p.spans[1] and string.find(x.p.spans[1].t or "", "scripts/check.sh", 1, true)
+	end), "upgrade step shows the muted note")
+	local menu = find(layer.layer, function(x)
+		return x.k == "menu" and x.p and x.p.key == "add"
+	end)
+	local listed = false
+	for _, item in menu.p.items do
+		if item.id == "roost:run_failed" then
+			listed = true
+		end
+	end
+	truthy(listed, "add menu lists roost:run_failed")
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "saved")
+	local text = file_text(w) :: string
+	local block = string.match(text, '%[%[workflow%]%][^\n]*\nid = "iter".*') or text
+	eq(string.find(block, "omp =", 1, true), nil, "save did not inject omp")
+	eq(string.find(block, "run =", 1, true), nil, "save did not inject run")
+	local saved = parsed(w).by_id.iter
+	eq(saved.evolve[1], "*")
+	eq(saved.steps[1].kind, "tab")
+	eq(saved.steps[1].tab.action, "open")
+	eq(saved.steps[1].tab.key, "main")
+	eq(saved.steps[1].tab.title, "日志")
+	eq(saved.steps[1].tab.command, "echo hi")
+	eq(saved.steps[1].tab.keep, true)
+	eq(saved.steps[1].tab.focus, true)
+	eq(saved.steps[2].kind, "tab")
+	eq(saved.steps[2].tab.action, "close")
+	eq(saved.steps[2].tab.key, "side")
+	eq(saved.steps[3].kind, "upgrade")
+	local tr = saved.triggers[1]
+	eq(tr.kind, "roost")
+	eq(tr.on, "run_failed")
+	eq(tr.workflows[1], "keep")
+	eq(tr.streak, 2)
+end
+
+do -- omp → tab → run clears the other kind's keys
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "mix"',
+		"[[workflow.step]]",
+		'omp = "prompt"',
+		"[[workflow.step]]",
+		'name = "extra"',
+		'omp = "do it"',
+		'model = "auto"',
+	}, "\n")
+	local w = world({ [DATA .. "/workflows.toml"] = wf })
+	click(w, "edit=mix")
+	view(w)
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.steps.s2.bar.kind", value = "tab" })
+	local extra = w.st.editor.raw.step[2]
+	eq(extra.tab, "open")
+	eq(extra.key, "main")
+	eq(extra.omp, nil, "tab step has no omp")
+	eq(extra.run, nil)
+	eq(extra.model, nil)
+	eq(extra.upgrade, nil)
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.steps.s2.bar.kind", value = "run" })
+	extra = w.st.editor.raw.step[2]
+	eq(extra.run, "")
+	eq(extra.omp, nil)
+	eq(extra.tab, nil, "leaving tab clears tab")
+	eq(extra.key, nil)
+	eq(extra.title, nil)
+	eq(extra.command, nil)
+	eq(extra.keep, nil)
+	eq(extra.focus, nil)
+	eq(extra.upgrade, nil)
+end
+
+do -- the add-trigger menu item adds a roost trigger
+	local w = world({})
+	click(w, "editor-new")
+	view(w)
+	click(w, "roost:run_failed")
+	local tr = w.st.editor.raw.trigger
+	eq(#tr, 1)
+	eq(tr[1].roost, "run_failed")
+	eq(tr[1].github, nil)
+	eq(tr[1].schedule, nil)
+end
+
+
 print("ok")

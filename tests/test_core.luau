@@ -51,6 +51,8 @@ local function classify(argv: { string }): Proc
 		p.kind = "tally"
 	elseif string.find(script, "UserShell", 1, true) then
 		p.kind = "login"
+	elseif string.find(script, "lstart", 1, true) then
+		p.kind = "daemon"
 	end
 	return p
 end
@@ -105,6 +107,10 @@ local function scenario(files: { [string]: string }, opts: { [string]: any }?): 
 	env.process = function(argv: { string }, popts: any): any
 		local p = classify(argv)
 		p.opts = popts
+		if p.kind == "daemon" then
+			-- Infrastructure too: which Tern daemon runs (core.check_daemon).
+			return { status = 0, stdout = "1 Thu Nov  5 12:00:00 2026", stderr = "", timed_out = false }
+		end
 		if p.kind == "login" then
 			-- Infrastructure, not one of the runner's processes: kept out of `procs`.
 			if s.login == false then
@@ -2178,6 +2184,396 @@ do -- overwrite-importing an export (env values blanked) keeps the env values th
 	truthy(summary, "imported")
 	eq(s.c.workflows.by_id.keys.env.API_KEY, "sk-secret-123", "the local secret was not erased")
 	eq(s.c.workflows.by_id.keys.env.MODE, "x")
+end
+
+local WF_TABS = [==[
+[[workflow]]
+id = "tabs"
+workspace = "temp"
+[[workflow.input]]
+name = "close"
+[[workflow.step]]
+name = "日志"
+when = "!input.close"
+tab = "open"
+key = "logs"
+command = "tail -f \"$ROOST_RUN_DIR/log.txt\""
+[[workflow.step]]
+name = "看板"
+when = "!input.close"
+tab = "open"
+key = "board"
+title = "看板"
+keep = true
+[[workflow.step]]
+name = "关看板"
+when = "input.close"
+tab = "close"
+key = "board"
+[[workflow.step]]
+name = "work"
+run = "echo hi"
+
+[[workflow]]
+id = "other"
+workspace = "temp"
+[[workflow.step]]
+name = "关别人的"
+tab = "close"
+key = "board"
+]==]
+
+do -- tab steps: tabs open in the Roost session; a run's own close at its end; only Roost's are ever closed
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TABS, [DATA .. "/roost.toml"] = LOCAL })
+	local w = window(s)
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0, "tab workflows parse")
+	eq(s.core.dispatch(s.c, "tabs"), nil)
+	step(s, 15)
+	local run = last_run(s)
+	eq(run.state, "success", "run finished: " .. tostring(run.reason))
+	eq(#w.opened, 2, "two tabs opened")
+	local cmd = w.opened[1].command :: string
+	truthy(string.find(cmd, "tail -f", 1, true) and string.find(cmd, `{DATA}/runs/{run.id}/s1.env`, 1, true), "command sources the run's variables: " .. cmd)
+	truthy(string.find(s.env.files[`{DATA}/runs/{run.id}/s1.env`], `export ROOST_RUN_ID='{run.id}'`, 1, true), "env file holds ROOST_*")
+	eq(w.opened[2].command, nil, "no command: a shell")
+	eq(#w.moved, 2, "both moved into the Roost session")
+	eq(w.moved[1].reveal.focus, false)
+	eq(w.focused, 1, "focus left where it was")
+	local logs_pane, board_pane = w.moved[1].pane, w.moved[2].pane
+	eq(w.named[w.panes[board_pane].tab], "看板", "tab named")
+	truthy(table.find(w.closed, logs_pane), "the run's own tab closed at its end")
+	truthy(w.panes[board_pane], "the kept tab stays")
+	eq(s.env.files[DATA .. "/tabs/open/tabs.logs.json"], nil, "the closed tab left the registry")
+	truthy(s.env.files[DATA .. "/tabs/open/tabs.board.json"], "the kept tab is recorded")
+	eq(#s.env.kv.tab_ops, 0, "no operations left")
+
+	-- Another workflow's key of the same name is not this tab.
+	eq(s.core.dispatch(s.c, "other"), nil)
+	step(s, 6)
+	eq(last_run(s).state, "success")
+	truthy(w.panes[board_pane], "another workflow can't close it")
+	truthy(string.find(s.env.files[`{DATA}/runs/{last_run(s).id}/log.txt`], "没有打开的标签页", 1, true), "said so")
+
+	-- Its own workflow closes it.
+	eq(s.core.dispatch(s.c, "tabs", { close = "1" }), nil)
+	step(s, 6)
+	eq(last_run(s).state, "success")
+	truthy(table.find(w.closed, board_pane), "closed by its workflow")
+	eq(s.env.files[DATA .. "/tabs/open/tabs.board.json"], nil)
+
+	-- A recorded pane id that now names another kind of block (ids reused after a restart) stays.
+	eq(s.core.dispatch(s.c, "tabs"), nil)
+	step(s, 15)
+	local again = w.moved[#w.moved].pane
+	w.panes[again].kind = "agent"
+	local closed = #w.closed
+	eq(s.core.dispatch(s.c, "tabs", { close = "1" }), nil)
+	step(s, 6)
+	eq(last_run(s).state, "success")
+	eq(#w.closed, closed, "not Roost's tab any more: left alone")
+	truthy(w.panes[again], "still open")
+	eq(s.env.files[DATA .. "/tabs/open/tabs.board.json"], nil, "its entry dropped")
+	truthy(w.panes[1], "the user's own tab untouched throughout")
+end
+
+do -- without a Tern window, a tab step fails after a while instead of hanging the run
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TABS, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "tabs"), nil)
+	step(s, 125)
+	local run = last_run(s)
+	eq(run.state, "failed")
+	truthy(string.find(s.env.files[`{DATA}/runs/{run.id}/log.txt`], "没有 Tern 窗口", 1, true), "the log says why")
+	eq(s.env.files[`{DATA}/tabs/ops/{run.id}-s1.json`], nil, "the operation was withdrawn")
+	eq(#s.env.kv.tab_ops, 0)
+end
+
+local WF_EVOLVE = [==[
+[[workflow]]
+id = "target"
+workspace = "temp"
+[[workflow.step]]
+name = "work"
+file = "run.sh"
+
+[[workflow]]
+id = "doctor"
+workspace = "temp"
+evolve = ["*"]
+[[workflow.trigger]]
+roost = "run_failed"
+[[workflow.step]]
+name = "fix"
+run = "fix"
+]==]
+
+-- A target whose staged run.sh decides its result ("exit 0" succeeds), and an evolver whose "fix"
+-- step writes `fix` into its material (the agent's edit), plus `meanwhile` on disk if given.
+local function evolve_scenario(fix: string, meanwhile: string?): Scenario
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_EVOLVE,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/target/files/run.sh"] = "exit 0\n",
+	})
+	s.behave = function(p)
+		for _, a in p.cmd do
+			if string.sub(a, -#"/files/run.sh") == "/files/run.sh" then
+				return if s.env.files[a] == "exit 0\n" then "exit:0" else "exit:1"
+			end
+		end
+		if table.concat(p.cmd, " ") == "/bin/sh -c fix" then
+			s.env.files[`{DATA}/runs/{p.run}/evolve/edit/workflows/target/files/run.sh`] = fix
+			if meanwhile then
+				s.env.files[DATA .. "/workflows/target/files/run.sh"] = meanwhile
+			end
+		end
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0, "evolve workflows parse")
+	for _ = 1, 3 do
+		eq(s.core.dispatch(s.c, "target"), nil)
+		step(s, 3)
+	end
+	eq(#s.c.store.runs, 3, "successes start nothing")
+	s.env.files[DATA .. "/workflows/target/files/run.sh"] = "exit 1\n"
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 8)
+	return s
+end
+
+do -- a target's failure starts its evolver; the edit is applied as a revision; worse runs undo it
+	local s = evolve_scenario("exit 2\n")
+	local runs = s.c.store.runs
+	local broken, doc = runs[4], runs[5]
+	eq(broken.state, "failed")
+	truthy(doc and doc.workflow == "doctor", "the failure started the evolver")
+	eq(doc.trigger.kind, "roost")
+	eq(doc.evolve_target, "target")
+	eq(doc.evolve_run, broken.id)
+	eq(doc.steps[1].kind, "evolve", "material first")
+	eq(doc.state, "success")
+	local dir = `{DATA}/runs/{doc.id}/evolve`
+	truthy(s.env.files[dir .. "/README.md"], "README written")
+	truthy(string.find(s.env.files[dir .. "/digest.md"], broken.id, 1, true), "the digest lists the failed run")
+	eq(s.env.files[dir .. "/base/workflows/target/files/run.sh"], "exit 1\n", "base is the state at start")
+	truthy(string.find(s.env.files[dir .. "/base/workflows/target/workflow.toml"], 'id = "target"', 1, true), "the block too")
+	eq(s.env.files[DATA .. "/workflows/target/files/run.sh"], "exit 2\n", "the edit was applied")
+	local revs = s.core.revisions(s.c)
+	eq(#revs, 1)
+	eq(revs[1].state, "watching")
+	eq(revs[1].workflows[1], "target")
+	eq(revs[1].baseline.target.runs, 4, "judged against the runs before")
+	eq(s.env.files[DATA .. "/revisions/1/before/workflows/target/files/run.sh"], "exit 1\n", "before kept")
+	truthy(string.find(s.env.files[`{DATA}/runs/{doc.id}/log.txt`], "已应用修订 #1", 1, true), "the evolver's log says so")
+
+	for _ = 1, 2 do
+		eq(s.core.dispatch(s.c, "target"), nil)
+		step(s, 4)
+	end
+	eq(#s.c.store.runs, 7, "no second evolver run: cooldown, then the rollback explains it")
+	eq(revs[1].state, "rolled_back", "two failures, far worse than before: undone")
+	eq(s.env.files[DATA .. "/workflows/target/files/run.sh"], "exit 1\n", "back to before")
+	truthy(string.find(s.env.files[`{DATA}/runs/{doc.id}/log.txt`], "已自动回滚", 1, true), "logged on the evolver's run")
+	truthy(string.find(s.env.files[`{DATA}/runs/{s.c.store.runs[6].id}/log.txt`], "冷却", 1, true), "the cooldown was logged")
+	eq(s.core.rollback_revision(s.c, 1) ~= nil, true, "a rolled back revision can't be undone again")
+end
+
+do -- an edit made elsewhere while the evolver ran is never overwritten
+	local s = evolve_scenario("exit 0\n", "mine\n")
+	local doc = s.c.store.runs[5]
+	eq(doc.state, "success")
+	eq(s.env.files[DATA .. "/workflows/target/files/run.sh"], "mine\n", "the other edit stays")
+	eq(#s.core.revisions(s.c), 0, "nothing applied")
+	truthy(string.find(s.env.files[`{DATA}/runs/{doc.id}/log.txt`], "运行期间它被别处改动过", 1, true), "skipped with a reason")
+end
+
+do -- a good edit is kept once enough runs went fine
+	local s = evolve_scenario("exit 0\n")
+	for _ = 1, 5 do
+		eq(s.core.dispatch(s.c, "target"), nil)
+		step(s, 3)
+	end
+	local rev = s.core.revisions(s.c)[1]
+	eq(rev.state, "kept")
+	eq(rev.seen.target.runs, 5)
+	eq(s.env.files[DATA .. "/workflows/target/files/run.sh"], "exit 0\n")
+end
+
+do -- the material's scope.json is only a hint: a workflow outside `evolve` is never changed
+	local wf = (string.gsub(WF_EVOLVE, 'evolve = %["%*"%]', 'evolve = ["target"]'))
+		.. '\n[[workflow]]\nid = "outsider"\nworkspace = "temp"\n[[workflow.step]]\nname = "x"\nfile = "o.sh"\n'
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = wf,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/target/files/run.sh"] = "exit 1\n",
+		[DATA .. "/workflows/outsider/files/o.sh"] = "keep\n",
+	})
+	s.behave = function(p)
+		for _, a in p.cmd do
+			if string.sub(a, -#"/files/run.sh") == "/files/run.sh" then
+				return "exit:1"
+			end
+		end
+		if table.concat(p.cmd, " ") == "/bin/sh -c fix" then
+			-- An agent reaching past its scope: lists the outsider (and a bogus library) and
+			-- forges a base equal to what is on disk.
+			local dir = `{DATA}/runs/{p.run}/evolve`
+			s.env.files[dir .. "/scope.json"] = '{"workflows":["target","outsider"],"libs":["../../x"]}'
+			local block = s.env.files[dir .. "/base/workflows/target/workflow.toml"]
+			local model = require("../lib/model")
+			local outsider = model.encode_workflow(model.raw_workflow(s.env.files[DATA .. "/workflows.toml"], "outsider") :: any)
+			s.env.files[dir .. "/base/workflows/outsider/workflow.toml"] = outsider
+			s.env.files[dir .. "/base/workflows/outsider/files/o.sh"] = "keep\n"
+			s.env.files[dir .. "/edit/workflows/outsider/workflow.toml"] = outsider
+			s.env.files[dir .. "/edit/workflows/outsider/files/o.sh"] = "evil\n"
+			truthy(block, "the target's own material is there")
+		end
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0)
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 8)
+	eq(s.c.store.runs[2].workflow, "doctor")
+	eq(s.c.store.runs[2].state, "success")
+	eq(s.env.files[DATA .. "/workflows/outsider/files/o.sh"], "keep\n", "outside the scope: untouched")
+	eq(#s.core.revisions(s.c), 0, "nothing applied")
+	eq(s.env.files[DATA .. "/x"], nil, "no path built from a bogus library name")
+end
+
+do -- a revision cut off while it was being applied (half its files written) is undone at the next start
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_EVOLVE,
+		[DATA .. "/roost.toml"] = LOCAL,
+		-- run.sh already written, lib.sh not yet, new.sh added by the revision, mine.sh the user's.
+		[DATA .. "/workflows/target/files/run.sh"] = "after\n",
+		[DATA .. "/workflows/target/files/lib.sh"] = "before\n",
+		[DATA .. "/workflows/target/files/new.sh"] = "after\n",
+		[DATA .. "/workflows/target/files/mine.sh"] = "mine\n",
+	})
+	local model = require("../lib/model")
+	local block = model.encode_workflow(model.raw_workflow(WF_EVOLVE, "target") :: any)
+	for _, side in { "before", "after" } do
+		s.env.files[`{DATA}/revisions/1/{side}/workflows/target/workflow.toml`] = block
+		s.env.files[`{DATA}/revisions/1/{side}/workflows/target/files/run.sh`] = `{side}\n`
+		s.env.files[`{DATA}/revisions/1/{side}/workflows/target/files/lib.sh`] = `{side}\n`
+	end
+	s.env.files[`{DATA}/revisions/1/after/workflows/target/files/new.sh`] = "after\n"
+	s.env.files[DATA .. "/revisions.json"] =
+		'{"revs":[{"n":1,"at":1,"run":"aa","reviewer":"doctor","workflows":["target"],"libs":[],"watch":["target"],"state":"applying","baseline":{},"seen":{}}],"next":2}'
+	s.c.book = require("../lib/evolve").load(DATA)
+	s.core.start(s.c)
+	local f = DATA .. "/workflows/target/files/"
+	eq(s.env.files[f .. "run.sh"], "before\n", "the written file put back")
+	eq(s.env.files[f .. "lib.sh"], "before\n", "the unwritten one left as it was")
+	eq(s.env.files[f .. "new.sh"], nil, "the revision's new file removed")
+	eq(s.env.files[f .. "mine.sh"], "mine\n", "a file neither side knows stays")
+	local rev = s.core.revisions(s.c)[1]
+	eq(rev.state, "failed")
+	eq(string.find(rev.note or "", "出错", 1, true), nil, "undone cleanly: " .. tostring(rev.note))
+	truthy(string.find(s.c.notices[1].text, "被打断", 1, true), "noticed: " .. s.c.notices[1].text)
+end
+
+do -- a tab reopened under the same key with `keep` survives the run's end; a new daemon forgets old records
+	local wf = '[[workflow]]\nid = "reopen"\nworkspace = "temp"\n'
+		.. '[[workflow.step]]\nname = "a"\ntab = "open"\nkey = "x"\n'
+		.. '[[workflow.step]]\nname = "b"\ntab = "open"\nkey = "x"\nkeep = true\n'
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = LOCAL })
+	local w = window(s)
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "reopen"), nil)
+	step(s, 15)
+	eq(last_run(s).state, "success")
+	local first, second = w.moved[1].pane, w.moved[2].pane
+	truthy(table.find(w.closed, first), "the first was replaced")
+	truthy(w.panes[second], "the kept one stays after the run's end")
+	truthy(s.env.files[DATA .. "/tabs/open/reopen.x.json"], "the kept tab stays recorded")
+
+	local again = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = LOCAL })
+	again.env.files[DATA .. "/tabs/open/reopen.x.json"] = s.env.files[DATA .. "/tabs/open/reopen.x.json"]
+	again.env.kv.daemon = "1 Mon Nov  2 10:00:00 2026"
+	local proc = again.env.process
+	again.env.process = function(argv: { string }, o: any): any
+		if string.find(argv[3] or "", "lstart", 1, true) then
+			return { status = 0, stdout = "2 Fri Nov  6 10:00:00 2026", stderr = "", timed_out = false }
+		end
+		return proc(argv, o)
+	end
+	again.core.start(again.c)
+	step(again, 1)
+	eq(again.env.files[DATA .. "/tabs/open/reopen.x.json"], nil, "another daemon: the records go")
+	eq(again.env.kv.daemon, "2 Fri Nov  6 10:00:00 2026")
+end
+
+local WF_UPGRADE = [==[
+[repos."me/roost"]
+path = "/src/roost"
+branch = "main"
+[repos."me/other"]
+path = "/src/other"
+
+[[workflow]]
+id = "self"
+[[workflow.trigger]]
+schedule = "daily"
+time = "03:00"
+repo = "me/roost"
+[[workflow.step]]
+name = "升级"
+upgrade = true
+
+[[workflow]]
+id = "loose"
+[[workflow.step]]
+name = "升级"
+upgrade = true
+]==]
+
+do -- upgrade steps check the worktree's commits and hand the rest to a detached script; starts mark the boot
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_UPGRADE,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/upgrades/abc123.json"] = '{"run":"abc123","old":"1111111111aa","new":"2222222222bb","state":"rolled_back","message":"新版本没有正常加载","at":1}',
+	})
+	s.behave = function(p)
+		-- The runner's own refusals exit 1, like the real thing.
+		return if string.find(p.cmd[3] or "", "exit 1", 1, true) then "exit:1" else "exit:0"
+	end
+	s.core.start(s.c)
+	s.core.booted(s.c)
+	truthy(s.env.files[DATA .. "/boot.txt"], "a loaded host is marked for a pending upgrade")
+	truthy(string.find(s.c.notices[1].text, "已回退", 1, true), "the last upgrade's outcome is reported: " .. s.c.notices[1].text)
+	eq(s.core.dispatch(s.c, "self"), nil)
+	step(s, 4)
+	local run = last_run(s)
+	local up: any = nil
+	for _, p in s.procs do
+		if p.kind == "wrapper" and p.step == 2 then
+			up = p
+		end
+	end
+	truthy(up, "the upgrade step ran")
+	eq(up.cmd[3], require("../lib/upgrade").CHECK)
+	eq(up.cmd[5], "/plugin", "the plugin checkout")
+	eq(up.cmd[7], run.id)
+	eq(up.cmd[8], `{DATA}/upgrade/{run.id}.apply.sh`)
+	eq(s.env.files[`{DATA}/upgrade/{run.id}.apply.sh`], require("../lib/upgrade").APPLY, "this run's copy of the apply script")
+	eq(up.argv[8], `{DATA}/worktrees/{run.id}`, "runs in the run's worktree")
+
+	eq(s.core.dispatch(s.c, "loose"), nil)
+	step(s, 3)
+	eq(last_run(s).state, "failed", "outside a worktree it refuses")
+	truthy(string.find(s.env.files[`{DATA}/runs/{last_run(s).id}/log.txt`], "worktree", 1, true), "and says why")
+	local again = scenario({ [DATA .. "/workflows.toml"] = WF_UPGRADE, [DATA .. "/roost.toml"] = LOCAL })
+	again.env.files[DATA .. "/upgrades/abc123.json"] = s.env.files[DATA .. "/upgrades/abc123.json"]
+	again.env.kv.upgrade_seen = s.env.kv.upgrade_seen
+	again.core.start(again.c)
+	for _, n in again.c.notices do
+		eq(string.find(n.text, "自升级", 1, true), nil, "said once")
+	end
+
 end
 
 print("ok")

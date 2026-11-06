@@ -4,10 +4,12 @@
 
 local M = {}
 
--- Plain variables every run has (empty when the trigger doesn't set them).
+-- Plain variables every run has (empty when the trigger doesn't set them). `evolve_*`: runs of a
+-- workflow with `evolve` (lib/evolve.luau): its material directory, and the workflow and run that
+-- triggered it (empty for scheduled or manual runs).
 M.VARS = {
 	"repo", "event", "action", "number", "title", "body", "url", "ref", "sha", "branch",
-	"sender", "comment", "label", "workflow", "run_id", "trigger",
+	"sender", "comment", "label", "workflow", "run_id", "trigger", "evolve_dir", "evolve_target", "evolve_run",
 }
 
 local KNOWN: { [string]: boolean } = {}

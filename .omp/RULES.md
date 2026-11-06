@@ -18,7 +18,7 @@
 
 ## 运行时红线(Luau / Rust)
 
-- 插件运行时只能写 `tern.plugin.data` 和 `tern.kv`。不要写插件目录:写入会触发 Tern 重载全部插件,自升级逻辑尤其要注意。
+- 插件运行时只能写 `tern.plugin.data` 和 `tern.kv`。不要写插件目录:写入会触发 Tern 重载全部插件,自升级逻辑尤其要注意。唯一例外是 `lib/upgrade.luau` 的进程外应用脚本(用户确认的全自动自升级:check.sh 通过后 fast-forward、重载失败自动 `reset --keep` 回退);不要新增其他写插件目录的路径。
 - Luau:每次调用必须在预算内返回(host 2 s、window 50 ms)。不要用无界循环,长任务用 `tern.timer` 分片。`tern.process.run` 必须带 `timeout_ms`。可能失败的 I/O 用 `pcall` 包裹。缓存、日志这类表必须有上限(VM 内存上限 256 MiB)。
 - Rust:生产代码不允许 `unwrap`/`expect`/`panic!`/`todo!`/下标越界式访问,改为返回 `Result`。外部输入必须限制读取大小(`Read::take`、分块读取)。构建产物不能放在插件目录内。
 - 提交前必须跑 `scripts/check.sh`,全部通过才算完成。

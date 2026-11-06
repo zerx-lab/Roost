@@ -800,6 +800,14 @@ function F.new(opts: { [string]: any }?)
 				end
 				return out
 			end,
+			-- `kind` is the block kind Tern reports ("terminal" unless a test changed it).
+			pane = function(_self: any, pane: number): any
+				local p = w.panes[pane]
+				if p == nil then
+					return nil
+				end
+				return { pane = pane, tab = p.tab, block = p.block, kind = p.kind or "terminal", cwd = "", title = "" }
+			end,
 			panes = function(_self: any): any
 				local out = {}
 				for pane, p in w.panes do
@@ -823,9 +831,11 @@ function F.new(opts: { [string]: any }?)
 				w.panes[pane] = nil
 				table.insert(w.closed, pane)
 			end,
-			new_tab = function(_self: any, launch: any, _reveal: any): number
+			new_tab = function(_self: any, launch: any, reveal: any): number
 				local pane = new_id()
 				new_tab(w.shown, pane)
+				w.panes[pane].launch = launch
+				w.panes[pane].reveal = reveal
 				table.insert(w.opened, launch)
 				return pane
 			end,
