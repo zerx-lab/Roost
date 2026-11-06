@@ -3,6 +3,8 @@
 -- `cursor` is a 0-based Unicode codepoint index (not a byte index, and not a UTF-16 offset).
 -- `lines` enables a multi-line prompt: Enter inserts a newline, Up/Down move by line, Home/End jump
 -- to the current line. Without `lines` the field stays one line and a paste drops newlines.
+-- Keys arrive through `M.key`; with the block's `edit` feature on, Tern keeps the selection itself
+-- (⌘A, ⇧-arrows, drag) and sends what it changes as `edit` events, applied by `M.edit`.
 
 local M = {}
 
@@ -69,6 +71,39 @@ function M.utf16_cursor(f: Field): number
 		i += 1
 	end
 	return off
+end
+
+-- UTF-16 length of `text`; invalid UTF-8 counts bytes, matching `utf16_cursor`.
+local function len16(text: string): number
+	if utf8.len(text) == nil then
+		return #text
+	end
+	local n = 0
+	for _, cp in utf8.codes(text) do
+		n += units(cp)
+	end
+	return n
+end
+
+-- Byte index (1-based) and codepoint index (0-based) of UTF-16 offset `off` in `text`. An offset
+-- inside a surrogate pair rounds down to the character it splits; past the end clamps to the end.
+-- Invalid UTF-8 treats offsets as bytes, matching `utf16_cursor`.
+local function from16(text: string, off: number): (number, number)
+	if utf8.len(text) == nil then
+		local b = clamp(math.floor(off), 0, #text)
+		return b + 1, b
+	end
+	local u = 0
+	local i = 0
+	for p, cp in utf8.codes(text) do
+		local w = units(cp)
+		if u + w > off then
+			return p, i
+		end
+		u += w
+		i += 1
+	end
+	return #text + 1, i
 end
 
 -- UTF-8 length of the codepoint starting at byte `b`, or 1 when the sequence is invalid.
@@ -285,6 +320,42 @@ function M.key(f: Field, key: Key): boolean
 		return false
 	end
 	return insert(f, if f.lines then raw else one_line(raw))
+end
+
+-- Apply a native `edit` event (`{from, to, text, cursor, len}`, UTF-16 offsets): replace
+-- `from..to` with `text` and put the caret at `cursor`. An edit computed against another text
+-- (`len` differs: a key landed in between) is dropped rather than spliced in the wrong place.
+-- A one-line field drops newlines from the inserted text and puts the caret after it.
+-- Returns false when nothing changed.
+function M.edit(f: Field, ev: { [string]: any }): boolean
+	local from, to, text, cursor, len = ev.from, ev.to, ev.text, ev.cursor, ev.len
+	if type(from) ~= "number" or type(to) ~= "number" or type(text) ~= "string" or type(cursor) ~= "number" then
+		return false
+	end
+	if type(len) ~= "number" or len ~= len16(f.text) then
+		return false
+	end
+	if to < from then
+		from, to = to, from
+	end
+	local bfrom, cfrom = from16(f.text, from)
+	local bto = from16(f.text, to)
+	local chunk = if f.lines then normalize(text) else one_line(text)
+	local new = string.sub(f.text, 1, bfrom - 1) .. chunk .. string.sub(f.text, bto)
+	local caret: number
+	if chunk == text then
+		local _, c = from16(new, cursor)
+		caret = c
+	else
+		caret = cfrom + cps(chunk)
+	end
+	if new == f.text and caret == f.cursor then
+		return false
+	end
+	f.text = new
+	f.cursor = caret
+	clear_col(f)
+	return true
 end
 
 return M

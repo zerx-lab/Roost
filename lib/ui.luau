@@ -3224,6 +3224,30 @@ function M.event(st: State, ev: UiEvent)
 				end
 			end
 		end
+	elseif ev.ev == "edit" then
+		-- A native edit (selection replaced, caret placed by a click) on the field M.key routes to.
+		st.confirm = nil
+		local id = ev.id or ""
+		local form, gd, imp = st.form, st.grp, st.imp
+		if form then
+			local i = tonumber(string.match(id, "^layer%.form%.field(%d+)%.input$") or "")
+			local fl = if i then form.fields[i] else nil
+			if fl and field.edit(fl, ev) then
+				form.error = nil
+			end
+		elseif gd then
+			if id == GRP_NAME_ID and field.edit(gd.name, ev) then
+				gd.error = nil
+			end
+		elseif imp then
+			if id == IMP_PATH_ID and field.edit(imp.path, ev) then
+				imp.plan, imp.error = nil, nil
+			end
+		elseif st.tab == "files" and st.fp.focus and id == FP_IDS[st.fp.focus] then
+			field.edit(st.fp.fields[st.fp.focus], ev)
+		elseif st.app_org and string.match(id, "relay%.app%.org%.input$") then
+			field.edit(st.app_org, ev)
+		end
 	end
 end
 

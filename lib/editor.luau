@@ -3062,6 +3062,19 @@ local function on_date(st: any, ed: Editor, id: string, value: string)
 	check_now(st)
 end
 
+-- After a key or a native edit changed field `id`: keep the raw table and file buffers in step.
+local function edited(st: any, ed: Editor, id: string, f: field.Field)
+	touch(ed)
+	if id == NAME_ID then
+		ed.raw.name = f.text
+	end
+	if id == FILE_EDIT_ID and type(ed.file_sel) == "string" and ed.files[ed.file_sel] ~= nil then
+		ed.files[ed.file_sel] = f.text
+	end
+	schedule_check(st, ed)
+	render(st)
+end
+
 function M.event(st: any, ev: any): boolean
 	local ed = ed_of(st)
 	if not ed then
@@ -3071,6 +3084,16 @@ function M.event(st: any, ev: any): boolean
 	if ev.ev == "focus" then
 		if ed.buf[id] then
 			focus_at(st, ed, id)
+		end
+		return true
+	end
+	if ev.ev == "edit" then
+		local f = ed.buf[id]
+		if f and field.edit(f, ev) then
+			if id == ID_ID then
+				ed.custom_id = true
+			end
+			edited(st, ed, id, f)
 		end
 		return true
 	end
@@ -3186,15 +3209,7 @@ function M.key(st: any, key: any): boolean
 		end
 	end
 	if field.key(f, key) then
-		touch(ed)
-		if id == NAME_ID then
-			ed.raw.name = f.text
-		end
-		if id == FILE_EDIT_ID and type(ed.file_sel) == "string" and ed.files[ed.file_sel] ~= nil then
-			ed.files[ed.file_sel] = f.text
-		end
-		schedule_check(st, ed)
-		render(st)
+		edited(st, ed, id, f)
 	end
 	return true
 end

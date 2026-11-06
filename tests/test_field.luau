@@ -72,4 +72,25 @@ do -- multi-line prompts: Enter breaks the line, Up/Down keep a sticky column, H
 	eq(f.text, "你好吗\nx\ny\n\nab", "pasted CRLF becomes newlines")
 end
 
+do -- native edits: UTF-16 offsets around emoji, stale edits dropped, one-line fields drop newlines
+	local f: field.Field = { text = "a😀你b", cursor = 0 }
+	-- ⌘A then typing: replace everything (len 5: the emoji takes 2 units)
+	eq(field.edit(f, { from = 0, to = 5, text = "", cursor = 0, len = 4 }), false, "stale len is dropped")
+	eq(f.text, "a😀你b")
+	eq(field.edit(f, { from = 1, to = 4, text = "x", cursor = 2, len = 5 }), true)
+	eq(f.text, "axb", "selection over the emoji and CJK is replaced")
+	eq(f.cursor, 2)
+	f.text, f.cursor = "a😀b", 0
+	eq(field.edit(f, { from = 2, to = 2, text = "", cursor = 2, len = 4 }), true, "click inside the pair")
+	eq(f.cursor, 1, "caret rounds down to the emoji's start")
+	eq(field.edit(f, { from = 2, to = 2, text = "", cursor = 2, len = 4 }), false, "same caret changes nothing")
+	eq(field.edit(f, { from = 4, to = 0, text = "p\nq", cursor = 3, len = 4 }), true, "reversed range")
+	eq(f.text, "pq", "one-line field drops the newline")
+	eq(f.cursor, 2, "caret after the inserted text")
+	local m: field.Field = { text = "ab", cursor = 0, lines = true }
+	eq(field.edit(m, { from = 1, to = 1, text = "\r\n", cursor = 2, len = 2 }), true)
+	eq(m.text, "a\nb", "multi-line keeps the newline")
+	eq(m.cursor, 2)
+end
+
 print("ok")

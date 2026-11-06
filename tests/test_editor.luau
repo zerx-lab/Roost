@@ -351,6 +351,31 @@ do -- a GitHub trigger without a filter cannot be saved; a typed repo chip clear
 	eq(wf.triggers[1].repos[1], "acme/web")
 end
 
+do -- native edits (⌘A + typing, a click placing the caret) reach the raw table and save
+	local w = world({})
+	click(w, "editor-new")
+	click(w, "gh:pr_opened")
+	view(w)
+	focus(w, REPO_CHIP)
+	type_text(w, "acme/web")
+	press(w, "enter")
+	-- Default texts are BMP-only (CJK included), so codepoints = UTF-16 units.
+	local len = utf8.len(w.st.editor.buf[NAME_ID].text) or 0
+	w.ui.event(w.st, { ev = "edit", id = NAME_ID, from = 0, to = len, text = "review", cursor = 6, len = len + 1 })
+	truthy(w.st.editor.raw.name ~= "review", "stale edit dropped")
+	w.ui.event(w.st, { ev = "edit", id = NAME_ID, from = 0, to = len, text = "review", cursor = 6, len = len })
+	eq(w.st.editor.raw.name, "review", "replaced selection reaches raw.name")
+	local plen = utf8.len(w.st.editor.buf[PROMPT_ID].text) or 0
+	w.ui.event(w.st, { ev = "edit", id = PROMPT_ID, from = 0, to = plen, text = "a\nb", cursor = 1, len = plen })
+	eq(w.st.editor.buf[PROMPT_ID].text, "a\nb", "multi-line prompt keeps the newline")
+	eq(w.st.editor.buf[PROMPT_ID].cursor, 1)
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "saves")
+	local wf = parsed(w).by_id.review
+	truthy(wf, "review saved")
+	eq(wf.steps[1].prompt.parts[1].lit, "a\nb")
+end
+
 do -- Escape on a dirty form asks before discarding
 	local w = world({})
 	local before = w.env.files[DATA .. "/workflows.toml"]

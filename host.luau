@@ -24,6 +24,8 @@ end
 
 tern.block.define("console", {
 	font = "sans",
+	-- Tern keeps the fields' selection (⌘A, ⇧-arrows, drag) and sends changes as `edit` events.
+	features = { "edit" :: "edit" },
 	init = function(cx: BlockCx, args: { string }, saved: any): ui.State
 		local st = ui.new(C, cx, args, saved)
 		st.unsubscribe = core.subscribe(C, function()
