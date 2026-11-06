@@ -21,6 +21,8 @@
 
 ## 约束与陷阱
 
+- [2026-11-06] 中继部署:`root@<中继服务器>`(Ubuntu x86_64,root 默认 shell 是 fish,远程命令要包 `bash -c`)。`roost-agent` 用 systemd(`/etc/roost/{agent.toml,env}`,数据 `/var/lib/roost`)监听 127.0.0.1:8787;1Panel的 OpenResty 反代站点 `roost.zerx.dev`,用通配证书 `*.zerx.dev`;外层还有 Cloudflare 代理(`*.zerx.dev` 是橙云通配,源站没有证书的站点会返回 525)。本机 DNS 被代理软件劫持为 198.18.x,要查真实解析需在服务器上 `dig @1.1.1.1` — 依据:本次部署实测
+- [2026-11-06] `cargo zigbuild` 会忽略 `target-dir`/`CARGO_TARGET_DIR`,总是写到 `agent/target`,即插件目录内,会引发重载。交叉编译后必须把二进制移出并删掉 `agent/target`,或者在仓库外的副本里构建 — 依据:`cargo zigbuild --release --target x86_64-unknown-linux-musl` 输出 warning
 - [2026-11-06] Tern UI 没有通用拖拽事件(只有 split 把手、slider、悬浮窗、文件拖入区),列表排序只能用按钮/按键 — 依据:docs.stencil.so/tern/elements(index/lists/layout)
 - [2026-11-06] toml.luau 支持 `"""` 多行字符串;编辑器写回含换行的字符串用它,splice 时必须跳过多行字符串里形似 header/注释的行 — 依据:lib/model.luau mlquote、in_string
 - [2026-11-06] `cx.agents`/`cx.sessions`/`cx.layout` 只在 window 可用;host block 想让窗口做事只能 `cx:open("roost://…")`,由 window 的 `tern.route.link` 认领 — 依据:tern.d.luau(EffectCx.open、LinkRequest)
