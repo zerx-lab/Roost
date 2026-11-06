@@ -28,7 +28,7 @@ Install with `tern plugin install …` (or `tern plugin link .` while developing
 | `workflows.toml` | Repos (GitHub name → local path), automations, triggers, steps; the editor reads and writes it |
 | `runs.json`, `runs/<id>/`, `worktrees/<id>/` | Run history; each run's log, event payload and omp sessions; event worktrees |
 | `events.json` | The events page: each relayed event and the runs it started (or why none) |
-| `groups.json` | The workflows page's groups: names, order, folded or not, and which workflow is in which (display only; not exported) |
+| `groups.json` | The workflows page's groups: names, order, folded or not, and which workflow is in which (display only). Exports carry groups by name: one workflow brings its group; exporting all writes workflows in page order with every group, empty ones too. Importing merges same-named groups, adds missing ones, and leaves workflows already grouped here where they are |
 | `tabs/` | Tab operations queued for windows (`ops/`) and the tabs Roost opened (`open/<workflow>.<key>.json`) |
 | `revisions.json`, `revisions/<n>/` | Evolvers' revisions and their before/after snapshots (latest 100) |
 | `upgrades/<run>.json`, `upgrade/`, `boot.txt` | Self-upgrade outcomes, logs and per-run apply scripts, and the marker a loaded host writes |

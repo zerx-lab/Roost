@@ -1583,6 +1583,8 @@ export type ImportPlan = {
 	libraries: { { name: string, exists: boolean, same: boolean } },
 	repos: { { name: string, exists: boolean } },
 	files: number,
+	-- The export's groups by name: whether one by that name is here, and how many workflows it lists.
+	groups: { { name: string, exists: boolean, count: number } },
 }
 
 -- The workflow's own files on disk.
@@ -1869,8 +1871,10 @@ local function utf8_text(s: string): boolean
 	return utf8.len(s) ~= nil and string.find(s, "%z") == nil
 end
 
--- Writes workflows `ids` (with their files, the libraries they use and their repositories' branch
--- settings) to one file under exports/; returns its path.
+-- Writes workflows `ids` (with their files, the libraries they use, their repositories' branch
+-- settings and their groups) to one file under exports/; returns its path. Workflows go in the
+-- workflows page's order (groups in order, then the ungrouped); exporting every workflow also
+-- keeps the empty groups.
 function M.export_workflows(c: Core, ids: { string }): (string?, string?)
 	local w = c.workflows
 	if w == nil then
@@ -1882,10 +1886,39 @@ function M.export_workflows(c: Core, ids: { string }): (string?, string?)
 	if text == nil then
 		return nil, "无法读取 workflows.toml"
 	end
-	local b: bundle.Bundle = { exported_at = now(), repos = {}, workflows = {}, files = {} }
+	local b: bundle.Bundle = { exported_at = now(), repos = {}, workflows = {}, files = {}, groups = {} }
+	local wanted: { [string]: boolean } = {}
+	for _, id in ids do
+		wanted[id] = true
+	end
+	local all = true
+	for _, wf in w.list do
+		all = all and wanted[wf.id] == true
+	end
+	local ordered: { string } = {}
+	for _, s in groups.sections(c.groups, w.list, function(wf: model.Workflow): string
+		return wf.id
+	end) do
+		local members: { string } = {}
+		for _, wf in s.items do
+			if wanted[wf.id] then
+				table.insert(members, wf.id)
+				table.insert(ordered, wf.id)
+			end
+		end
+		if s.group and (#members > 0 or all) then
+			table.insert(b.groups, { name = s.group.name, workflows = members })
+		end
+	end
+	-- Unknown ids stay in so the lookup below names them.
+	for _, id in ids do
+		if w.by_id[id] == nil and table.find(ordered, id) == nil then
+			table.insert(ordered, id)
+		end
+	end
 	local libs: { [string]: boolean } = {}
 	local blanked = 0
-	for _, id in ids do
+	for _, id in ordered do
 		local wf = w.by_id[id]
 		local raw = model.raw_workflow(text, id)
 		if wf == nil or raw == nil then
@@ -2024,7 +2057,15 @@ function M.import_preview(c: Core, path: string): (ImportPlan?, string?)
 	end
 	local _, libtrees = trees(b)
 	local repos = declared_repos(old)
-	local plan: ImportPlan = { path = p, workflows = {}, libraries = {}, repos = {}, files = #b.files }
+	local plan: ImportPlan =
+		{ path = p, workflows = {}, libraries = {}, repos = {}, files = #b.files, groups = {} }
+	for _, bg in b.groups do
+		local here = false
+		for _, x in c.groups.list do
+			here = here or x.name == bg.name
+		end
+		table.insert(plan.groups, { name = bg.name, exists = here, count = #bg.workflows })
+	end
 	for _, raw in b.workflows do
 		local id = tostring(raw.id)
 		table.insert(plan.workflows, {
@@ -2192,6 +2233,32 @@ function M.import_workflows(c: Core, path: string, overwrite: boolean): (string?
 	end
 	if #missing > 0 then
 		table.insert(parts, `缺少文件库 {table.concat(missing, "、")}`)
+	end
+	if #b.groups > 0 then
+		-- Imported workflows join the export's groups (by name, added when missing) unless they
+		-- are in a group here already.
+		local only: { [string]: boolean } = {}
+		for _, id in added do
+			only[id] = true
+		end
+		local made: { string }, joined: number, failed: { string } = {}, 0, {}
+		local gerr = edit_groups(c, function(g)
+			made, joined, failed = groups.merge(g, b.groups, only)
+			return nil
+		end)
+		if gerr then
+			table.insert(parts, `分组没有导入:{gerr}`)
+		else
+			if #made > 0 then
+				table.insert(parts, `新建分组 {table.concat(made, "、")}`)
+			end
+			if joined > 0 then
+				table.insert(parts, `{joined} 个工作流归入分组`)
+			end
+			if #failed > 0 then
+				table.insert(parts, `无法新建分组 {table.concat(failed, "、")}`)
+			end
+		end
 	end
 	return table.concat(parts, ";"), nil
 end

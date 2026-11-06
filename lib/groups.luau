@@ -1,7 +1,8 @@
 --!strict
 -- Workflow groups on the workflows page: named, ordered, foldable groups and which workflow sits
 -- in which. Layout only (nothing runs differently), so it lives in its own file, groups.json, not
--- in workflows.toml: the editor, export/import and evolvers never see it.
+-- in workflows.toml: the editor and evolvers never see it. Exports carry groups by name
+-- (bundle `[[group]]`); `merge` takes them in on import.
 --
 -- groups.json: {"groups": [{"id": "g1", "name": "…", "collapsed": false}, …], "of": {"<workflow id>": "g1"}}
 -- Saved like events.json: `.bak` first, then the file; load falls back to the backup. A file that
@@ -186,6 +187,44 @@ end
 function M.group_of(g: Groups, wf: string): string?
 	local gid = g.of[wf]
 	return if gid and M.find(g, gid) then gid else nil
+end
+
+export type Incoming = { name: string, workflows: { string } }
+
+-- Takes an export's groups in: a group is matched by name, else added at the end (empty ones
+-- too); a workflow in `only` (the ones imported) joins its group unless it is already in a group
+-- here (this machine's grouping wins). Returns the groups added, how many workflows joined one,
+-- and the groups that could not be added.
+function M.merge(g: Groups, incoming: { Incoming }, only: { [string]: boolean }): ({ string }, number, { string })
+	local added: { string } = {}
+	local failed: { string } = {}
+	local joined = 0
+	for _, inc in incoming do
+		local target: Group? = nil
+		for _, x in g.list do
+			if x.name == inc.name then
+				target = x
+				break
+			end
+		end
+		if target == nil then
+			local id, err = M.create(g, inc.name)
+			if id == nil then
+				table.insert(failed, `{inc.name}({err or "无法创建"})`)
+				continue
+			end
+			target = M.find(g, id)
+			table.insert(added, inc.name)
+		end
+		local gid = (target :: Group).id
+		for _, wf in inc.workflows do
+			if only[wf] and M.group_of(g, wf) == nil then
+				g.of[wf] = gid
+				joined += 1
+			end
+		end
+	end
+	return added, joined, failed
 end
 
 export type Section<W> = { group: Group?, items: { W } }

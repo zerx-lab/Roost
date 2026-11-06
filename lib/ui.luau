@@ -2606,6 +2606,14 @@ local function plan_nodes(plan: core.ImportPlan): { Node }
 			ui.span(if r.exists then "已声明" else "需在 workflows.toml 填写本机路径", if r.exists then "success" else "warning"),
 		}), `r{i}`))
 	end
+	for i, g in plan.groups do
+		table.insert(out, keyed(ui.text({
+			ui.span("分组 ", "muted"),
+			ui.span(g.name),
+			ui.span(`  {g.count} 个工作流  `, "muted"),
+			ui.span(if g.exists then "并入本机同名分组(已在本机分组的不移动)" else "新建", "success"),
+		}), `g{i}`))
+	end
 	table.insert(out, keyed(muted(`共 {plan.files} 个文件`), "files"))
 	return out
 end

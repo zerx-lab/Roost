@@ -829,6 +829,68 @@ do -- workflow groups: create, move, fold, reorder keys, follow renames, survive
 	eq(again.c.groups.of.plain, again.c.groups.list[1].id)
 end
 
+do -- exports carry groups: one workflow takes its group, all take every group in page order
+	local GROUPS = '{"groups":[{"id":"g1","name":"Ops"},{"id":"g2","name":"Empty"}],"of":{"plain":"g1"}}'
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL, [DATA .. "/groups.json"] = GROUPS })
+	local bundle = require("../lib/bundle")
+	local function read(path: string): any
+		local b, err = bundle.decode(w.env.files[path])
+		truthy(b, `export decodes: {tostring(err)}`)
+		return b
+	end
+	act(w, "export", "triage")
+	eq(#read(w.cx.copied[1]).groups, 0, "an ungrouped workflow carries no group")
+	act(w, "export", "plain")
+	local one = read(w.cx.copied[2])
+	eq(#one.groups, 1, "only its own group")
+	eq(one.groups[1].name, "Ops")
+	eq(table.concat(one.groups[1].workflows, ","), "plain")
+	act(w, "export-all")
+	local all = read(w.cx.copied[3])
+	-- workflows.toml has triage first; the page shows group Ops (plain) before the ungrouped.
+	eq(all.workflows[1].id, "plain", "page order")
+	eq(all.workflows[2].id, "triage")
+	eq(#all.groups, 2, "empty groups too")
+	eq(all.groups[2].name, "Empty")
+	eq(#all.groups[2].workflows, 0)
+	local path = w.cx.copied[3]
+
+	-- Into an install without them: groups made by name, workflows placed.
+	local OTHER = '[[workflow]]\nid = "other"\nworkspace = "temp"\n[[workflow.step]]\nrun = "true"\n'
+	local t = world({ [DATA .. "/workflows.toml"] = OTHER, [DATA .. "/roost.toml"] = LOCAL, [path] = w.env.files[path] })
+	t.st.tab = "workflows"
+	act(t, "imp-open")
+	t.st.imp.path = { text = path, cursor = #path }
+	act(t, "imp-preview")
+	truthy(string.find(F.text(view(t).layer), "Ops", 1, true), "the preview lists the groups")
+	act(t, "imp-run")
+	eq(t.st.imp, nil)
+	eq(t.c.groups.list[1].name, "Ops")
+	eq(t.c.groups.list[2].name, "Empty")
+	eq(t.c.groups.of.plain, t.c.groups.list[1].id)
+	eq(t.c.groups.of.triage, nil)
+	truthy(string.find(t.cx.toasts[#t.cx.toasts].text, "新建分组", 1, true), "summary names the new groups")
+
+	-- Over workflows already grouped here: this machine's grouping stays; same-named groups merge.
+	local u = world({
+		[DATA .. "/workflows.toml"] = WORKFLOWS,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/groups.json"] = '{"groups":[{"id":"g1","name":"Local"},{"id":"g2","name":"Ops"}],"of":{"plain":"g1"}}',
+		[path] = w.env.files[path],
+	})
+	truthy(u.core.import_workflows(u.c, path, true))
+	eq(u.c.groups.of.plain, "g1", "kept in its local group")
+	eq(#u.c.groups.list, 3, "Ops matched by name, Empty added")
+	eq(u.c.groups.list[3].name, "Empty")
+
+	-- A workflow in two groups, or a group naming a workflow not in the file, is refused.
+	local base = '[roost]\nformat = 1\n[[workflow]]\nid = "a"\n[[workflow.step]]\nrun = "x"\n'
+	truthy(select(2, bundle.decode(base .. '[[group]]\nname = "x"\nworkflows = ["a"]\n[[group]]\nname = "y"\nworkflows = ["a"]\n')), "twice")
+	truthy(select(2, bundle.decode(base .. '[[group]]\nname = "x"\nworkflows = ["b"]\n')), "unknown")
+	truthy(select(2, bundle.decode(base .. '[[group]]\nname = "x"\n[[group]]\nname = "x"\n')), "duplicate name")
+	truthy(bundle.decode(base), "no groups is fine (older exports)")
+end
+
 do -- an unreadable groups.json is reported and never overwritten
 	local w = world({
 		[DATA .. "/workflows.toml"] = WORKFLOWS,

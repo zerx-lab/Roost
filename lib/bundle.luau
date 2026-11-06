@@ -6,12 +6,16 @@
 --   [repos."owner/name"]          branch / worktree only (local paths stay on this machine)
 --   [[workflow]] …                each workflow as workflows.toml holds it
 --   [[file]]                      workflow = "<id>" or library = "<库>", path, text
+--   [[group]]                     name, workflows = [ids in this file]: the workflows page's groups
+--                                 (lib/groups.luau), in page order; an export of every workflow
+--                                 also lists empty groups. Older Roost ignores the table.
 --
 -- Text is written as a multi-line literal string when it can be (scripts stay readable).
 
 local toml = require("./toml")
 local model = require("./model")
 local util = require("./util")
+local groups = require("./groups")
 
 local M = {}
 
@@ -22,11 +26,13 @@ M.SUFFIX = ".roost.toml"
 
 export type File = { workflow: string?, library: string?, path: string, text: string }
 export type Repo = { branch: string?, worktree: boolean? }
+export type Group = { name: string, workflows: { string } }
 export type Bundle = {
 	exported_at: number,
 	repos: { [string]: Repo },
 	workflows: { { [string]: any } }, -- TOML-shaped, as model.raw_workflow returns them
 	files: { File },
+	groups: { Group },
 }
 
 -- `'''…'''` unless the text holds what a literal string can't (`'''`, a trailing quote, controls
@@ -81,6 +87,16 @@ function M.encode(b: Bundle, header: string): string
 		table.insert(out, `path = {toml.quote(f.path)}`)
 		table.insert(out, `text = {text_value(f.text)}`)
 	end
+	for _, g in b.groups do
+		local quoted: { string } = {}
+		for _, id in g.workflows do
+			table.insert(quoted, toml.quote(id))
+		end
+		table.insert(out, "")
+		table.insert(out, "[[group]]")
+		table.insert(out, `name = {toml.quote(g.name)}`)
+		table.insert(out, `workflows = [{table.concat(quoted, ", ")}]`)
+	end
 	return table.concat(out, "\n") .. "\n"
 end
 
@@ -104,6 +120,7 @@ function M.decode(text: string): (Bundle?, string?)
 		repos = {},
 		workflows = {},
 		files = {},
+		groups = {},
 	}
 	if root.repos ~= nil and type(root.repos) ~= "table" then
 		return nil, "repos 应为表"
@@ -157,6 +174,36 @@ function M.decode(text: string): (Bundle?, string?)
 		end
 		seen[key] = true
 		table.insert(b.files, { workflow = wf, library = lib, path = f.path, text = f.text })
+	end
+	if root.group ~= nil and type(root.group) ~= "table" then
+		return nil, "group 应为 [[group]] 表数组"
+	end
+	local named = groups.empty()
+	local placed: { [string]: boolean } = {}
+	for i, g in root.group or {} do
+		local where = `第 {i} 个 [[group]]`
+		if type(g) ~= "table" or type(g.name) ~= "string" then
+			return nil, `{where}:需要 name`
+		end
+		local nerr = groups.check_name(named, g.name, nil)
+		if nerr then
+			return nil, `{where}:{nerr}`
+		end
+		groups.create(named, g.name)
+		if g.workflows ~= nil and type(g.workflows) ~= "table" then
+			return nil, `{where}:workflows 应为数组`
+		end
+		local members: { string } = {}
+		for _, id in g.workflows or {} do
+			if type(id) ~= "string" or not ids[id] then
+				return nil, `{where}:workflow "{tostring(id)}" 不在本文件中`
+			elseif placed[id] then
+				return nil, `{where}:工作流 {id} 出现在多个分组里`
+			end
+			placed[id] = true
+			table.insert(members, id)
+		end
+		table.insert(b.groups, { name = g.name, workflows = members })
 	end
 	return b, nil
 end
