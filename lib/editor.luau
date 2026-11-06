@@ -2367,7 +2367,8 @@ function M.template_menu(): any
 			end
 		end
 	end
-	return N("menu", { key = "templates", text = "从模板", icon = "sparkle", caret = true, items = items })
+	-- The trigger sits near the toolbar's right edge: hang the menu leftward so it is not clipped.
+	return N("menu", { key = "templates", text = "从模板", icon = "sparkle", caret = true, align = "end", items = items })
 end
 
 local function discard_overlay(): any

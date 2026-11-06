@@ -540,4 +540,53 @@ do -- tab / upgrade steps, evolve scopes and roost triggers
 	assert(string.find(enc, 'evolve = ["a"]', 1, true) and string.find(enc, 'roost = "run_failed"', 1, true), enc)
 end
 
+do -- workflow groups: ids, names, order, sections and tolerant decoding
+	local groups = require("../lib/groups")
+	local g = groups.empty()
+	local a = groups.create(g, "A") :: string
+	local b = groups.create(g, "B") :: string
+	eq(select(2, groups.create(g, "A")) ~= nil, true, "duplicate name refused")
+	eq(select(2, groups.create(g, "")) ~= nil, true, "empty name refused")
+	eq(select(2, groups.create(g, string.rep("名", groups.NAME_MAX + 1))) ~= nil, true, "too long (counted in characters)")
+	eq(groups.rename(g, a, "B") ~= nil, true, "rename onto another group's name refused")
+	eq(groups.rename(g, a, "A"), nil, "renaming to its own name is fine")
+	-- A deleted group's workflows don't land in a later group that gets the same id.
+	groups.assign(g, "v", b)
+	eq(groups.remove(g, b), nil)
+	local c = groups.create(g, "C") :: string
+	eq(groups.group_of(g, "v"), nil, "v stays ungrouped")
+	eq(groups.move(g, a, -1), false, "first can't move up")
+	eq(groups.move(g, a, 1), true)
+	eq(g.list[1].id, c)
+	eq(groups.move(g, a, 1), false, "last can't move down")
+	eq(groups.assign(g, "x", "g999") ~= nil, true, "unknown group refused")
+	groups.assign(g, "x", a)
+	groups.assign(g, "y", c)
+	-- Sections: every group in order (empty ones too), then the ungrouped; file order inside.
+	local d = groups.create(g, "D") :: string
+	local secs = groups.sections(g, { "z", "y", "x", "w" }, function(s: string): string
+		return s
+	end)
+	eq(#secs, 4)
+	eq((secs[1].group :: any).id, c)
+	eq(secs[1].items[1], "y")
+	eq((secs[2].group :: any).id, a)
+	eq((secs[3].group :: any).id, d)
+	eq(#secs[3].items, 0, "an empty group still shows")
+	eq(secs[4].group, nil)
+	eq(table.concat(secs[4].items, ","), "z,w")
+	-- Removing a group ungroups its workflows.
+	groups.remove(g, a)
+	eq(groups.group_of(g, "x"), nil)
+	-- Decoding drops malformed entries and memberships of unknown groups.
+	local back = groups.decode({
+		groups = { { id = "g1", name = "ok" }, { id = "bad", name = "x" }, { id = "g1", name = "dup" }, { id = "g2", name = "" } },
+		of = { a = "g1", b = "g7", c = 3 },
+	})
+	eq(#back.list, 1)
+	eq(back.of.a, "g1")
+	eq(back.of.b, nil)
+	eq(back.of.c, nil)
+end
+
 print("ok")

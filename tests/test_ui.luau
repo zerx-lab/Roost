@@ -732,4 +732,114 @@ do -- overview lists evolver revisions and a self-upgrade; only a watching one r
 	truthy(string.find(w.cx.toasts[#w.cx.toasts].text, "refused", 1, true), "rollback error is toasted")
 end
 
+do -- runs show their id; the detail and the row menu copy it
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.core.dispatch(w.c, "plain")
+	local r = require("../lib/store").list(w.c.store, 1, "plain")[1]
+	truthy(r, "a run")
+	w.st.tab = "runs"
+	w.ui.event(w.st, { ev = "select", id = "main.body.runs.left.runs", item = r.id })
+	local page = view(w)
+	local tbl = find(page.main, function(x)
+		return x.k == "table" and x.p and x.p.key == "runs"
+	end)
+	eq(tbl.p.rows[1].cells[2], r.id, "the id column holds the full id")
+	local facts = find(page.main, function(x)
+		return x.k == "kv" and x.p and x.p.key == "facts"
+	end)
+	local first = facts.p.items[1]
+	eq(F.text({ k = "text", p = { spans = first[2] or first.v } }), r.id, "the detail leads with the id")
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.left.runs", act = "copy-id", item = r.id })
+	eq(w.cx.copied[#w.cx.copied], r.id, "row menu copies the id")
+end
+
+do -- workflow groups: create, move, fold, reorder keys, follow renames, survive reloads
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.st.tab = "workflows"
+	local function card(id: string): any
+		return find(view(w).main, function(x)
+			return x.k == "card" and x.p and x.p.role == "roost.workflow" and x.p.key == id
+		end)
+	end
+	-- A new group from a card's menu takes that workflow along.
+	act(w, "grp-new-for:plain")
+	truthy(w.st.grp and view(w).layer, "the name dialog opens")
+	w.st.grp.name = { text = "Ops", cursor = 3 }
+	eq(press(w, "enter"), true)
+	eq(w.st.grp, nil, "closed once created")
+	local gid = w.c.groups.list[1].id
+	eq(w.c.groups.of.plain, gid, "plain moved into the new group")
+	-- The head controls are named by id: a card in a group is one level deeper.
+	eq(card("plain").p["end"], `main.body.workflows.g_{gid}.cards.plain.end`)
+	eq(card("triage").p["end"], "main.body.workflows.ungrouped.cards.triage.end")
+	-- A second group with the same name is refused in the dialog.
+	act(w, "grp-new")
+	w.st.grp.name = { text = "Ops", cursor = 3 }
+	act(w, "grp-ok")
+	truthy(w.st.grp and w.st.grp.error, "duplicate name refused")
+	eq(#w.c.groups.list, 1)
+	eq(press(w, "escape"), true)
+	-- j/k walk the page's order: the group first, then the ungrouped.
+	eq(press(w, "j"), true)
+	eq(w.st.wf_id, "plain")
+	eq(press(w, "j"), true)
+	eq(w.st.wf_id, "triage")
+	-- [ moves the picked workflow into the previous group; ] past the last group ungroups it.
+	eq(press(w, "["), true)
+	eq(w.c.groups.of.triage, gid)
+	eq(press(w, "["), false, "already in the first group")
+	eq(press(w, "]"), true)
+	eq(w.c.groups.of.triage, nil)
+	-- The card menu moves too.
+	act(w, `mv:triage:{gid}`)
+	eq(w.c.groups.of.triage, gid)
+	act(w, "mv:triage:")
+	eq(w.c.groups.of.triage, nil)
+	-- A folded group hides its cards, and j/k skip them.
+	act(w, "grp-toggle", gid)
+	eq(card("plain"), nil, "folded")
+	w.st.wf_id = "triage"
+	eq(press(w, "k"), false, "nothing shown above")
+	act(w, "grp-toggle", gid)
+	truthy(card("plain"), "unfolded")
+	-- Saved, and read back by a new runtime.
+	local saved = w.env.files[DATA .. "/groups.json"]
+	truthy(saved and string.find(saved, '"Ops"', 1, true), "groups.json written")
+	-- A renamed workflow keeps its group; a deleted one leaves it.
+	local raw = w.core.workflow_raw(w.c, "plain")
+	raw.id = "plain2"
+	eq(w.core.save_workflow(w.c, "plain", raw), nil)
+	eq(w.c.groups.of.plain, nil)
+	eq(w.c.groups.of.plain2, gid, "the group follows the new id")
+	eq(w.core.delete_workflow(w.c, "plain2"), nil)
+	eq(w.c.groups.of.plain2, nil, "forgotten with the workflow")
+	-- Deleting a group takes two clicks and ungroups its workflows.
+	act(w, `mv:triage:{gid}`)
+	confirm_click(w, `grp-del:{gid}`)
+	eq(#w.c.groups.list, 0)
+	eq(w.c.groups.of.triage, nil)
+	eq(card("triage").p["end"], "main.body.workflows.cards.triage.end", "no groups: one grid again")
+
+	local again = world({
+		[DATA .. "/workflows.toml"] = WORKFLOWS,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/groups.json"] = saved,
+	})
+	eq(again.c.groups.list[1].name, "Ops", "loaded at start")
+	eq(again.c.groups.of.plain, again.c.groups.list[1].id)
+end
+
+do -- an unreadable groups.json is reported and never overwritten
+	local w = world({
+		[DATA .. "/workflows.toml"] = WORKFLOWS,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/groups.json"] = "{broken",
+	})
+	truthy(w.c.groups_err, "the error is kept")
+	local id, err = w.core.group_create(w.c, "Ops")
+	eq(id, nil)
+	truthy(err, "creating is refused")
+	eq(w.env.files[DATA .. "/groups.json"], "{broken", "the file is untouched")
+end
+
 print("ok")

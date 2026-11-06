@@ -17,6 +17,7 @@ local toml = require("./toml")
 local evolve = require("./evolve")
 local upgrade = require("./upgrade")
 local tabs = require("./tabs")
+local groups = require("./groups")
 
 local M = {}
 
@@ -75,7 +76,7 @@ export type AppInfo = {
 
 export type Core = {
 	data: string,
-	paths: { config: string, workflows: string, theme: string },
+	paths: { config: string, workflows: string, theme: string, groups: string },
 	config: model.Config,
 	config_issues: { model.Issue },
 	config_text: string?,
@@ -108,6 +109,8 @@ export type Core = {
 	login: loginenv.State, -- the login-shell environment local tools and shell steps inherit
 	login_waiters: { () -> () }, -- actions waiting for the first capture
 	book: evolve.Book, -- evolvers' revisions and firing record (lib/evolve.luau)
+	groups: groups.Groups, -- the workflows page's groups (groups.json, lib/groups.luau)
+	groups_err: string?, -- groups.json exists but can't be read: kept as is, never overwritten
 }
 
 local DEFAULT_CONFIG = [[
@@ -744,6 +747,7 @@ function M.new(data: string): Core
 		config = `{data}/roost.toml`,
 		workflows = `{data}/workflows.toml`,
 		theme = `{data}/theme.css`,
+		groups = `{data}/groups.json`,
 	}
 	local st = store.new(data, 200, 30 * 86400)
 	local c: Core
@@ -783,6 +787,8 @@ function M.new(data: string): Core
 		login = loginenv.new(),
 		login_waiters = {},
 		book = evolve.load(data),
+		groups = groups.empty(),
+		groups_err = nil,
 	}
 	c.runner = runner.new({
 		data = data,
@@ -883,6 +889,10 @@ function M.start(c: Core)
 		pcall(tern.fs.write, c.paths.workflows, DEFAULT_WORKFLOWS)
 	end
 	store.load(c.store)
+	c.groups, c.groups_err = groups.load(c.paths.groups)
+	if c.groups_err then
+		M.notice(c, "error", c.groups_err)
+	end
 	-- Deliveries already handled: those that started runs (runs.json keeps them however the
 	-- events page was trimmed or cleared), then the events page, each oldest first, so the
 	-- dedup window keeps the newest.
@@ -1356,6 +1366,92 @@ local function write_workflows(c: Core, old: string, text: string): string?
 	return nil
 end
 
+-- Applies `fn` to a copy of the groups and keeps the copy once groups.json holds it. An unreadable
+-- groups.json is never overwritten (that would drop the user's groups).
+local function edit_groups(c: Core, fn: (groups.Groups) -> string?): string?
+	if c.groups_err then
+		return c.groups_err
+	end
+	local g = groups.clone(c.groups)
+	local err = fn(g)
+	if err then
+		return err
+	end
+	local serr = groups.save(c.paths.groups, g)
+	if serr then
+		return `无法保存分组:{serr}`
+	end
+	c.groups = g
+	M.changed(c)
+	return nil
+end
+
+-- Creates a group named `name` (trimmed) at the end; returns its id.
+function M.group_create(c: Core, name: string): (string?, string?)
+	local id: string? = nil
+	local err = edit_groups(c, function(g)
+		local gid, gerr = groups.create(g, util.trim(name))
+		id = gid
+		return gerr
+	end)
+	return if err then nil else id, err
+end
+
+function M.group_rename(c: Core, id: string, name: string): string?
+	return edit_groups(c, function(g)
+		return groups.rename(g, id, util.trim(name))
+	end)
+end
+
+-- Deletes a group; its workflows become ungrouped (the workflows themselves stay).
+function M.group_delete(c: Core, id: string): string?
+	return edit_groups(c, function(g)
+		return groups.remove(g, id)
+	end)
+end
+
+-- Moves a group `delta` places in the page's order.
+function M.group_move(c: Core, id: string, delta: number): string?
+	return edit_groups(c, function(g)
+		return if groups.move(g, id, delta) then nil else "已经到头了"
+	end)
+end
+
+function M.group_toggle(c: Core, id: string): string?
+	return edit_groups(c, function(g)
+		return groups.toggle(g, id)
+	end)
+end
+
+-- Puts workflow `wf` in group `gid` (nil: ungrouped).
+function M.group_assign(c: Core, wf: string, gid: string?): string?
+	local w = c.workflows
+	if w == nil or w.by_id[wf] == nil then
+		return `没有工作流 {wf}`
+	end
+	return edit_groups(c, function(g)
+		return groups.assign(g, wf, gid)
+	end)
+end
+
+-- A workflow's group follows it to a new id, and is forgotten when it is deleted (`to` nil).
+local function regroup(c: Core, from: string, to: string?)
+	if c.groups.of[from] == nil then
+		return
+	end
+	local err = edit_groups(c, function(g)
+		local gid = g.of[from]
+		g.of[from] = nil
+		if to then
+			g.of[to] = gid
+		end
+		return nil
+	end)
+	if err then
+		M.notice(c, "warning", `工作流 {from} 的分组没有跟着更新:{err}`)
+	end
+end
+
 -- Saves `raw` over workflow `old_id` (nil: a new one). Nil when written and reloaded, else the
 -- issues that stopped it. workflows.toml.bak keeps the previous file. `wfiles` replaces the
 -- workflow's own files (nil keeps them; a changed id moves them along). `base` is what the editor
@@ -1440,6 +1536,7 @@ function M.save_workflow(
 			M.notice(c, "warning", `工作流 {old_id} 的旧目录里还有没复制的文件,已保留:{leftover}`)
 		end
 		M.changed(c)
+		regroup(c, old_id :: string, id)
 	end
 	return nil
 end
@@ -1455,8 +1552,11 @@ function M.delete_workflow(c: Core, id: string): string?
 		return err
 	end
 	local werr = write_workflows(c, old, text)
-	if werr == nil and model.valid_lib(id) then
-		store.discard(c.store, files.workflow_home(c.data, id))
+	if werr == nil then
+		regroup(c, id, nil)
+		if model.valid_lib(id) then
+			store.discard(c.store, files.workflow_home(c.data, id))
+		end
 		M.changed(c)
 	end
 	return werr

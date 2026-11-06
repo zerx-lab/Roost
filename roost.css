@@ -7,11 +7,14 @@
  *   [data-role='roost.tabs']                 page tabs
  *   [data-role='roost.overview']             overview page
  *   [data-role='roost.runs']                 runs page (split: list | detail)
- *   [data-role='roost.fill']                 the runs page's body when it is the split: fills the block below the tabs
+ *   [data-role='roost.fill']                 every page's body: fills the block below the tabs; the page scrolls inside it
  *   [data-role='roost.runlist']              runs list pane (filter bar, then the scrolling table)
  *   [data-role='roost.run']                  run detail pane (right of the runs list)
  *   [data-role='roost.log']                  run log scroller (ansi inside)
- *   [data-role='roost.workflows']            workflows page (list | selected workflow [data-role='roost.workflow'])
+ *   [data-role='roost.workflows']            workflows page; each workflow is a card [data-role='roost.workflow']
+ *   [data-role='roost.wfgroup']              one group of workflows (head [data-role='roost.wfgroup.head'], then the cards)
+ *   [data-role='roost.wfcards']              a wrapping row of workflow cards (stretched to the tallest in a row)
+ *   [data-role='roost.wftail']               a workflow card's last run and history strip, kept at the card's bottom
  *   [data-role='roost.events']               relayed events page
  *   [data-role='roost.relay']                relay page
  *   [data-role='roost.deliveries']           relay page: webhook delivery counts
@@ -35,10 +38,12 @@
 	padding: 2px 2px 0;
 }
 
-/* The wide runs page fills the block below the tabs: page body → split → panes → the run list's
- * table and the run's log, which take what is left and scroll inside it. A height counted in
- * lines can't match the pixels above, so this is done here. */
+/* Only the page scrolls, never the head and tabs above it: the page body fills the block below
+ * the tabs, and the page in it (a scroll, or the wide runs page's split → panes → the run list's
+ * table and the run's log) takes what is left and scrolls inside it. A height counted in lines
+ * can't match the pixels above, so this is done here. */
 .sf-main[data-surface='plugin.roost.console'] > [data-role='roost.fill'],
+[data-surface='plugin.roost.console'] [data-role='roost.fill'] > .sf-scroll,
 [data-surface='plugin.roost.console'] [data-role='roost.fill'] > .sf-split[data-role='roost.runs'],
 [data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.runlist'],
 [data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.run'] {
@@ -86,8 +91,43 @@
 	opacity: 0.72;
 }
 
+/* Workflow cards: roomier insets (Tern's are 4px 10px / 0 12px 10px 36px), and a card stretched to
+ * the tallest of its row keeps its last-run strip at the bottom instead of leaving the spare room
+ * under it. The body's left inset follows the head's: padding + 16px icon + 8px gap. */
+[data-surface='plugin.roost.console'] .sf-card[data-role='roost.workflow'] {
+	display: flex;
+	flex-direction: column;
+}
+[data-surface='plugin.roost.console'] .sf-card[data-role='roost.workflow'] > .sf-card-head {
+	padding: 10px 14px 6px 16px;
+}
+[data-surface='plugin.roost.console'] .sf-card[data-role='roost.workflow'] > .sf-card-body {
+	flex: 1 1 auto;
+	gap: 10px;
+	padding: 4px 16px 14px 40px;
+}
+[data-surface='plugin.roost.console'] .sf-card[data-role='roost.workflow'] > .sf-card-body > [data-role='roost.wftail'] {
+	margin-top: auto;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.wfgroup.head'] {
+	padding: 2px 2px 0;
+}
+
 [data-surface='plugin.roost.console'] [data-role='roost.form'] .sf-field {
 	margin-bottom: 4px;
+}
+
+/* A row field's select sits at the form's right edge, and its menu (at least 152px, wider than a
+ * short trigger such as 连续失败次数's) hangs from the trigger's left edge. Tern right-aligns it only
+ * past the pane's edge, not the overlay's, so the overflow made the whole form scroll sideways and
+ * cut off its left side. Hang these menus from the right edge instead. */
+[data-surface='plugin.roost.console'] [data-role='roost.form'] .sf-field[data-variant='row'] .sf-select-menu {
+	left: auto;
+	right: 0;
+	transform-origin: 100% 0;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.form'] .sf-field[data-variant='row'] .sf-select-menu.up {
+	transform-origin: 100% 100%;
 }
 
 @media (prefers-reduced-motion: reduce) {

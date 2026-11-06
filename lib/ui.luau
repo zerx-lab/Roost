@@ -19,6 +19,7 @@ local stats = require("./stats")
 local evolve = require("./evolve")
 local upgrade = require("./upgrade")
 local files = require("./files")
+local groups = require("./groups")
 
 local ui = tern.ui
 local N = ui.node
@@ -78,6 +79,8 @@ export type FilesPage = {
 }
 -- The import overlay: the file to read and what importing it would do.
 export type Import = { path: field.Field, plan: core.ImportPlan?, error: string? }
+-- The group name dialog: a new group (moving workflow `wf` into it when set), or renaming `id`.
+export type GroupDialog = { id: string?, wf: string?, name: field.Field, error: string? }
 
 local function text_field(text: string, lines: boolean?): field.Field
 	return { text = text, cursor = utf8.len(text) or #text, lines = lines }
@@ -119,6 +122,7 @@ export type State = {
 	confirm_at: number?, -- tern.now() of that click
 	fp: FilesPage,
 	imp: Import?, -- the import overlay while open
+	grp: GroupDialog?, -- the group name dialog while open
 }
 
 -- ---------------------------------------------------------------------------------------------
@@ -475,6 +479,7 @@ function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
 		confirm_at = nil,
 		fp = new_fp(),
 		imp = nil,
+		grp = nil,
 	}
 	if st.run_id and c.store.by_id[st.run_id] == nil then
 		st.run_id = nil
@@ -600,17 +605,24 @@ local function run_row(r: store.Run, t: number): any
 		id = r.id,
 		cells = list_of(
 			{ text = STATE_LABEL[r.state] or r.state, dot = STATE_TONE[r.state] or "muted" },
+			r.id,
 			{ text = name },
 			{ text = TRIGGER_LABEL[trig] or trig, icon = TRIGGER_ICON[trig] or "dot" },
 			util.ago(r.created_at, t),
 			duration(r.started_at, r.finished_at)
 		),
-		menu = if r.state == "queued" or r.state == "running" then { "cancel", "open-log" } else { "rerun", "open-log" },
+		title = `运行 {r.id}`,
+		menu = if r.state == "queued" or r.state == "running"
+			then { "cancel", "open-log", "copy-id" }
+			else { "rerun", "open-log", "copy-id" },
 	}
 end
 
+-- The run id is in the list and the detail: people quote it when they report or look into a run,
+-- and runs/<id>/ on disk carries the same name.
 local RUN_COLS: { Col } = {
 	{ id = "state", head = "状态", priority = 8 },
+	{ id = "id", head = "ID", mono = true, priority = 4 },
 	{ id = "run", head = "运行", grow = 1, truncate = "end", priority = 9 },
 	{ id = "trigger", head = "触发", priority = 3 },
 	{ id = "at", head = "创建", align = "end", priority = 5 },
@@ -989,7 +1001,7 @@ end
 -- first, then where it came from, who it acts as, what it was given, when and what it cost. Its
 -- took is in the head. Returns the node and its row count (the narrow page sizes the log by it).
 local function run_facts(r: store.Run, t: number): (Node, number)
-	local items: { any } = {}
+	local items: { any } = { pair("ID", { ui.span(r.id, "mono") }) }
 	if r.reason then
 		local calm = r.state == "success" or r.state == "skipped"
 		table.insert(items, pair(if calm then "说明" else "原因", { ui.span(r.reason, if calm then "muted" else "warning") }))
@@ -1048,6 +1060,7 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 		end
 	end
 	table.insert(tools, btn("日志文件", `open-log={r.id}`, { icon = "file", variant = "quiet", key = "log" }))
+	table.insert(tools, btn("复制 ID", `copy-id={r.id}`, { icon = "copy", variant = "quiet", key = "copy-id", title = `复制运行 ID {r.id}` }))
 	table.insert(tools, btn("自动换行", "log-wrap", {
 		icon = "align-left",
 		variant = "quiet",
@@ -1221,9 +1234,44 @@ end
 -- How many recent runs a card's history strip shows.
 local HISTORY = 24
 
+-- Lines a card's description shows (and always takes, so the facts under it line up across a
+-- row of cards); the whole text is in its hover card.
+local DESC_LINES = 3
+
+-- The card's "分组" menu: move it to another group (a radio group), or into a new one.
+local function group_menu(g: groups.Groups, wf: string): Node
+	local cur = groups.group_of(g, wf)
+	local items: { any } = { { header = "移动到分组" } }
+	for _, x in g.list do
+		table.insert(items, { id = `mv:{wf}:{x.id}`, label = x.name, radio = "group", checked = cur == x.id })
+	end
+	table.insert(items, { id = `mv:{wf}:`, label = "未分组", radio = "group", checked = cur == nil })
+	table.insert(items, "-")
+	table.insert(items, { id = `grp-new-for:{wf}`, label = "新建分组并移入…", icon = "folder-plus" })
+	return N("menu", {
+		key = "group",
+		text = "分组",
+		icon = "folder",
+		trigger = "quiet",
+		size = "sm",
+		align = "end",
+		title = "移动到分组",
+		items = items,
+	})
+end
+
 -- One workflow as a card among its siblings: what fires it, where, its steps, then how it has
--- been doing (the last run, the rate, a strip of recent runs colored by outcome).
-local function workflow_card(st: State, wf: model.Workflow, health: stats.Health?, t: number, basis: number, picked: boolean): Node
+-- been doing (the last run, the rate, a strip of recent runs colored by outcome). `path`: the id
+-- of the row the card sits in (the head's controls are named by id).
+local function workflow_card(
+	st: State,
+	wf: model.Workflow,
+	health: stats.Health?,
+	t: number,
+	basis: number,
+	picked: boolean,
+	path: string
+): Node
 	local c = st.core
 	local items: { any } = {}
 	local shared, all = workflow_repos(wf)
@@ -1265,6 +1313,7 @@ local function workflow_card(st: State, wf: model.Workflow, health: stats.Health
 	end
 	local body: { Node } = {
 		N("row", { key = "end", gap = "sm", align = "center" }, {
+			group_menu(c.groups, wf.id),
 			btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }),
 			btn("导出", `export={wf.id}`, { variant = "quiet", icon = "file-code", key = "export", title = "导出这个工作流(含脚本文件)到 exports 目录" }),
 			btn("运行", `dispatch={wf.id}`, {
@@ -1274,9 +1323,23 @@ local function workflow_card(st: State, wf: model.Workflow, health: stats.Health
 			}),
 		}),
 	}
+	local desc: Node
 	if wf.description then
-		table.insert(body, keyed(muted(wf.description), "desc"))
+		local full = wf.description
+		local hover = ui.col({ ui.text(full) })
+		hover.p = { gap = "sm", max = { w = "72ch" } }
+		desc = N("text", {
+			key = "text",
+			spans = { ui.span(full, "muted") },
+			lines = DESC_LINES,
+			title = full,
+			hovercard = hover,
+		})
+	else
+		desc = keyed(ui.text({ ui.span("没有描述", "muted") }), "text")
 	end
+	-- A col takes the reserved height (a text node's own `min` is not a layout bound everywhere).
+	table.insert(body, N("col", { key = "desc", min = { h = `{DESC_LINES}lines` } }, { desc }))
 	table.insert(body, keyed(ui.kv(items :: any), "info"))
 	local runs = store.list(c.store, HISTORY, wf.id)
 	local foot: { Node } = {}
@@ -1302,8 +1365,12 @@ local function workflow_card(st: State, wf: model.Workflow, health: stats.Health
 	else
 		table.insert(foot, keyed(muted("还没有运行"), "last"))
 	end
-	table.insert(body, keyed(ui.rule(""), "rule"))
-	table.insert(body, N("row", { key = "foot", gap = "md", align = "center" }, foot))
+	-- The tail sits at the card's bottom (roost.css): in a row of cards stretched to the tallest,
+	-- the spare room goes above it, not under it.
+	table.insert(body, N("col", { key = "tail", role = "roost.wftail", gap = "sm" }, {
+		keyed(ui.rule(""), "rule"),
+		N("row", { key = "foot", gap = "md", align = "center" }, foot),
+	}))
 	return ui.card({ ui.span(wf.name, "strong") }, body, {
 		key = wf.id,
 		role = "roost.workflow",
@@ -1313,7 +1380,7 @@ local function workflow_card(st: State, wf: model.Workflow, health: stats.Health
 		selected = picked,
 		basis = basis,
 		grow = 1,
-		["end"] = `main.body.workflows.cards.{wf.id}.end`,
+		["end"] = `{path}.{wf.id}.end`,
 	})
 end
 
@@ -1323,6 +1390,7 @@ local function workflows_toolbar(count: string?): Node
 		N("row", { key = "end", gap = "sm", align = "center" }, {
 			btn("新建自动化", "editor-new", { icon = "plus", size = "md", key = "new" }),
 			editor.template_menu(),
+			btn("新建分组", "grp-new", { variant = "quiet", icon = "folder-plus", size = "md", key = "group", title = "新建一个工作流分组" }),
 			btn("导入", "imp-open", { variant = "quiet", icon = "plus", size = "md", key = "import", title = "从导出文件导入工作流" }),
 			btn("导出全部", "export-all", { variant = "quiet", icon = "file-code", size = "md", key = "export", title = "把全部工作流导出到一个文件" }),
 			btn("", "open=workflows", { variant = "quiet", icon = "file-code", size = "md", title = "编辑 workflows.toml", key = "file" }),
@@ -1357,19 +1425,113 @@ local function workflows_tab(st: State): Node
 	-- Cards per row by width; basis leaves room for the gaps.
 	local basis = if st.cols >= 190 then 0.31 elseif st.cols >= 110 then 0.48 else 1
 	local sel = selected_workflow(st, w)
-	local cards: { Node } = {}
 	local off = 0
 	for _, wf in w.list do
 		if not wf.enabled then
 			off += 1
 		end
-		table.insert(cards, workflow_card(st, wf, health[wf.id], t, basis, sel ~= nil and sel.id == wf.id))
+	end
+	local function card_row(key: string, path: string, list: { model.Workflow }): Node
+		local cards: { Node } = {}
+		for _, wf in list do
+			table.insert(cards, workflow_card(st, wf, health[wf.id], t, basis, sel ~= nil and sel.id == wf.id, path))
+		end
+		return N("row", { key = key, role = "roost.wfcards", gap = "lg", wrap = true, align = "stretch" }, cards)
 	end
 	local count = `{#w.list} 个工作流{if off > 0 then ` · {off} 个已停用` else ""}`
-	return N("col", { key = "workflows", role = "roost.workflows", gap = "lg" }, {
-		workflows_toolbar(count),
-		N("row", { key = "cards", gap = "lg", wrap = true, align = "stretch" }, cards),
-	})
+	local children: { Node } = { workflows_toolbar(count) }
+	local g = c.groups
+	if #g.list == 0 then
+		-- No groups yet: the page is one grid, as before groups existed.
+		table.insert(children, card_row("cards", "main.body.workflows.cards", w.list))
+	else
+		local secs = groups.sections(g, w.list, function(wf: model.Workflow): string
+			return wf.id
+		end)
+		local nth = 0
+		for _, s in secs do
+			local x = s.group
+			local key = if x then `g_{x.id}` else "ungrouped"
+			local head_end: { Node } = {}
+			local title: { any }
+			local fold: Node? = nil
+			local open = true
+			if x then
+				nth += 1
+				open = not x.collapsed
+				fold = btn("", `grp-toggle={x.id}`, {
+					variant = "quiet",
+					icon = if open then "chev" else "chev-r",
+					key = "fold",
+					title = if open then "收起分组" else "展开分组",
+				})
+				title = { ui.span(x.name, "strong"), ui.span(`   {#s.items} 个工作流`, "muted") }
+				head_end = {
+					btn("", `grp-up={x.id}`, {
+						variant = "quiet",
+						icon = "arrow-up",
+						key = "up",
+						title = "上移分组",
+						disabled = if nth == 1 then "已经在最前" else false,
+					}),
+					btn("", `grp-down={x.id}`, {
+						variant = "quiet",
+						icon = "arrow-down",
+						key = "down",
+						title = "下移分组",
+						disabled = if nth == #g.list then "已经在最后" else false,
+					}),
+					btn("重命名", `grp-ren={x.id}`, { variant = "quiet", icon = "pen", key = "ren" }),
+					confirm_btn(st, "删除分组", "确认删除", `grp-del:{x.id}`, {
+						variant = "quiet",
+						icon = "trash",
+						key = "del",
+						title = "删除分组:其中的工作流回到「未分组」,工作流本身不受影响",
+					}),
+				}
+			else
+				title = { ui.span("未分组", "strong"), ui.span(`   {#s.items} 个工作流`, "muted") }
+			end
+			local lead: { Node } = {}
+			if fold then
+				table.insert(lead, fold)
+			end
+			table.insert(lead, keyed(ui.text(title), "name"))
+			local section: { Node } = {
+				N("row", { key = "head", role = "roost.wfgroup.head", justify = "between", align = "center", gap = "md" }, {
+					N("row", { key = "lead", gap = "sm", align = "center" }, lead),
+					N("row", { key = "end", gap = "sm", align = "center" }, head_end),
+				}),
+			}
+			if open then
+				if #s.items == 0 then
+					table.insert(section, keyed(muted("空分组:在工作流卡片的「分组」菜单里把工作流移进来。"), "none"))
+				else
+					table.insert(section, card_row("cards", `main.body.workflows.{key}.cards`, s.items))
+				end
+			end
+			table.insert(children, N("col", { key = key, role = "roost.wfgroup", gap = "md" }, section))
+		end
+	end
+	return N("col", { key = "workflows", role = "roost.workflows", gap = "lg" }, children)
+end
+
+-- The workflows the page shows, in its order (groups in order, then the ungrouped; folded groups
+-- hide theirs): what j/k walk.
+local function shown_workflows(st: State, w: model.Workflows): { model.Workflow }
+	local g = st.core.groups
+	if #g.list == 0 then
+		return w.list
+	end
+	local out: { model.Workflow } = {}
+	for _, s in groups.sections(g, w.list, function(wf: model.Workflow): string
+		return wf.id
+	end) do
+		if not (s.group and s.group.collapsed) then
+			table.move(s.items, 1, #s.items, #out + 1, out)
+		end
+	end
+	return out
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -2522,6 +2684,94 @@ local function import_view(st: State): Node?
 end
 
 -- ---------------------------------------------------------------------------------------------
+-- Group name dialog (workflows page)
+
+local GRP_NAME_ID = "layer.grp.name.input"
+
+-- `id`: rename that group; else a new group, which workflow `wf` (when set) moves into.
+local function grp_open(st: State, id: string?, wf: string?)
+	if st.editor or st.form or st.imp or st.grp then
+		return
+	end
+	local x = if id then groups.find(st.core.groups, id) else nil
+	if id and x == nil then
+		toast_err(st, "分组不存在")
+		return
+	end
+	st.grp = { id = id, wf = wf, name = text_field(if x then x.name else ""), error = nil }
+	st.cx:frame({ { "focus", GRP_NAME_ID } })
+end
+
+local function grp_close(st: State)
+	st.grp = nil
+	st.cx:frame({ pair("focus", tern.json.null) })
+end
+
+local function grp_submit(st: State)
+	local d = st.grp
+	if not d then
+		return
+	end
+	local c = st.core
+	local err: string?
+	if d.id then
+		err = core.group_rename(c, d.id, d.name.text)
+	else
+		local gid, cerr = core.group_create(c, d.name.text)
+		err = cerr
+		if gid and d.wf then
+			-- The group exists either way; a failed move is reported, not undone.
+			toast_err(st, core.group_assign(c, d.wf, gid))
+		end
+	end
+	if err then
+		d.error = err
+		return
+	end
+	grp_close(st)
+end
+
+local function group_view(st: State): Node?
+	local d = st.grp
+	if not d then
+		return nil
+	end
+	local wf = if d.wf and st.core.workflows then st.core.workflows.by_id[d.wf] else nil
+	local children: { Node } = {
+		N("field", { key = "name", label = "分组名", hint = `最多 {groups.NAME_MAX} 个字符,不能与已有分组重名` }, {
+			N("input", {
+				key = "input",
+				text = d.name.text,
+				cursor = field.utf16_cursor(d.name),
+				placeholder = "例如 FluxDown",
+				variant = "field",
+			}),
+		}),
+	}
+	if wf then
+		table.insert(children, keyed(muted(`创建后把「{wf.name}」移入这个分组。`), "note"))
+	end
+	if d.error then
+		table.insert(children, keyed(ui.text({ ui.span(d.error, "error") }), "error"))
+	end
+	table.insert(children, N("row", { key = "foot", justify = "end", gap = "sm" }, {
+		btn("取消", "grp-cancel", { variant = "quiet", keys = { "esc" }, key = "cancel", size = "md" }),
+		btn(if d.id then "重命名" else "创建", "grp-ok", { variant = "primary", keys = { "enter" }, key = "ok", size = "md" }),
+	}))
+	return N("col", {}, {
+		N("overlay", {
+			key = "grp",
+			role = "roost.form",
+			head = if d.id then "重命名分组" else "新建分组",
+			icon = "folder",
+			modal = true,
+			size = "sm",
+			foot = "layer.grp.foot",
+		}, children),
+	})
+end
+
+-- ---------------------------------------------------------------------------------------------
 -- View
 
 function M.view(st: State): BlockView
@@ -2562,16 +2812,17 @@ function M.view(st: State): BlockView
 			label = if n and n > 0 then { ui.span(`{tab.label} `), ui.span(tostring(n), "muted") } else tab.label,
 		})
 	end
+	-- Only the page scrolls: the head and the tabs stay put. The body always fills the block below
+	-- the tabs (roost.css, `roost.fill`); a page that is a `col` becomes a `scroll` of the same key,
+	-- role and children, so node ids stay and each page keeps its own scroll position. The wide
+	-- runs page is a split whose panes scroll inside themselves.
+	if body.k == "col" then
+		body.k = "scroll"
+	end
 	local main = N("col", { gap = "lg" }, {
 		header(st),
 		N("tabs", { key = "nav", role = "roost.tabs", active = st.tab, items = nav }),
-		N(
-			"col",
-			if st.tab == "runs" and runs_split(st)
-				then { key = "body", role = "roost.fill", gap = "lg" }
-				else { key = "body", gap = "lg" },
-			{ body }
-		),
+		N("col", { key = "body", role = "roost.fill", gap = "lg" }, { body }),
 	})
 	local legend: { any } = { ui.span("1-7", "key"), ui.span(" 切换页面", "muted") }
 	local function hint(k: string, what: string)
@@ -2587,10 +2838,13 @@ function M.view(st: State): BlockView
 		hint("j/k", "选择工作流")
 		hint("r", "运行")
 		hint("e", "编辑")
+		if #st.core.groups.list > 0 then
+			hint("[ ]", "移到上/下一个分组")
+		end
 		hint("Esc", "取消选中")
 	end
 	local dock = N("col", {}, { ui.text(legend) })
-	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) or import_view(st) }
+	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) or import_view(st) or group_view(st) }
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -2666,6 +2920,8 @@ local function confirmed(st: State, what: string)
 		toast_err(st, core.delete_state(c, string.sub(what, 11)))
 	elseif string.sub(what, 1, 11) == "orphan-del:" then
 		toast_err(st, core.delete_workflow_files(c, string.sub(what, 12)))
+	elseif string.sub(what, 1, 8) == "grp-del:" then
+		toast_err(st, core.group_delete(c, string.sub(what, 9)))
 	else
 		local n = string.match(what, "^rollback%-rev:(%d+)$")
 		if n then
@@ -2719,6 +2975,9 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		end
 	elseif act == "open-log" and target then
 		st.cx:open(`{run_dir(st, target)}/log.txt`)
+	elseif act == "copy-id" and target then
+		st.cx:copy(target)
+		st.cx:toast("success", `已复制运行 ID {target}`)
 	elseif act == "log-wrap" then
 		st.log_wrap = not st.log_wrap
 	elseif act == "sidebar" then
@@ -2816,6 +3075,28 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 			table.insert(ids, wf.id)
 		end
 		export_workflows(st, ids)
+	elseif act == "grp-new" then
+		grp_open(st, nil, nil)
+	elseif string.sub(act, 1, 12) == "grp-new-for:" then
+		grp_open(st, nil, string.sub(act, 13))
+	elseif act == "grp-ren" and value then
+		grp_open(st, value, nil)
+	elseif act == "grp-up" and value then
+		toast_err(st, core.group_move(c, value, -1))
+	elseif act == "grp-down" and value then
+		toast_err(st, core.group_move(c, value, 1))
+	elseif act == "grp-toggle" and value then
+		toast_err(st, core.group_toggle(c, value))
+	elseif act == "grp-cancel" then
+		grp_close(st)
+	elseif act == "grp-ok" then
+		grp_submit(st)
+	elseif string.sub(act, 1, 3) == "mv:" then
+		-- A row of a card's group menu: `mv:<workflow>:<group>` (empty group: ungrouped).
+		local wf, gid = string.match(act, "^mv:([^:]+):(.*)$")
+		if wf and gid then
+			toast_err(st, core.group_assign(c, wf, if gid == "" then nil else gid))
+		end
 	elseif act == "imp-open" then
 		imp_open(st)
 	elseif act == "imp-cancel" then
@@ -2916,6 +3197,8 @@ function M.event(st: State, ev: UiEvent)
 	elseif ev.ev == "focus" then
 		if st.imp then
 			st.cx:frame({ { "focus", IMP_PATH_ID } })
+		elseif st.grp then
+			st.cx:frame({ { "focus", GRP_NAME_ID } })
 		elseif st.form then
 			local i = tonumber(string.match(ev.id or "", "^layer%.form%.field(%d+)%.input$") or "")
 			if i and st.form.fields[i] then
@@ -2985,6 +3268,21 @@ function M.key(st: State, key: Key): boolean?
 		local fl = f.fields[f.focus]
 		if fl and field.key(fl, key) then
 			f.error = nil
+			return true
+		end
+		return false
+	end
+	local gd = st.grp
+	if gd then
+		if key.name == "escape" then
+			grp_close(st)
+			return true
+		elseif key.name == "enter" then
+			grp_submit(st)
+			return true
+		end
+		if field.key(gd.name, key) then
+			gd.error = nil
 			return true
 		end
 		return false
@@ -3068,23 +3366,43 @@ function M.key(st: State, key: Key): boolean?
 			st.wf_id = nil
 			return true
 		end
+		local shown = shown_workflows(st, w)
 		local sel = selected_workflow(st, w)
 		if not sel then
 			-- Nothing picked yet: j/k pick the first card; r/e need a pick.
-			if (key.name == "j" or key.name == "down" or key.name == "k" or key.name == "up") and w.list[1] then
-				st.wf_id = w.list[1].id
+			if (key.name == "j" or key.name == "down" or key.name == "k" or key.name == "up") and shown[1] then
+				st.wf_id = shown[1].id
 				return true
 			end
 			return false
 		end
 		if key.name == "j" or key.name == "down" or key.name == "k" or key.name == "up" then
+			if #shown == 0 then
+				return false
+			end
 			local delta = if key.name == "j" or key.name == "down" then 1 else -1
-			local idx = table.find(w.list, sel) or 1
-			local nxt = w.list[math.clamp(idx + delta, 1, #w.list)]
+			local idx = table.find(shown, sel)
+			-- The pick is in a folded group: start over from the first shown card.
+			local nxt = if idx then shown[math.clamp(idx + delta, 1, #shown)] else shown[1]
 			if nxt.id == sel.id then
 				return false
 			end
 			st.wf_id = nxt.id
+			return true
+		elseif (key.name == "[" or key.name == "]") and #st.core.groups.list > 0 then
+			-- The picked workflow to the previous / next group; past the last group is 未分组.
+			local g = st.core.groups
+			local order: { string } = {}
+			for _, x in g.list do
+				table.insert(order, x.id)
+			end
+			local cur = groups.group_of(g, sel.id)
+			local at = if cur then table.find(order, cur) :: number else #order + 1
+			local to = math.clamp(at + (if key.name == "]" then 1 else -1), 1, #order + 1)
+			if to == at then
+				return false
+			end
+			toast_err(st, core.group_assign(st.core, sel.id, order[to]))
 			return true
 		elseif key.name == "r" and sel.manual then
 			do_action(st, "dispatch", sel.id, nil)
