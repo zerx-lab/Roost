@@ -18,6 +18,7 @@ local match = require("./match")
 local agent = require("./agent")
 local stats = require("./stats")
 local loginenv = require("./loginenv")
+local files = require("./files")
 
 local M = {}
 
@@ -402,6 +403,8 @@ local function resolve(r: Runner, run: Run): (Workflow?, boolean)
 		inputs = {},
 		triggers = {},
 		steps = {},
+		libs = {},
+		state = run.workflow,
 	}
 	return stub, true
 end
@@ -568,6 +571,8 @@ local function finish(r: Runner, run: Run, state: string, reason: string?)
 	if run.identity == "app" then
 		pcall(tern.fs.remove, token_path(r, run.id))
 	end
+	-- Scratch ($ROOST_TMP) goes out of process; the run's file copies stay with its directory.
+	store.discard(r.env.store, `{dir_of(r, run.id)}/tmp`)
 	r.live[run.id] = nil
 end
 
@@ -701,6 +706,12 @@ local function step_env(r: Runner, run: Run, wf: Workflow, app: boolean): { [str
 	put("ROOST_REPO_PATH", run.repo_path)
 	put("ROOST_WORKSPACE", run.cwd)
 	put("ROOST_RUN_DIR", dir_of(r, run.id))
+	-- Copies taken when the run started (lib/files.luau), the state kept across runs, and scratch.
+	put("ROOST_FILES", `{dir_of(r, run.id)}/files`)
+	put("ROOST_LIB", `{dir_of(r, run.id)}/lib`)
+	put("ROOST_STATE", files.state_dir(r.env.data, wf.state))
+	put("ROOST_TMP", `{dir_of(r, run.id)}/tmp`)
+	put("PYTHONPYCACHEPREFIX", `{dir_of(r, run.id)}/tmp/pycache`)
 	put("ROOST_EVENT_PATH", `{dir_of(r, run.id)}/event.json`)
 	put("ROOST_INFO_PATH", `{dir_of(r, run.id)}/info.json`)
 	put("ROOST_EVENT", e.event)
@@ -1269,10 +1280,24 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 			else
 				argv = { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌或身份文件,omp 步骤未启动' >&2; exit 1" }
 			end
+		elseif app_missing(r, run) then
+			argv = { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌,步骤未以 App 身份启动' >&2; exit 1" }
+		elseif step.kind == "file" and step.file then
+			-- The run's copy (taken when it started), run by the interpreter for its extension.
+			local ref = step.file :: model.FileRef
+			local path = files.staged(d, ref)
+			local interp = model.interpreter(ref.path)
+			local okx, there = pcall(tern.fs.exists, path)
+			if interp and okx and there == true then
+				argv = table.clone(interp)
+				table.insert(argv, path)
+				table.move(step.args, 1, #step.args, #argv + 1, argv)
+			else
+				local missing = `[roost] 本次运行的文件副本里没有 {model.file_ref_text(ref)}(运行开始后才加入的文件不会出现在副本中)`
+				argv = { "/bin/sh", "-c", 'echo "$1" >&2; exit 1', "roost", missing }
+			end
 		else
-			argv = if app_missing(r, run)
-				then { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌,步骤未以 App 身份启动' >&2; exit 1" }
-				else { cfg.shell, "-c", step.script or "true" }
+			argv = { cfg.shell, "-c", step.script or "true" }
 		end
 	end
 	local deadline = run.deadline or (now(r) + cfg.default_timeout)
@@ -1380,7 +1405,7 @@ local function step_done(r: Runner, run: Run, wf: Workflow, code: number)
 				else `{s.name} 退出码 {code}`
 		end
 	end
-	if def and def.kind == "run" and code >= 0 then
+	if def and def.kind ~= "omp" and code >= 0 then
 		-- The wrapper wrote the exit file, so $ROOST_OUTPUT is a regular file or gone.
 		local stop = take_outputs(r, run, run.step)
 		if stop and code == 0 and run.final == nil then
@@ -1558,10 +1583,33 @@ function M.pump(r: Runner)
 				continue
 			end
 			local w = wf :: Workflow
+			-- A directory this run uses that is queued for deletion would be removed under it: wait
+			-- for the removal to finish (tick pumps again every second).
+			local data = r.env.data
+			local waits = { files.state_dir(data, w.state), files.workflow_home(data, w.id) }
+			for _, lib in w.libs do
+				table.insert(waits, files.lib_root(data, lib))
+			end
+			local blocked = false
+			for _, p in waits do
+				blocked = blocked or store.pending(r.env.store, p)
+			end
+			if blocked then
+				M.schedule(r, 1000)
+				continue
+			end
+			run.started_at = now(r)
+			-- The run's copies of its files, taken now: later edits never change a run in progress.
+			local staged = files.stage(r.env.data, w, dir_of(r, run.id))
+			if staged then
+				append_log(r, run.id, { `[roost] 准备文件失败:{staged}` })
+				finish(r, run, "failed", `准备文件失败:{staged}`)
+				persist(r)
+				continue
+			end
 			running[run.workflow] = true
 			n += 1
 			run.state = "running"
-			run.started_at = now(r)
 			run.deadline = now(r) + (w.timeout or r.env.config().runner.default_timeout)
 			next_step(r, run, w)
 		end

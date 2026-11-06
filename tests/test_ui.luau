@@ -134,7 +134,7 @@ end
 do -- the host block renders every page; keys switch pages
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = ROOST })
 	step(w, 1)
-	for i, id in { "overview", "runs", "workflows", "events", "relay", "config" } do
+	for i, id in { "overview", "runs", "workflows", "events", "relay", "config", "files" } do
 		eq(press(w, tostring(i)), if i == 1 then false else true, `key {i}`)
 		eq(w.st.tab, id)
 		local v = view(w)
@@ -517,6 +517,177 @@ do -- today's spend and a step condition show on the workflow card
 	truthy(string.find(spans_text(item("triage", "步骤")), "条件 out.verify", 1, true) ~= nil, "positive when")
 	triage.steps[1].when = { source = "input", key = "dry_run", negate = true }
 	truthy(string.find(spans_text(item("triage", "步骤")), "条件 !input.dry_run", 1, true) ~= nil, "negated when")
+end
+
+local function btn_with(v: any, act: string): any
+	return find(v, function(x)
+		return x.k == "button" and x.p and x.p.actions and x.p.actions.click == act
+	end)
+end
+
+-- Two real clicks of a confirm button, far enough apart to count.
+local function confirm_click(w: World, what: string)
+	w.ui.event(w.st, { ev = "action", act = "confirm", value = what })
+	w.env.advance(1000)
+	w.ui.event(w.st, { ev = "action", act = "confirm", value = what })
+end
+
+local function act(w: World, name: string, value: string?)
+	w.ui.event(w.st, { ev = "action", act = name, value = value })
+end
+
+do -- the files page: libraries, their files, saving, and deleting with two clicks
+	local w = world({
+		[DATA .. "/workflows.toml"] = WORKFLOWS,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/library/kit/hello.sh"] = "echo hi\n",
+		[DATA .. "/state/old/x"] = "1",
+	})
+	w.st.tab = "files"
+	local v = view(w)
+	local text = F.text(v.main)
+	truthy(string.find(text, "kit", 1, true), "the library is listed")
+	truthy(string.find(text, "未被使用", 1, true), "and its use")
+	truthy(string.find(text, "old", 1, true), "a state directory is listed")
+
+	act(w, "fp-lib", "kit")
+	v = view(w)
+	truthy(string.find(F.text(v.main), "hello.sh", 1, true), "the library's file is listed")
+	local editor_node = find(v.main, function(x)
+		return x.k == "editor" and x.p and x.p.lang == "bash"
+	end)
+	truthy(editor_node, "the file is edited in a multi-line editor with its language")
+	eq(editor_node.p.text, "echo hi\n")
+
+	-- Edit (two lines typed through the keys), save, and the file on disk changes.
+	w.st.fp.focus = "edit"
+	press(w, "end")
+	press(w, "x", "x")
+	press(w, "enter")
+	press(w, "y", "y")
+	eq(w.st.fp.fields.edit.text, "echo hi\nx\ny", "typing and Enter edit the open file")
+	act(w, "tab", "files")
+	act(w, "fp-save")
+	eq(w.env.files[DATA .. "/library/kit/hello.sh"], w.st.fp.fields.edit.text, "saved to the library")
+
+	-- A new file, then a rename that keeps the content.
+	w.st.fp.fields.newfile = { text = "tools/scan.py", cursor = 13 }
+	act(w, "fp-newfile")
+	eq(w.env.files[DATA .. "/library/kit/tools/scan.py"], "", "new file created")
+	eq(w.st.fp.sel, "tools/scan.py")
+	w.st.fp.fields.edit = { text = "print(1)\n", cursor = 9, lines = true }
+	w.st.fp.fields.ren = { text = "tools/go.py", cursor = 11 }
+	act(w, "fp-ren")
+	eq(w.env.files[DATA .. "/library/kit/tools/go.py"], "print(1)\n", "renamed with its edited content")
+	eq(w.env.files[DATA .. "/library/kit/tools/scan.py"], nil)
+
+	-- Unsaved edits block switching file instead of being lost.
+	w.st.fp.fields.edit = { text = "changed", cursor = 7, lines = true }
+	act(w, "fp-file", "hello.sh")
+	eq(w.st.fp.sel, "tools/go.py", "stays on the dirty file")
+	truthy(#w.cx.toasts > 0 and string.find(w.cx.toasts[#w.cx.toasts].text, "未保存", 1, true), "and says why")
+	act(w, "fp-revert")
+	eq(w.st.fp.fields.edit.text, "print(1)\n")
+
+	-- Deleting needs two clicks.
+	w.ui.event(w.st, { ev = "action", act = "confirm", value = "file-del:tools/go.py" })
+	truthy(w.env.files[DATA .. "/library/kit/tools/go.py"], "one click deletes nothing")
+	confirm_click(w, "file-del:tools/go.py")
+	eq(w.env.files[DATA .. "/library/kit/tools/go.py"], nil, "second click deletes")
+
+	-- State directories go the same way; a library goes when no workflow uses it.
+	confirm_click(w, "state-del:old")
+	w.env.advance(200)
+	eq(w.env.files[DATA .. "/state/old/x"], nil, "state directory deleted on request")
+	confirm_click(w, "lib-del:kit")
+	w.env.advance(200)
+	eq(w.env.tern.fs.exists(DATA .. "/library/kit"), false, "unused library deleted")
+end
+
+do -- a library in use refuses to go, and says by whom
+	local lib_wf = '[[workflow]]\nid = "uses"\nlibs = ["kit"]\n[[workflow.step]]\nfile = "@kit/a.py"\n'
+	local w = world({
+		[DATA .. "/workflows.toml"] = lib_wf,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/library/kit/a.py"] = "print(1)\n",
+	})
+	w.st.tab = "files"
+	truthy(string.find(F.text(view(w).main), "uses", 1, true), "the page names the workflow using the library")
+	confirm_click(w, "lib-del:kit")
+	w.env.advance(200)
+	truthy(w.env.files[DATA .. "/library/kit/a.py"], "the library stays")
+	truthy(string.find(w.cx.toasts[#w.cx.toasts].text, "uses", 1, true), "the refusal names the workflow")
+end
+
+do -- export copies the path; import previews and brings the workflow back disabled
+	local w = world({
+		[DATA .. "/workflows.toml"] = WORKFLOWS .. '\n[[workflow]]\nid = "scripted"\n[[workflow.step]]\nfile = "run.py"\n',
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/scripted/files/run.py"] = "print('hi')\n",
+	})
+	w.st.tab = "workflows"
+	truthy(btn_with(view(w).main, "export-all"), "export all in the toolbar")
+	truthy(btn_with(view(w).main, "export=scripted"), "export on the card")
+	act(w, "export", "scripted")
+	eq(#w.cx.copied, 1, "the path was copied")
+	local path = w.cx.copied[1]
+	truthy(string.match(path, "/data/exports/.+scripted%.roost%.toml$"), path)
+	truthy(w.env.files[path], "the export file exists")
+	truthy(string.find(w.cx.toasts[#w.cx.toasts].text, "已导出", 1, true), "success toast")
+	act(w, "export-all")
+	eq(#w.cx.copied, 2)
+
+	-- Import it into a fresh install.
+	local t = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL, [path] = w.env.files[path] })
+	t.st.tab = "workflows"
+	act(t, "imp-open")
+	local layer = view(t).layer
+	truthy(layer, "the import overlay opens")
+	local run_btn = btn_with(layer, "imp-run")
+	truthy(run_btn and run_btn.p.disabled, "importing needs a preview first")
+	t.st.imp.path = { text = path, cursor = #path }
+	act(t, "imp-preview")
+	layer = view(t).layer
+	truthy(string.find(F.text(layer), "scripted", 1, true), "the preview lists the workflow")
+	truthy(string.find(F.text(layer), "新增,导入后停用", 1, true), "and what importing does")
+	act(t, "imp-run")
+	eq(t.st.imp, nil, "the overlay closes on success")
+	local imported = t.c.workflows.by_id.scripted
+	truthy(imported, "the workflow is back")
+	eq(imported.enabled, false, "disabled")
+	eq(t.env.files[DATA .. "/workflows/scripted/files/run.py"], "print('hi')\n", "with its file")
+	truthy(string.find(t.cx.toasts[#t.cx.toasts].text, "已导入", 1, true), "summary toast")
+
+	-- The editor owns the layer: import does not open over it.
+	act(t, "editor-new")
+	act(t, "imp-open")
+	eq(t.st.imp, nil)
+
+	-- A broken path shows its error in the overlay, and nothing is written.
+	local u = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	act(u, "imp-open")
+	u.st.imp.path = { text = "/nowhere.roost.toml", cursor = 19 }
+	act(u, "imp-preview")
+	truthy(string.find(F.text(view(u).layer), "无法读取", 1, true), "preview error shown")
+end
+
+do -- storage lists the new areas and clears exports with two clicks
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	act(w, "export-all")
+	eq(#w.c.store.runs, 0)
+	w.st.tab = "config"
+	local labels = ""
+	F.walk(view(w).main, function(x)
+		if x.k == "kv" and x.p and x.p.items then
+			for _, item in x.p.items do
+				labels ..= tostring(item[1] or item.k) .. "|"
+			end
+		end
+	end)
+	truthy(string.find(labels, "导出文件", 1, true) and string.find(labels, "脚本与文件", 1, true) and string.find(labels, "状态目录", 1, true), "storage rows: " .. labels)
+	confirm_click(w, "clear-exports")
+	w.env.advance(200)
+	eq(#w.core.exports(w.c), 0, "exports cleared")
 end
 
 print("ok")

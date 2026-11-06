@@ -11,6 +11,9 @@ local match = require("./match")
 local util = require("./util")
 local eventlog = require("./eventlog")
 local loginenv = require("./loginenv")
+local files = require("./files")
+local bundle = require("./bundle")
+local toml = require("./toml")
 
 local M = {}
 
@@ -33,7 +36,7 @@ local DELIVERIES_TTL = 30
 export type Notice = { at: number, level: string, text: string }
 export type EventRow = eventlog.Row
 -- The last retention pass: what it removed and whether someone asked for it.
-export type Cleanup = { at: number, runs: number, events: number, orphans: number, manual: boolean }
+export type Cleanup = { at: number, runs: number, events: number, orphans: number, exports: number, manual: boolean }
 export type Disk = { loading: boolean, at: number?, error: string?, sizes: { [string]: number } }
 export type Deliveries = { loading: boolean, at: number?, error: string?, body: { [string]: any }? }
 export type CronRow = {
@@ -194,6 +197,11 @@ run = "echo 'Roost 运行于' \"$(date)\""
 local function read_file(path: string): string?
 	local ok, text = pcall(tern.fs.read, path, MAX_FILE)
 	return if ok then text :: string else nil
+end
+
+local function exists(path: string): boolean
+	local ok, yes = pcall(tern.fs.exists, path)
+	return ok and yes == true
 end
 
 -- Wall clock in epoch seconds; tests replace it.
@@ -654,6 +662,9 @@ end
 -- Retention: roost.toml [retention] applied at start, hourly, after the policy changes and on
 -- demand. Only finished runs go; their directories are deleted in the background (drain).
 
+-- Defined with the export functions below.
+local prune_exports: (c: Core) -> number
+
 function M.housekeep(c: Core, manual: boolean)
 	if manual and not c.store.policy then
 		M.notice(c, "error", "roost.toml 有错误,保留策略还没有生效:修好后再清理")
@@ -666,19 +677,21 @@ function M.housekeep(c: Core, manual: boolean)
 	if events > 0 then
 		save_events(c)
 	end
+	local exports = if c.store.policy then prune_exports(c) else 0
 	local orphans = store.sweep(c.store, SWEEP_CAP)
 	if runs > 0 then
 		runner.save(c.runner)
 	end
-	local done: Cleanup = { at = t, runs = runs, events = events, orphans = orphans, manual = manual :: boolean }
+	local done: Cleanup =
+		{ at = t, runs = runs, events = events, orphans = orphans, exports = exports, manual = manual :: boolean }
 	c.cleanup = done
 	if manual then
 		M.notice(
 			c,
 			"success",
-			if runs + events + orphans == 0
+			if runs + events + orphans + exports == 0
 				then "没有超出保留策略的内容"
-				else `已清理 {runs} 个运行、{events} 条事件记录、{orphans} 个遗留目录`
+				else `已清理 {runs} 个运行、{events} 条事件记录、{exports} 个旧导出文件、{orphans} 个遗留目录`
 		)
 	end
 	M.changed(c)
@@ -1188,9 +1201,67 @@ local function runtime_issues(c: Core, wf: model.Workflow, out: { model.Issue })
 	end
 end
 
--- Issues of `raw` as it would be saved: its own (path under workflow.<id>) and file-level ones.
-function M.check_workflow(c: Core, old_id: string?, raw: { [string]: any }): { model.Issue }
+-- The workflow's own files as they would be saved: `wfiles` when the editor passes them, else
+-- what is on disk for `id`.
+local function own_files(c: Core, id: string, wfiles: { [string]: string }?): ({ [string]: string }?, string?)
+	if wfiles then
+		return wfiles, nil
+	end
+	local tree, err = files.load(files.workflow_root(c.data, id))
+	return if tree then tree.text else nil, err
+end
+
+-- Problems with the files a workflow uses: its own (as they would be saved) and its libraries'.
+local function file_issues(c: Core, wf: model.Workflow, wfiles: { [string]: string }?, out: { model.Issue })
+	local base = `workflow.{wf.id}`
+	local own, err = own_files(c, wf.id, wfiles)
+	local bad = err or (if own then files.check(own) else nil)
+	if bad then
+		table.insert(out, { file = "workflows.toml", path = `{base}.files`, message = `工作流文件:{bad}`, line = wf.line })
+	end
+	local missing: { [string]: boolean } = {}
+	for _, lib in wf.libs do
+		if not exists(files.lib_root(c.data, lib)) then
+			missing[lib] = true
+			table.insert(out, { file = "workflows.toml", path = `{base}.libs`, message = `文件库 "{lib}" 不存在`, line = wf.line })
+		end
+	end
+	for i, s in wf.steps do
+		local ref = s.file
+		if ref then
+			local there = if ref.lib
+				then missing[ref.lib] or exists(`{files.lib_root(c.data, ref.lib)}/{ref.path}`)
+				else own ~= nil and own[ref.path] ~= nil
+			if not there then
+				table.insert(out, {
+					file = "workflows.toml",
+					path = `{base}.step[{i}].file`,
+					message = if ref.lib
+						then `文件库 "{ref.lib}" 里没有 {ref.path}`
+						else `本工作流没有文件 {ref.path}`,
+					line = wf.line,
+				})
+			end
+		end
+	end
+end
+
+-- `raw` ready to save: an id (with_id), and when the id changes while the workflow keeps its
+-- default state group, `state` pinned to the old id so the kept state isn't left behind.
+local function prepared(c: Core, old_id: string?, raw: { [string]: any }): { [string]: any }
 	local full = with_id(c, old_id, raw)
+	if old_id and full.id ~= old_id and full.state == nil and exists(files.state_dir(c.data, old_id)) then
+		full = table.clone(full)
+		full.state = old_id
+	end
+	return full
+end
+
+-- Issues of `raw` as it would be saved: its own (path under workflow.<id>) and file-level ones.
+-- `wfiles` (path → text): the workflow's own files as they would be saved; nil checks those on
+-- disk.
+function M.check_workflow(c: Core, old_id: string?, raw: { [string]: any }, wfiles: { [string]: string }?): { model.Issue }
+	local full = prepared(c, old_id, raw)
 	local text, err = compose(c, old_id, full)
 	if text == nil then
 		return file_issue(err or "无法写回 workflows.toml")
@@ -1207,6 +1278,7 @@ function M.check_workflow(c: Core, old_id: string?, raw: { [string]: any }): { m
 	local wf = if w then w.by_id[full.id] else nil
 	if wf then
 		runtime_issues(c, wf, out)
+		file_issues(c, wf, if wfiles == nil and old_id and old_id ~= full.id then own_files(c, old_id, nil) else wfiles, out)
 	end
 	return out
 end
@@ -1235,20 +1307,94 @@ local function write_workflows(c: Core, old: string, text: string): string?
 end
 
 -- Saves `raw` over workflow `old_id` (nil: a new one). Nil when written and reloaded, else the
--- issues that stopped it. workflows.toml.bak keeps the previous file.
-function M.save_workflow(c: Core, old_id: string?, raw: { [string]: any }): { model.Issue }?
-	local issues = M.check_workflow(c, old_id, raw)
+-- issues that stopped it. workflows.toml.bak keeps the previous file. `wfiles` replaces the
+-- workflow's own files (nil keeps them; a changed id moves them along). `base` is what the editor
+-- loaded them as: only files that were in it are removed, and a file changed on disk since is
+-- not overwritten. Files are written before workflows.toml, so the new definition never runs
+-- without its files.
+function M.save_workflow(
+	c: Core,
+	old_id: string?,
+	raw: { [string]: any },
+	wfiles: { [string]: string }?,
+	base: { [string]: string }?
+): { model.Issue }?
+	local issues = M.check_workflow(c, old_id, raw, wfiles)
 	if #issues > 0 then
 		return issues
 	end
-	local text, err, old = compose(c, old_id, with_id(c, old_id, raw))
+	local full = prepared(c, old_id, raw)
+	local text, err, old = compose(c, old_id, full)
 	if text == nil or old == nil then
 		return file_issue(err or "无法写回 workflows.toml")
 	end
+	local id = full.id :: string
+	local moved = old_id ~= nil and old_id ~= id
+	-- Files written into a directory that is about to be deleted would go with it.
+	if store.pending(c.store, files.workflow_home(c.data, id)) then
+		return file_issue(`工作流 "{id}" 的旧文件正在删除,稍后再保存`)
+	end
+	local want = wfiles
+	if moved then
+		-- The new id's directory must not already hold files: replacing them would delete what a
+		-- hand-restored or orphaned directory kept.
+		local there, terr = files.load(files.workflow_root(c.data, id))
+		if there == nil then
+			return file_issue(`无法读取 "{id}" 的文件目录:{terr}`)
+		elseif #there.paths > 0 then
+			return file_issue(`工作流 "{id}" 的文件目录里已有文件,先在「文件」页清理再改 id`)
+		end
+		if want == nil then
+			local cur, lerr = own_files(c, old_id :: string, nil)
+			if cur == nil then
+				return file_issue(`无法读取原工作流的文件:{lerr}`)
+			end
+			want = cur
+		end
+	end
+	if want then
+		local ferr = files.replace(files.workflow_root(c.data, id), want, if moved then nil else base)
+		if ferr then
+			return file_issue(`无法保存工作流文件,没有写入 workflows.toml:{ferr}`)
+		end
+	end
 	local werr = write_workflows(c, old, text)
-	return if werr then file_issue(werr) else nil
+	if werr then
+		return file_issue(werr)
+	end
+	if moved then
+		-- Only what the editor loaded leaves the old directory (and only if it is unchanged there):
+		-- a file added or edited elsewhere meanwhile, hidden files and the directory itself stay.
+		local old_home = files.workflow_home(c.data, old_id :: string)
+		local old_root = `{old_home}/files`
+		local leftover: string? = nil
+		local snapshot = base
+		if snapshot then
+			local on_disk = files.load(old_root)
+			for rel, was in snapshot do
+				if on_disk and on_disk.text[rel] == was then
+					files.remove(old_root, rel)
+				end
+			end
+		else
+			-- No base (the files moved untouched): everything listed was copied, so it can go.
+			files.replace(old_root, {})
+		end
+		local ok, left = pcall(tern.fs.list, old_root)
+		if ok and type(left) == "table" and #(left :: { string }) == 0 then
+			store.discard(c.store, old_home)
+		else
+			leftover = old_home
+		end
+		if leftover then
+			M.notice(c, "warning", `工作流 {old_id} 的旧目录里还有没复制的文件,已保留:{leftover}`)
+		end
+		M.changed(c)
+	end
+	return nil
 end
 
+-- Removes workflow `id` from workflows.toml, then its own files (its state stays: see M.states).
 function M.delete_workflow(c: Core, id: string): string?
 	local old, rerr = current_text(c)
 	if old == nil then
@@ -1258,13 +1404,646 @@ function M.delete_workflow(c: Core, id: string): string?
 	if text == nil then
 		return err
 	end
-	return write_workflows(c, old, text)
+	local werr = write_workflows(c, old, text)
+	if werr == nil and model.valid_lib(id) then
+		store.discard(c.store, files.workflow_home(c.data, id))
+		M.changed(c)
+	end
+	return werr
 end
 
 -- The TOML-shaped table of workflow `id` as it is in the file now.
 function M.workflow_raw(c: Core, id: string): { [string]: any }?
 	local text = read_file(c.paths.workflows)
 	return if text then model.raw_workflow(text, id) else nil
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Workflow files, the file library, state directories, export and import (lib/files.luau,
+-- lib/bundle.luau). Runs use copies (files.stage); everything here edits the originals.
+
+-- Export files kept (newest first) once the retention policy is in force.
+M.MAX_EXPORTS = 50
+
+export type LibInfo = { name: string, used_by: { string } }
+export type StateInfo = { name: string, used_by: { string } }
+export type ImportPlan = {
+	path: string,
+	workflows: { { id: string, name: string, exists: boolean } },
+	libraries: { { name: string, exists: boolean, same: boolean } },
+	repos: { { name: string, exists: boolean } },
+	files: number,
+}
+
+-- The workflow's own files on disk.
+function M.workflow_files(c: Core, id: string): (files.Tree?, string?)
+	if not model.valid_lib(id) then
+		return { paths = {}, text = {} }, nil
+	end
+	return files.load(files.workflow_root(c.data, id))
+end
+
+-- name → ids of the workflows `pick` says use it.
+local function users(c: Core, pick: (model.Workflow) -> { string }): { [string]: { string } }
+	local out: { [string]: { string } } = {}
+	local w = c.workflows
+	if w then
+		for _, wf in w.list do
+			for _, n in pick(wf) do
+				out[n] = out[n] or {}
+				table.insert(out[n], wf.id)
+			end
+		end
+	end
+	return out
+end
+
+-- The libraries on disk and which workflows use them.
+function M.libraries(c: Core): { LibInfo }
+	local used = users(c, function(wf)
+		return wf.libs
+	end)
+	local out: { LibInfo } = {}
+	for _, name in files.libs(c.data) do
+		table.insert(out, { name = name, used_by = used[name] or {} })
+	end
+	return out
+end
+
+local function lib_root(c: Core, name: string): (string?, string?)
+	if not model.valid_lib(name) then
+		return nil, `文件库名 "{name}" 无效`
+	end
+	local root = files.lib_root(c.data, name)
+	if not exists(root) then
+		return nil, `文件库 "{name}" 不存在`
+	end
+	return root, nil
+end
+
+function M.library_files(c: Core, name: string): (files.Tree?, string?)
+	local root, err = lib_root(c, name)
+	if root == nil then
+		return nil, err
+	end
+	return files.load(root)
+end
+
+function M.create_library(c: Core, name: string): string?
+	if not model.valid_lib(name) then
+		return `文件库名 "{name}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`
+	end
+	local root = files.lib_root(c.data, name)
+	if store.pending(c.store, root) then
+		return `文件库 "{name}" 正在删除,稍后再创建`
+	elseif exists(root) then
+		return `文件库 "{name}" 已存在`
+	end
+	local ok, err = pcall(function(): string?
+		tern.fs.mkdir(root)
+		return nil
+	end)
+	if not ok then
+		return `无法创建文件库:{err}`
+	end
+	M.changed(c)
+	return nil
+end
+
+-- The workflows with a step running `@name/path`; "" when none, or why it can't be told.
+local function step_users(c: Core, name: string, path: string): (string, string?)
+	if c.workflows == nil or #c.workflow_issues > 0 then
+		return "", "workflows.toml 有错误,无法确认有没有步骤在用这个文件:修好后再改"
+	end
+	local out: { string } = {}
+	for _, wf in c.workflows.list do
+		for _, s in wf.steps do
+			local ref = s.file
+			if ref and ref.lib == name and ref.path == path then
+				table.insert(out, wf.id)
+				break
+			end
+		end
+	end
+	return table.concat(out, "、"), nil
+end
+
+-- Writes one library file (`from` given: renames that file to `path` at the same time). The whole
+-- library must stay within the limits.
+function M.save_library_file(c: Core, name: string, path: string, text: string, from: string?): string?
+	local root, err = lib_root(c, name)
+	if root == nil then
+		return err
+	end
+	local tree, lerr = files.load(root)
+	if tree == nil then
+		return lerr
+	end
+	local all = table.clone(tree.text)
+	if from and from ~= path then
+		if all[from] == nil then
+			return `文件库 "{name}" 里没有 {from}`
+		elseif all[path] ~= nil and string.lower(path) ~= string.lower(from) then
+			return `{path} 已存在`
+		end
+		-- A step names the old path: the rename would break its next run.
+		local used, uerr = step_users(c, name, from)
+		if uerr then
+			return uerr
+		elseif used ~= "" then
+			return `{from} 仍被工作流 {used} 的步骤使用,先改步骤再重命名`
+		end
+		all[from] = nil
+	end
+	all[path] = text
+	local bad = files.check(all)
+	if bad then
+		return bad
+	end
+	local werr: string? = nil
+	if from and from ~= path and string.lower(from) == string.lower(path) then
+		-- A case-only rename is one file on a case-insensitive disk: writing the new name would
+		-- overwrite the old one, and removing the old name afterwards would delete the result.
+		-- The content is in `text`, so the old name goes first.
+		werr = files.remove(root, from)
+		if werr == nil then
+			werr = files.write(root, path, text)
+		end
+	else
+		werr = files.write(root, path, text)
+		if werr == nil and from and from ~= path then
+			werr = files.remove(root, from)
+		end
+	end
+	M.changed(c)
+	return werr
+end
+
+function M.delete_library_file(c: Core, name: string, path: string): string?
+	local root, err = lib_root(c, name)
+	if root == nil then
+		return err
+	end
+	local used, uerr = step_users(c, name, path)
+	if uerr then
+		return uerr
+	elseif used ~= "" then
+		return `{path} 仍被工作流 {used} 的步骤使用`
+	end
+	local rerr = files.remove(root, path)
+	M.changed(c)
+	return rerr
+end
+
+-- Deletes a library no workflow uses.
+function M.delete_library(c: Core, name: string): string?
+	local root, err = lib_root(c, name)
+	if root == nil then
+		return err
+	end
+	if c.workflows == nil or #c.workflow_issues > 0 then
+		return "workflows.toml 有错误,无法确认文件库是否仍被使用:修好后再删除"
+	end
+	for _, info in M.libraries(c) do
+		if info.name == name and #info.used_by > 0 then
+			return `仍被工作流 {table.concat(info.used_by, "、")} 使用`
+		end
+	end
+	store.discard(c.store, root)
+	M.changed(c)
+	return nil
+end
+
+-- The state directories on disk and the workflows whose state group they are.
+function M.states(c: Core): { StateInfo }
+	local used = users(c, function(wf)
+		return { wf.state }
+	end)
+	local out: { StateInfo } = {}
+	for _, name in files.names(`{c.data}/state`) do
+		table.insert(out, { name = name, used_by = used[name] or {} })
+	end
+	return out
+end
+
+-- Deletes a state directory (a workflow still using it starts over), unless a queued or running
+-- run uses it.
+function M.delete_state(c: Core, name: string): string?
+	if not model.valid_lib(name) then
+		return `状态目录名 "{name}" 无效`
+	end
+	if #c.workflow_issues > 0 then
+		return "workflows.toml 有错误,无法确认哪些工作流在用这个状态目录:修好后再删除"
+	end
+	local w = c.workflows
+	for _, r in c.store.runs do
+		if r.state == "queued" or r.state == "running" then
+			local wf = if w then w.by_id[r.workflow] else nil
+			if wf == nil or wf.state == name then
+				return "有排队或正在执行的运行可能在用这个状态目录,等它们结束后再删除"
+			end
+		end
+	end
+	store.discard(c.store, files.state_dir(c.data, name))
+	M.changed(c)
+	return nil
+end
+
+-- Ids under workflows/ with no such workflow (left by hand edits of workflows.toml); empty while
+-- workflows.toml has errors (the last good copy would call a workflow added since an orphan).
+function M.orphan_workflow_files(c: Core): { string }
+	local w = c.workflows
+	local out: { string } = {}
+	if w and #c.workflow_issues == 0 then
+		for _, id in files.names(`{c.data}/workflows`) do
+			if w.by_id[id] == nil then
+				table.insert(out, id)
+			end
+		end
+	end
+	return out
+end
+
+function M.delete_workflow_files(c: Core, id: string): string?
+	if table.find(M.orphan_workflow_files(c), id) == nil then
+		return `工作流 "{id}" 仍在使用这些文件`
+	end
+	store.discard(c.store, files.workflow_home(c.data, id))
+	M.changed(c)
+	return nil
+end
+
+local function export_file(name: string): boolean
+	return string.sub(name, -#bundle.SUFFIX) == bundle.SUFFIX and string.match(name, "^[%w%-_%.]+$") ~= nil
+end
+
+-- Export file names, newest first (names start with the time).
+function M.exports(c: Core): { string }
+	local ok, names = pcall(tern.fs.list, files.exports_dir(c.data))
+	local out: { string } = {}
+	if ok and type(names) == "table" then
+		for _, n in names :: { string } do
+			if export_file(n) then
+				table.insert(out, n)
+			end
+		end
+	end
+	table.sort(out, function(a, b)
+		return a > b
+	end)
+	return out
+end
+
+-- Deletes every export file; returns how many were queued.
+function M.clear_exports(c: Core): number
+	local list = M.exports(c)
+	for _, n in list do
+		store.discard(c.store, `{files.exports_dir(c.data)}/{n}`)
+	end
+	M.changed(c)
+	return #list
+end
+
+-- Queues exports past MAX_EXPORTS; returns how many.
+function prune_exports(c: Core): number
+	local list = M.exports(c)
+	local n = 0
+	for i = M.MAX_EXPORTS + 1, #list do
+		store.discard(c.store, `{files.exports_dir(c.data)}/{list[i]}`)
+		n += 1
+	end
+	return n
+end
+
+local function utf8_text(s: string): boolean
+	return utf8.len(s) ~= nil and string.find(s, "%z") == nil
+end
+
+-- Writes workflows `ids` (with their files, the libraries they use and their repositories' branch
+-- settings) to one file under exports/; returns its path.
+function M.export_workflows(c: Core, ids: { string }): (string?, string?)
+	local w = c.workflows
+	if w == nil then
+		return nil, "workflows.toml 有错误,修好后再导出"
+	elseif #ids == 0 then
+		return nil, "没有要导出的工作流"
+	end
+	local text = read_file(c.paths.workflows)
+	if text == nil then
+		return nil, "无法读取 workflows.toml"
+	end
+	local b: bundle.Bundle = { exported_at = now(), repos = {}, workflows = {}, files = {} }
+	local libs: { [string]: boolean } = {}
+	local blanked = 0
+	for _, id in ids do
+		local wf = w.by_id[id]
+		local raw = model.raw_workflow(text, id)
+		if wf == nil or raw == nil then
+			return nil, `找不到工作流 {id}`
+		end
+		-- Variables in a workflow's env often hold tokens, and an export gets shared: names stay,
+		-- values go.
+		if type(raw.env) == "table" then
+			local blank: { [string]: string } = {}
+			for k in raw.env :: { [string]: any } do
+				blank[k] = ""
+				blanked += 1
+			end
+			raw.env = blank
+		end
+		table.insert(b.workflows, raw)
+		for _, tr in wf.triggers do
+			for _, name in model.trigger_repos(tr) do
+				local repo = w.repos[name]
+				if repo then
+					b.repos[name] = { branch = repo.branch, worktree = repo.worktree }
+				end
+			end
+		end
+		for _, lib in wf.libs do
+			libs[lib] = true
+		end
+		local tree, err = M.workflow_files(c, id)
+		if tree == nil then
+			return nil, `{id} 的文件:{err}`
+		end
+		for _, p in tree.paths do
+			if not utf8_text(tree.text[p]) then
+				return nil, `{id} 的文件 {p} 不是 UTF-8 文本,无法导出`
+			end
+			table.insert(b.files, { workflow = id, path = p, text = tree.text[p] })
+		end
+	end
+	for _, lib in util.keys(libs) do
+		local tree, err = M.library_files(c, lib)
+		if tree == nil then
+			return nil, `文件库 "{lib}":{err}`
+		end
+		for _, p in tree.paths do
+			if not utf8_text(tree.text[p]) then
+				return nil, `文件库 "{lib}" 的 {p} 不是 UTF-8 文本,无法导出`
+			end
+			table.insert(b.files, { library = lib, path = p, text = tree.text[p] })
+		end
+	end
+	local stamp = os.date("%Y-%m-%d %H:%M", math.floor(now())) :: string
+	local note = if blanked > 0 then `\n工作流 env 里的 {blanked} 个变量只保留了名字,值已清空(可能含令牌),导入后请自行填写。` else ""
+	local out = bundle.encode(b, `Roost 工作流导出({stamp},Roost {M.VERSION})。\n在 Roost「工作流」页用「导入」载入;导入的工作流默认停用。{note}`)
+	if #out > bundle.MAX_BYTES then
+		return nil, `导出内容超过 {bundle.MAX_BYTES // (1024 * 1024)} MiB(文件太多或太大),请分开导出`
+	end
+	local what = if #ids == 1 then ids[1] else `{#ids}-workflows`
+	local dir = files.exports_dir(c.data)
+	local path = `{dir}/{os.date("%Y%m%d-%H%M%S", math.floor(now()))}-{what}{bundle.SUFFIX}`
+	local ok, err = pcall(function(): string?
+		tern.fs.mkdir(dir)
+		tern.fs.write(path, out)
+		return nil
+	end)
+	if not ok then
+		return nil, `无法写入导出文件:{err}`
+	end
+	M.changed(c)
+	return path, nil
+end
+
+-- `path`: an absolute path, `~/…`, or the name of a file under exports/.
+local function read_bundle(c: Core, path: string): (bundle.Bundle?, string, string?)
+	local p = util.expand(util.trim(path), tern.getenv("HOME"))
+	if p == "" then
+		return nil, p, "请填写导出文件的路径"
+	elseif string.sub(p, 1, 1) ~= "/" then
+		p = `{files.exports_dir(c.data)}/{p}`
+	end
+	local ok, text = pcall(tern.fs.read, p, bundle.MAX_BYTES)
+	if not ok or type(text) ~= "string" then
+		return nil, p, `无法读取 {p}(不存在、超过 {bundle.MAX_BYTES // (1024 * 1024)} MiB 或不是普通文件)`
+	end
+	local b, err = bundle.decode(text)
+	return b, p, err
+end
+
+-- The bundle's files grouped by owner: workflow id → tree, library → tree.
+local function trees(b: bundle.Bundle): ({ [string]: { [string]: string } }, { [string]: { [string]: string } })
+	local wf: { [string]: { [string]: string } } = {}
+	local lib: { [string]: { [string]: string } } = {}
+	for _, f in b.files do
+		local group = if f.workflow then wf else lib
+		local key = (f.workflow or f.library) :: string
+		group[key] = group[key] or {}
+		group[key][f.path] = f.text
+	end
+	return wf, lib
+end
+
+local function same_tree(a: { [string]: string }, b: { [string]: string }): boolean
+	for k, v in a do
+		if b[k] ~= v then
+			return false
+		end
+	end
+	for k in b do
+		if a[k] == nil then
+			return false
+		end
+	end
+	return true
+end
+
+-- The repositories declared in `text` (an unparsable file has none).
+local function declared_repos(text: string): { [string]: boolean }
+	local root = toml.parse(text)
+	local out: { [string]: boolean } = {}
+	if type(root) == "table" and type(root.repos) == "table" then
+		for name in root.repos do
+			out[name] = true
+		end
+	end
+	return out
+end
+
+-- What importing `path` would do.
+function M.import_preview(c: Core, path: string): (ImportPlan?, string?)
+	local b, p, err = read_bundle(c, path)
+	if b == nil then
+		return nil, err
+	end
+	local old, rerr = current_text(c)
+	if old == nil then
+		return nil, rerr
+	end
+	local _, libtrees = trees(b)
+	local repos = declared_repos(old)
+	local plan: ImportPlan = { path = p, workflows = {}, libraries = {}, repos = {}, files = #b.files }
+	for _, raw in b.workflows do
+		local id = tostring(raw.id)
+		table.insert(plan.workflows, {
+			id = id,
+			name = if type(raw.name) == "string" then raw.name else id,
+			exists = model.raw_workflow(old, id) ~= nil,
+		})
+	end
+	for _, name in util.keys(libtrees) do
+		local cur = M.library_files(c, name)
+		table.insert(plan.libraries, {
+			name = name,
+			exists = exists(files.lib_root(c.data, name)),
+			same = cur ~= nil and same_tree(cur.text, libtrees[name]),
+		})
+	end
+	for _, name in util.keys(b.repos) do
+		table.insert(plan.repos, { name = name, exists = repos[name] == true })
+	end
+	return plan, nil
+end
+
+-- Imports `path`: its workflows go in disabled; existing workflows and differing libraries are
+-- replaced only with `overwrite`. Everything is checked before anything is written; files go
+-- first, workflows.toml (with its .bak) last. Returns a summary.
+function M.import_workflows(c: Core, path: string, overwrite: boolean): (string?, string?)
+	local b, p, err = read_bundle(c, path)
+	if b == nil then
+		return nil, err
+	end
+	local old, rerr = current_text(c)
+	if old == nil then
+		return nil, rerr
+	end
+	local wftrees, libtrees = trees(b)
+	local text = old
+	local added: { string } = {}
+	local skipped: { string } = {}
+	for _, raw in b.workflows do
+		local id = tostring(raw.id)
+		local there = model.raw_workflow(text, id) ~= nil
+		if there and not overwrite then
+			table.insert(skipped, id)
+			continue
+		end
+		raw.enabled = false
+		-- Exports blank env values; replacing a workflow must not erase the ones it has here.
+		if there and type(raw.env) == "table" then
+			local keep = model.raw_workflow(text, id)
+			local have: { [string]: any } = if keep and type(keep.env) == "table" then keep.env else {}
+			for k, v in raw.env :: { [string]: any } do
+				if v == "" and type(have[k]) == "string" then
+					(raw.env :: { [string]: any })[k] = have[k]
+				end
+			end
+		end
+		local next_text, serr = model.splice_workflow(text, if there then id else nil, model.encode_workflow(raw))
+		if next_text == nil then
+			return nil, `{id}:{serr or "无法写入"}`
+		end
+		text = next_text
+		table.insert(added, id)
+	end
+	if #added == 0 then
+		return nil, `没有可导入的工作流:{table.concat(skipped, "、")} 已存在(选择覆盖才会替换)`
+	end
+	local repos = declared_repos(old)
+	local new_repos: { string } = {}
+	for _, name in util.keys(b.repos) do
+		if not repos[name] then
+			local r = b.repos[name]
+			local lines = {
+				"",
+				`# 导入自 {string.match(p, "[^/]+$") or p}:填写本机检出路径 path 后才会在检出中运行(否则在临时目录中运行)`,
+				`[repos.{toml.quote(name)}]`,
+			}
+			if r.branch then
+				table.insert(lines, `branch = {toml.quote(r.branch)}`)
+			end
+			if r.worktree ~= nil then
+				table.insert(lines, `worktree = {if r.worktree then "true" else "false"}`)
+			end
+			text = (if string.sub(text, -1) == "\n" or text == "" then text else text .. "\n") .. table.concat(lines, "\n") .. "\n"
+			table.insert(new_repos, name)
+		end
+	end
+	local w, issues = model.parse_workflows(text)
+	if w == nil then
+		local msgs: { string } = {}
+		for i = 1, math.min(3, #issues) do
+			table.insert(msgs, `{issues[i].path}:{issues[i].message}`)
+		end
+		return nil, `导入后 workflows.toml 无效,没有做任何修改:{table.concat(msgs, ";")}`
+	end
+	-- A directory still being deleted would take the new files with it.
+	for _, id in added do
+		if store.pending(c.store, files.workflow_home(c.data, id)) then
+			return nil, `工作流 {id} 的旧文件正在删除,稍后再导入`
+		end
+	end
+	for name in libtrees do
+		if store.pending(c.store, files.lib_root(c.data, name)) then
+			return nil, `文件库 "{name}" 正在删除,稍后再导入`
+		end
+	end
+	-- Check every tree before writing any.
+	for id in wftrees do
+		local bad = files.check(wftrees[id])
+		if bad then
+			return nil, `{id} 的文件:{bad}`
+		end
+	end
+	local lib_writes: { string } = {}
+	local lib_kept: { string } = {}
+	for _, name in util.keys(libtrees) do
+		local bad = files.check(libtrees[name])
+		if bad then
+			return nil, `文件库 "{name}":{bad}`
+		end
+		local cur = M.library_files(c, name)
+		if cur == nil or not exists(files.lib_root(c.data, name)) then
+			table.insert(lib_writes, name)
+		elseif not same_tree(cur.text, libtrees[name]) then
+			table.insert(if overwrite then lib_writes else lib_kept, name)
+		end
+	end
+	for _, name in lib_writes do
+		local ferr = files.replace(files.lib_root(c.data, name), libtrees[name])
+		if ferr then
+			return nil, `写入文件库 "{name}" 失败,workflows.toml 未修改:{ferr}`
+		end
+	end
+	for _, id in added do
+		local ferr = files.replace(files.workflow_root(c.data, id), wftrees[id] or {})
+		if ferr then
+			return nil, `写入 {id} 的文件失败,workflows.toml 未修改:{ferr}`
+		end
+	end
+	local werr = write_workflows(c, old, text)
+	if werr then
+		return nil, werr
+	end
+	local parts = { `已导入 {#added} 个工作流(已停用,检查后再启用):{table.concat(added, "、")}` }
+	if #skipped > 0 then
+		table.insert(parts, `跳过已存在的 {table.concat(skipped, "、")}`)
+	end
+	if #lib_writes > 0 then
+		table.insert(parts, `写入文件库 {table.concat(lib_writes, "、")}`)
+	end
+	if #lib_kept > 0 then
+		table.insert(parts, `文件库 {table.concat(lib_kept, "、")} 与本机内容不同,保留本机版本`)
+	end
+	if #new_repos > 0 then
+		table.insert(parts, `新增仓库 {table.concat(new_repos, "、")}:需在 workflows.toml 填写本机路径`)
+	end
+	local missing: { string } = {}
+	for _, id in added do
+		local wf = w.by_id[id]
+		local used: { string } = if wf then wf.libs else {}
+		for _, lib in used do
+			if not exists(files.lib_root(c.data, lib)) and table.find(missing, lib) == nil then
+				table.insert(missing, lib)
+			end
+		end
+	end
+	if #missing > 0 then
+		table.insert(parts, `缺少文件库 {table.concat(missing, "、")}`)
+	end
+	return table.concat(parts, ";"), nil
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1628,7 +2407,7 @@ function M.disk(c: Core): Disk
 		tern.process.run({
 			"/bin/sh",
 			"-c",
-			'cd "$1" 2>/dev/null && du -sk -- runs worktrees runs.json runs.json.bak events.json events.json.bak 2>/dev/null; exit 0',
+			'cd "$1" 2>/dev/null && du -sk -- runs worktrees workflows library state exports runs.json runs.json.bak events.json events.json.bak 2>/dev/null; exit 0',
 			"roost",
 			c.data,
 		}, { timeout_ms = 10000 }, function(res: ProcessResult)

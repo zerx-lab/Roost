@@ -75,6 +75,7 @@ export type Store = {
 	indexed: boolean, -- runs.json was read (or never existed): `sweep` may trust the index
 	policy: boolean, -- keep/max_age come from a valid roost.toml: nothing expires before that
 	tries: { [string]: number }, -- failed removals per queued path (bounded by MAX_TRIES)
+	inflight: { [string]: boolean }, -- paths an `rm` is deleting right now
 }
 
 local MAX_INDEX_BYTES = 16 * 1024 * 1024
@@ -99,6 +100,7 @@ function M.new(dir: string, keep: number, max_age: number): Store
 		indexed = false,
 		policy = false,
 		tries = {},
+		inflight = {},
 	}
 end
 
@@ -259,6 +261,36 @@ local function plain_name(name: string): boolean
 	return string.match(name, "^[%w%-_%.]+$") ~= nil and name ~= "." and name ~= ".."
 end
 
+-- Top-level directories whose entries Roost may delete (one plain name below them).
+local OWNED = { "runs", "worktrees", "workflows", "library", "state", "exports" }
+
+-- A path Roost may delete: exactly `<sub>/<name>` for a sub in OWNED, or a run's scratch
+-- directory `runs/<name>/tmp`, under an absolute data dir.
+local function owned(s: Store, path: string): boolean
+	if string.sub(s.dir, 1, 1) ~= "/" or #s.dir < 2 then
+		return false
+	end
+	for _, sub in OWNED do
+		local base = `{s.dir}/{sub}/`
+		if string.sub(path, 1, #base) == base then
+			local rest = string.sub(path, #base + 1)
+			local name, tail = string.match(rest, "^([^/]+)/(.*)$")
+			if name and tail then
+				return sub == "runs" and tail == "tmp" and plain_name(name)
+			end
+			return plain_name(rest)
+		end
+	end
+	return false
+end
+
+local MAX_TRIES = 3
+
+local function exists(path: string): boolean
+	local ok, yes = pcall(tern.fs.exists, path)
+	return ok and yes == true
+end
+
 -- Queues directories no run owns: `runs/<id>` the index doesn't know, `worktrees/<id>` of a run
 -- that is unknown or over. At most `cap` per call; returns how many were queued.
 function M.sweep(s: Store, cap: number): number
@@ -289,29 +321,45 @@ function M.sweep(s: Store, cap: number): number
 			take(M.worktree_dir(s, name))
 		end
 	end
+	-- A finished run's scratch directory (normally queued by the runner when the run ended).
+	for _, r in s.runs do
+		local tmp = `{M.run_dir(s, r.id)}/tmp`
+		if M.TERMINAL[r.state] and plain_name(r.id) and exists(tmp) then
+			take(tmp)
+		end
+	end
 	return n
 end
 
--- A directory Roost may delete: exactly `runs/<name>` or `worktrees/<name>` under an absolute
--- data dir.
-local function owned(s: Store, path: string): boolean
-	if string.sub(s.dir, 1, 1) ~= "/" or #s.dir < 2 then
-		return false
+-- Queues a directory Roost owns (see `owned`) for `drain`; anything else is ignored.
+function M.discard(s: Store, path: string)
+	if owned(s, path) then
+		for _, p in s.trash do
+			if p == path then
+				return
+			end
+		end
+		table.insert(s.trash, path)
 	end
-	for _, sub in { "runs", "worktrees" } do
-		local base = `{s.dir}/{sub}/`
-		if string.sub(path, 1, #base) == base then
-			return plain_name(string.sub(path, #base + 1))
+end
+
+-- Whether `path` (or a directory above it) is waiting to be deleted or being deleted. Creating
+-- anything there now would be removed by the pending `rm`: callers wait or refuse.
+function M.pending(s: Store, path: string): boolean
+	local function covers(p: string): boolean
+		return p == path or string.sub(path, 1, #p + 1) == p .. "/"
+	end
+	for p in s.inflight do
+		if covers(p) then
+			return true
+		end
+	end
+	for _, p in s.trash do
+		if covers(p) then
+			return true
 		end
 	end
 	return false
-end
-
-local MAX_TRIES = 3
-
-local function exists(path: string): boolean
-	local ok, yes = pcall(tern.fs.exists, path)
-	return ok and yes == true
 end
 
 -- Requeues what is still there after a removal, up to MAX_TRIES attempts per path.
@@ -348,21 +396,29 @@ function M.drain(s: Store, n: number, done: (number) -> ())
 	end
 	local argv = { "/bin/rm", "-rf", "--" }
 	table.move(batch, 1, #batch, #argv + 1, argv)
+	for _, p in batch do
+		s.inflight[p] = true
+	end
+	local function finished()
+		for _, p in batch do
+			s.inflight[p] = nil
+		end
+		-- Whatever is still there goes back in the queue (settle), however rm ended.
+		settle(s, batch)
+		done(#s.trash)
+	end
 	local ok, err = pcall(function(): string?
 		tern.process.run(argv, { timeout_ms = 120000 }, function(res: ProcessResult)
 			if res.timed_out or res.status ~= 0 then
 				tern.log.warn("roost: rm failed", res.status, string.sub(res.stderr or "", 1, 500))
 			end
-			-- Whatever is still there goes back in the queue (settle), however rm ended.
-			settle(s, batch)
-			done(#s.trash)
+			finished()
 		end)
 		return nil
 	end)
 	if not ok then
 		tern.log.warn("roost: cannot start rm", err)
-		settle(s, batch)
-		done(#s.trash)
+		finished()
 	end
 end
 

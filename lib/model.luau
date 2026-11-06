@@ -83,11 +83,14 @@ export type GithubTrigger = {
 }
 -- `when = "out.x"` / `"!input.y"`: the step runs only while that value is truthy (or, with `!`, not).
 export type When = { source: "out" | "input", key: string, negate: boolean }
+-- A `file` step's script: one of the workflow's own files, or `@<库>/<路径>` in the file library.
+export type FileRef = { lib: string?, path: string }
 export type Step = {
 	name: string,
-	kind: "omp" | "run",
+	kind: "omp" | "run" | "file",
 	prompt: template.Template?,
 	script: string?,
+	file: FileRef?,
 	model: string?,
 	args: { string },
 	timeout: number?,
@@ -111,6 +114,10 @@ export type Workflow = {
 	inputs: { Input },
 	triggers: { Trigger },
 	steps: { Step },
+	-- File libraries every run gets a copy of: `libs` plus those its `file` steps name (sorted).
+	libs: { string },
+	-- The state group (`state/<名>/`, $ROOST_STATE) kept across runs; the workflow id unless set.
+	state: string,
 	line: number?,
 }
 export type Workflows = {
@@ -695,6 +702,56 @@ function M.valid_output_key(k: string): boolean
 	return #k <= 64 and string.match(k, "^[%a_][%w_]*$") ~= nil
 end
 
+-- A path among a workflow's or a library's files: 1-8 `/`-separated parts, each starting with a
+-- letter, digit or `_` (so no hidden names, `.` or `..`), at most 255 bytes.
+function M.valid_file_path(p: string): boolean
+	if #p == 0 or #p > 255 then
+		return false
+	end
+	local n = 0
+	for seg in string.gmatch(p .. "/", "([^/]*)/") do
+		n += 1
+		if n > 8 or string.match(seg, "^[%w_][%w_%.%-]*$") == nil then
+			return false
+		end
+	end
+	return true
+end
+
+-- A file library's name (its directory under `library/`): same rules as a workflow id.
+function M.valid_lib(s: string): boolean
+	return valid_id(s)
+end
+
+-- What runs a `file` step's script, by extension (the program is looked up on the step's PATH).
+M.INTERPRETERS = {
+	py = { "python3" },
+	sh = { "/bin/sh" },
+	bash = { "bash" },
+	js = { "node" },
+	mjs = { "node" },
+	cjs = { "node" },
+}
+
+function M.interpreter(path: string): { string }?
+	local ext = string.match(path, "%.(%w+)$")
+	return if ext then M.INTERPRETERS[string.lower(ext)] else nil
+end
+
+-- `file = "<路径>"` (the workflow's own file) or `"@<库>/<路径>"` (a library's), or nil when malformed.
+function M.file_ref(s: string): FileRef?
+	local lib, rest = string.match(s, "^@([^/]+)/(.+)$")
+	if lib and rest then
+		return if valid_id(lib) and M.valid_file_path(rest) then { lib = lib, path = rest } else nil
+	end
+	return if M.valid_file_path(s) then { lib = nil, path = s } else nil
+end
+
+-- How a file reference is written (`file = …`).
+function M.file_ref_text(ref: FileRef): string
+	return if ref.lib then `@{ref.lib}/{ref.path}` else ref.path
+end
+
 -- Whether a step output or input value counts as "on" for `when`.
 function M.truthy(v: string?): boolean
 	if v == nil then
@@ -1235,7 +1292,7 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		local base = `workflow.{if id ~= "" then id else tostring(wi)}`
 		check_keys(c, w, base, {
 			"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace",
-			"identity", "daily_budget", "env", "input", "trigger", "step",
+			"identity", "daily_budget", "state", "libs", "env", "input", "trigger", "step",
 		})
 		if not valid_id(id) then
 			issue(c, `{base}.id`, `id "{id}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, w, "id") or wline)
@@ -1257,6 +1314,19 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		if identity ~= nil and identity ~= "app" and identity ~= "local" then
 			issue(c, `{base}.identity`, "应为 app 或 local(省略则用 roost.toml [github] identity)", line_of(c, w, "identity"))
 			identity = nil
+		end
+		local state = get_string(c, w, "state", base)
+		if state ~= nil and not valid_id(state) then
+			issue(c, `{base}.state`, `状态组 "{state}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, w, "state"))
+			state = nil
+		end
+		local libs: { [string]: boolean } = {}
+		for _, l in get_strings(c, w, "libs", base) do
+			if valid_id(l) then
+				libs[l] = true
+			else
+				issue(c, `{base}.libs`, `文件库名 "{l}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, w, "libs"))
+			end
 		end
 
 		local inputs: { Input } = {}
@@ -1295,9 +1365,10 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		for si, s in rawsteps do
 			local spath = `{base}.step[{si}]`
 			local sline = line_of(c, rawsteps, si)
-			check_keys(c, s, spath, { "name", "omp", "run", "model", "args", "timeout", "continue_on_error", "when" })
+			check_keys(c, s, spath, { "name", "omp", "run", "file", "model", "args", "timeout", "continue_on_error", "when" })
 			local prompt = get_string(c, s, "omp", spath)
 			local script = get_string(c, s, "run", spath)
+			local fileref = get_string(c, s, "file", spath)
 			local step: Step = {
 				name = get_string(c, s, "name", spath) or "",
 				kind = "run",
@@ -1309,8 +1380,8 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 				continue_on_error = get_bool(c, s, "continue_on_error", spath, false),
 				when = get_when(c, s, spath, input_names),
 			}
-			if prompt and script then
-				issue(c, spath, "omp 与 run 只能二选一", sline)
+			if (if prompt then 1 else 0) + (if script then 1 else 0) + (if fileref then 1 else 0) > 1 then
+				issue(c, spath, "omp、run 与 file 只能选一个", sline)
 			elseif prompt then
 				local tpl, err = template.parse(prompt)
 				if not tpl then
@@ -1326,11 +1397,33 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 				check_omp_args(c, step.args, `{spath}.args`, line_of(c, s, "args"))
 			elseif script then
 				if step.model or #step.args > 0 then
-					issue(c, spath, "model 与 args 只用于 omp 步骤", sline)
+					issue(c, spath, "run 步骤不接受 model 与 args(model 只用于 omp 步骤,args 用于 omp 与 file 步骤)", sline)
 				end
 				step.script = script
+			elseif fileref then
+				if step.model then
+					issue(c, spath, "model 只用于 omp 步骤", sline)
+				end
+				local ref = M.file_ref(fileref)
+				local fline = line_of(c, s, "file")
+				if ref == nil then
+					issue(
+						c,
+						`{spath}.file`,
+						"应为 \"<路径>\"(本工作流的文件)或 \"@<文件库>/<路径>\";路径各段以字母、数字或 _ 开头",
+						fline
+					)
+				elseif M.interpreter(ref.path) == nil then
+					issue(c, `{spath}.file`, "不支持的脚本类型:扩展名应为 .py .sh .bash .js .mjs .cjs", fline)
+				else
+					step.kind = "file"
+					step.file = ref
+					if ref.lib then
+						libs[ref.lib] = true
+					end
+				end
 			else
-				issue(c, spath, "步骤需要 omp = \"<提示词>\" 或 run = \"<shell 脚本>\"", sline)
+				issue(c, spath, "步骤需要 omp = \"<提示词>\"、run = \"<shell 脚本>\" 或 file = \"<脚本文件>\"", sline)
 			end
 			if step.name == "" then
 				step.name = `{step.kind} #{si}`
@@ -1360,6 +1453,8 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 			inputs = inputs,
 			triggers = triggers,
 			steps = steps,
+			libs = util.keys(libs),
+			state = state or id,
 			line = wline,
 		}
 		table.insert(list, wf)
@@ -1608,7 +1703,7 @@ end
 
 local WF_ORDER = {
 	"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace", "identity",
-	"daily_budget", "env",
+	"daily_budget", "state", "libs", "env",
 }
 local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify = true, concurrency = "queue", workspace = "auto" }
 local SUB_ORDER: { [string]: { string } } = {
@@ -1619,7 +1714,7 @@ local SUB_ORDER: { [string]: { string } } = {
 		"conclusions", "workflows", "review_states", "thread_actions", "comment",
 		"skip_drafts", "include_closed", "ignore_bots", "ignore_self", "forks", "associations",
 	},
-	step = { "name", "when", "omp", "run", "model", "args", "timeout", "continue_on_error" },
+	step = { "name", "when", "omp", "run", "file", "model", "args", "timeout", "continue_on_error" },
 }
 local SUB_DEFAULTS: { [string]: { [string]: any } } = {
 	input = { required = false },

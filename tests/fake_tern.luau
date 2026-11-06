@@ -385,6 +385,21 @@ function F.new(opts: { [string]: any }?)
 		logs = {} :: { string },
 	}
 
+	-- With env.icase (APFS's default), a path matches an existing one that differs only by case:
+	-- writing keeps the existing spelling, removing either spelling removes it.
+	local function resolve(path: string): string
+		if not env.icase or env.files[path] ~= nil then
+			return path
+		end
+		local low = string.lower(path)
+		for k in env.files do
+			if string.lower(k) == low then
+				return k
+			end
+		end
+		return path
+	end
+
 	local function prefix_exists(path: string): boolean
 		local p = path .. "/"
 		for k in env.files do
@@ -416,7 +431,7 @@ function F.new(opts: { [string]: any }?)
 		},
 		fs = {
 			read = function(path: string, max: number?)
-				local v = env.files[path]
+				local v = env.files[resolve(path)]
 				if v == nil then
 					error("tern.fs.read " .. path .. ": No such file or directory")
 				end
@@ -427,7 +442,7 @@ function F.new(opts: { [string]: any }?)
 			end,
 			write = function(path: string, text: string)
 				assert(type(text) == "string", "fs.write text")
-				env.files[path] = text
+				env.files[resolve(path)] = text
 			end,
 			exists = function(path: string)
 				return env.files[path] ~= nil or prefix_exists(path)
@@ -436,6 +451,7 @@ function F.new(opts: { [string]: any }?)
 				env.dirs[path] = true
 			end,
 			remove = function(path: string)
+				path = resolve(path)
 				env.files[path] = nil
 				env.dirs[path] = nil
 				local p = path .. "/"
@@ -451,16 +467,26 @@ function F.new(opts: { [string]: any }?)
 				end
 			end,
 			list = function(path: string)
+				-- Like the real one: a file is not a directory; empty directories (mkdir) are listed too.
+				if env.files[path] ~= nil then
+					error("tern.fs.list " .. path .. ": Not a directory")
+				end
 				local out, seen = {}, {}
 				local p = path .. "/"
-				for k in env.files do
+				local function add(k: string)
 					if string.sub(k, 1, #p) == p then
-						local name = string.match(string.sub(k, #p + 1), "^[^/]+") :: string
-						if not seen[name] then
+						local name = string.match(string.sub(k, #p + 1), "^[^/]+")
+						if name and not seen[name] then
 							seen[name] = true
 							table.insert(out, name)
 						end
 					end
+				end
+				for k in env.files do
+					add(k)
+				end
+				for k in env.dirs do
+					add(k)
 				end
 				table.sort(out)
 				return out

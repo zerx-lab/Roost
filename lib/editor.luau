@@ -2,9 +2,9 @@
 -- Automation editor ("新建/编辑自动化"). ui.luau owns the block; this module owns the overlay.
 -- Text fields are program-owned (lib/field.luau). Selects, switches, menus and dates are pointer-only.
 -- Node ids under layer.editor are the contract the key handler and tests share:
---   body.head.name.input, body.head.icon, body.triggers.add, body.triggers.tN.sentence.*,
---   body.triggers.tN.card.*, body.prompt.stack.input, body.prompt.bar.pmodel,
---   body.steps.sN.*, body.prompt.when.input, body.notify.sw, body.advanced.*, foot.save, foot.del, layer.discard.
+--   body.triggers.tN.sentence.*, body.triggers.tN.card.*, body.prompt.stack.input,
+--   body.prompt.bar.pmodel, body.steps.sN.*, body.files.*, body.prompt.when.input,
+--   body.notify.sw, body.advanced.*, foot.save, foot.del, layer.discard.
 
 local field = require("./field")
 local model = require("./model")
@@ -21,6 +21,12 @@ local ID_ID = ROOT .. ".body.advanced.id.input"
 local TIMEOUT_ID = ROOT .. ".body.advanced.timeout.input"
 local PROMPT_WHEN_ID = ROOT .. ".body.prompt.when.input"
 local BUDGET_ID = ROOT .. ".body.advanced.budget.input"
+local STATE_ID = ROOT .. ".body.advanced.state.input"
+local LIBS_ADD_ID = ROOT .. ".body.advanced.libs.add"
+local FILE_ADD_ID = ROOT .. ".body.files.add.input"
+local FILE_REN_ID = ROOT .. ".body.files.ren.input"
+local FILE_EDIT_ID = ROOT .. ".body.files.edit.input"
+local FILE_MAX_LINES = 24
 local CHECK_MS = 300
 
 type Issue = model.Issue
@@ -37,6 +43,8 @@ type Editor = {
 	dirty: boolean,
 	issues: { Issue },
 	confirm_delete: boolean,
+	-- Path of the workflow file whose delete button is armed (two clicks).
+	confirm_file: string?,
 	discard: boolean,
 	advanced: boolean,
 	custom_id: boolean,
@@ -47,6 +55,19 @@ type Editor = {
 	timer: any,
 	suggest: { [string]: { string } },
 	busy: boolean,
+	-- Workflow's own files (path → text); new/renamed/deleted stay here until save.
+	files: { [string]: string },
+	-- The files as they were loaded: what save may remove, and the change check against the disk.
+	files_base: { [string]: string },
+	-- Why they could not be loaded; saving is refused rather than writing an empty set.
+	files_error: string?,
+	-- Currently selected own-file path, or nil.
+	file_sel: string?,
+	-- Which path FILE_EDIT_ID / FILE_REN_ID currently hold (so a reselect reseeds them).
+	file_edit_for: string?,
+	file_ren_for: string?,
+	-- library name → sorted paths, refreshed when libs change.
+	lib_cache: { [string]: { string } },
 }
 
 local function N(kind: string, props: { [string]: any }, children: { any }?): any
@@ -111,7 +132,13 @@ local function triggers_of(raw: { [string]: any }): { any }
 end
 
 local function step_kind(step: any): string
-	if type(step) == "table" and type(step.run) == "string" and type(step.omp) ~= "string" then
+	if type(step) ~= "table" then
+		return "omp"
+	end
+	if type(step.file) == "string" and type(step.omp) ~= "string" and type(step.run) ~= "string" then
+		return "file"
+	end
+	if type(step.run) == "string" and type(step.omp) ~= "string" then
 		return "run"
 	end
 	return "omp"
@@ -142,10 +169,59 @@ local function step_text(step: any): string
 	if type(step) ~= "table" then
 		return ""
 	end
-	if step_kind(step) == "run" then
+	local kind = step_kind(step)
+	if kind == "run" then
 		return if type(step.run) == "string" then step.run else ""
+	elseif kind == "file" then
+		return ""
 	end
 	return if type(step.omp) == "string" then step.omp else ""
+end
+
+local function args_text(step: any): string
+	if type(step) ~= "table" or type(step.args) ~= "table" then
+		return ""
+	end
+	local parts: { string } = {}
+	for _, item in step.args do
+		if type(item) == "string" then
+			table.insert(parts, item)
+		end
+	end
+	return table.concat(parts, " ")
+end
+
+local function parse_args(text: string): { string }?
+	local out: { string } = {}
+	for token in string.gmatch(text, "%S+") do
+		table.insert(out, token)
+	end
+	return if #out == 0 then nil else out
+end
+
+local function file_lang(path: string): string
+	local ext = string.match(path, "%.([%w]+)$")
+	if ext == nil then
+		return "text"
+	end
+	local low = string.lower(ext)
+	if low == "py" then
+		return "python"
+	elseif low == "sh" or low == "bash" then
+		return "bash"
+	elseif low == "js" or low == "mjs" or low == "cjs" then
+		return "javascript"
+	end
+	return "text"
+end
+
+local function sorted_file_paths(files: { [string]: string }): { string }
+	local paths: { string } = {}
+	for path in files do
+		table.insert(paths, path)
+	end
+	table.sort(paths)
+	return paths
 end
 
 local function str_list(v: any): { string }
@@ -159,6 +235,73 @@ local function str_list(v: any): { string }
 		end
 	end
 	return out
+end
+
+local function load_own_files(st: any, ed: Editor)
+	ed.files = {}
+	ed.files_base = {}
+	ed.files_error = nil
+	ed.file_sel = nil
+	if ed.mode ~= "edit" or type(ed.old_id) ~= "string" then
+		return
+	end
+	local tree, err = core.workflow_files(st.core, ed.old_id)
+	if tree == nil then
+		ed.files_error = err or "无法读取工作流文件"
+		return
+	end
+	for path, text in tree.text do
+		if type(path) == "string" and type(text) == "string" then
+			ed.files[path] = text
+			ed.files_base[path] = text
+		end
+	end
+	local paths = sorted_file_paths(ed.files)
+	ed.file_sel = paths[1]
+end
+
+-- Drop library path lists that are no longer in raw.libs; load any missing ones.
+local function refresh_lib_cache(st: any, ed: Editor)
+	local want: { [string]: boolean } = {}
+	for _, name in str_list(ed.raw.libs) do
+		want[name] = true
+	end
+	for name in ed.lib_cache do
+		if not want[name] then
+			ed.lib_cache[name] = nil
+		end
+	end
+	for name in want do
+		if ed.lib_cache[name] == nil then
+			local tree = core.library_files(st.core, name)
+			local paths: { string } = {}
+			if tree and type(tree.paths) == "table" then
+				for _, p in tree.paths do
+					if type(p) == "string" then
+						table.insert(paths, p)
+					end
+				end
+			end
+			ed.lib_cache[name] = paths
+		end
+	end
+end
+
+local function file_options(ed: Editor): { any }
+	local opts: { any } = {}
+	for _, path in sorted_file_paths(ed.files) do
+		table.insert(opts, { value = path, label = path })
+	end
+	local libs = str_list(ed.raw.libs)
+	table.sort(libs)
+	for _, lib in libs do
+		local paths: { string } = ed.lib_cache[lib] or {}
+		for _, path in paths do
+			local ref = `@{lib}/{path}`
+			table.insert(opts, { value = ref, label = ref })
+		end
+	end
+	return opts
 end
 
 local function ed_of(st: any): Editor?
@@ -187,6 +330,7 @@ end
 local function touch(ed: Editor)
 	ed.dirty = true
 	ed.confirm_delete = false
+	ed.confirm_file = nil
 end
 
 local function buf(ed: Editor, id: string): field.Field
@@ -350,18 +494,48 @@ local function sync_steps(ed: Editor)
 				local name = util.trim(name_f.text)
 				step.name = if name == "" then nil else name
 			end
-			local text_f = ed.buf[sid(i, "text", "input")]
-			if text_f then
-				if step_kind(step) == "run" then
-					step.run = text_f.text
-					step.omp = nil
-				else
-					step.omp = text_f.text
-					step.run = nil
+			local kind = step_kind(step)
+			if kind == "file" then
+				local args_f = ed.buf[sid(i, "args", "input")]
+				-- Only a changed field is parsed: an argument holding a space would be split by the
+				-- round trip through the one-line field even when nobody touched it.
+				if args_f and args_f.text ~= args_text(step) then
+					step.args = parse_args(args_f.text)
+				end
+			else
+				local text_f = ed.buf[sid(i, "text", "input")]
+				if text_f then
+					if kind == "run" then
+						step.run = text_f.text
+						step.omp = nil
+					else
+						step.omp = text_f.text
+						step.run = nil
+					end
 				end
 			end
 			apply_when(ed, step, sid(i, "when", "input"))
 		end
+	end
+end
+
+local function sync_files(ed: Editor)
+	local sel = ed.file_sel
+	-- Only while the buffer holds this very file: after a delete or a switch it still holds
+	-- the previous one's text.
+	if type(sel) == "string" and ed.file_edit_for == sel and ed.files[sel] ~= nil then
+		local f = ed.buf[FILE_EDIT_ID]
+		if f then
+			ed.files[sel] = f.text
+		end
+	end
+end
+
+local function sync_libs_state(ed: Editor)
+	local state_f = ed.buf[STATE_ID]
+	if state_f then
+		local text = util.trim(state_f.text)
+		ed.raw.state = if text == "" then nil else text
 	end
 end
 
@@ -435,6 +609,8 @@ local function sync_all(ed: Editor)
 	sync_name(ed)
 	sync_steps(ed)
 	sync_prompt(ed)
+	sync_files(ed)
+	sync_libs_state(ed)
 	sync_text_field(ed, DESC_ID, "description")
 	sync_text_field(ed, TIMEOUT_ID, "timeout")
 	sync_budget(ed)
@@ -449,7 +625,8 @@ local function check_now(st: any)
 	end
 	cancel_timer(ed)
 	sync_all(ed)
-	ed.issues = core.check_workflow(st.core, ed.old_id, ed.raw)
+	refresh_lib_cache(st, ed)
+	ed.issues = core.check_workflow(st.core, ed.old_id, ed.raw, ed.files)
 	render(st)
 end
 
@@ -588,24 +765,38 @@ end
 
 local function set_step_kind(ed: Editor, i: number, kind: string)
 	local step = steps_of(ed.raw)[i]
-	if type(step) ~= "table" or (kind ~= "omp" and kind ~= "run") then
+	if type(step) ~= "table" or (kind ~= "omp" and kind ~= "run" and kind ~= "file") then
 		return
 	end
+	local prev = step_kind(step)
 	local text = step_text(step)
 	step.kind = nil
-	if kind == "omp" then
-		step.omp = text
-		step.run = nil
-	else
-		step.run = text
+	if kind == "file" then
+		step.file = if type(step.file) == "string" then step.file else ""
 		step.omp = nil
+		step.run = nil
+		step.model = nil
+		-- Keep existing args for file steps; drop omp/run-only text.
+	elseif kind == "omp" then
+		step.omp = if prev == "file" then "" else text
+		step.run = nil
+		step.file = nil
+		step.args = nil
+	else
+		step.run = if prev == "file" then "" else text
+		step.omp = nil
+		step.file = nil
 		-- Only omp steps take a model or omp args; leaving them would make the step unsavable.
 		step.model = nil
 		step.args = nil
 	end
 	local f = ed.buf[sid(i, "text", "input")]
 	if f then
-		f.text = text
+		f.text = if kind == "file" then "" else (if prev == "file" then "" else text)
+		f.lines = kind ~= "file"
+	end
+	if kind ~= "file" then
+		ed.buf[sid(i, "args", "input")] = nil
 	end
 	touch(ed)
 end
@@ -644,6 +835,7 @@ local function swap_steps(ed: Editor, i: number, j: number)
 	end
 	swap_buf(sid(i, "name", "input"), sid(j, "name", "input"))
 	swap_buf(sid(i, "text", "input"), sid(j, "text", "input"))
+	swap_buf(sid(i, "args", "input"), sid(j, "args", "input"))
 	swap_buf(sid(i, "when", "input"), sid(j, "when", "input"))
 	touch(ed)
 end
@@ -677,6 +869,10 @@ local function seed_open(ed: Editor)
 	seed(ed, TIMEOUT_ID, if type(timeout) == "string" then timeout elseif type(timeout) == "number" then tostring(timeout) else "")
 	seed(ed, BUDGET_ID, budget_text(raw))
 	seed(ed, PROMPT_WHEN_ID, if prompt then when_text_of(prompt) else "")
+	seed(ed, STATE_ID, if type(raw.state) == "string" then raw.state else "")
+	seed(ed, FILE_ADD_ID, "script.py")
+	seed(ed, FILE_REN_ID, "")
+	seed(ed, LIBS_ADD_ID, "")
 end
 
 function M.close(st: any)
@@ -728,6 +924,7 @@ function M.open(st: any, mode: string, arg: string?)
 		dirty = false,
 		issues = {},
 		confirm_delete = false,
+		confirm_file = nil,
 		discard = false,
 		advanced = false,
 		custom_id = false,
@@ -736,8 +933,16 @@ function M.open(st: any, mode: string, arg: string?)
 		timer = nil,
 		suggest = {},
 		busy = false,
+		files = {},
+		files_base = {},
+		files_error = nil,
+		file_sel = nil,
+		file_edit_for = nil,
+		file_ren_for = nil,
+		lib_cache = {},
 	}
 	st.editor = ed
+	load_own_files(st, ed)
 	seed_open(ed)
 	check_now(st)
 	ed.focus = NAME_ID
@@ -750,13 +955,18 @@ local function save(st: any)
 		return
 	end
 	sync_all(ed)
-	ed.issues = core.check_workflow(st.core, ed.old_id, ed.raw)
+	if ed.files_error then
+		ed.issues = { { file = "workflows.toml", path = "files", message = `工作流文件没有读出来,为避免覆盖已关闭保存:{ed.files_error}` } }
+		render(st)
+		return
+	end
+	ed.issues = core.check_workflow(st.core, ed.old_id, ed.raw, ed.files)
 	if #ed.issues > 0 then
 		render(st)
 		return
 	end
 	ed.busy = true
-	local issues = core.save_workflow(st.core, ed.old_id, ed.raw)
+	local issues = core.save_workflow(st.core, ed.old_id, ed.raw, ed.files, ed.files_base)
 	ed.busy = false
 	if issues == nil then
 		M.close(st)
@@ -1363,28 +1573,38 @@ local function steps_section(ed: Editor): any
 	local prompt_at = prompt_index(ed)
 	local rows: { any } = { txt("更多步骤", "h") }
 	local any_extra = false
+	local file_opts = file_options(ed)
 	for i, step in steps do
 		if i ~= prompt_at and type(step) == "table" then
 			any_extra = true
 			local kind = step_kind(step)
 			local name_id = sid(i, "name", "input")
 			local text_id = sid(i, "text", "input")
+			local args_id = sid(i, "args", "input")
 			local when_id = sid(i, "when", "input")
 			seed(ed, name_id, if type(step.name) == "string" then step.name else "")
-			seed(ed, text_id, step_text(step))
 			seed(ed, when_id, when_text_of(step))
 			local err = field_error(ed, function(path)
-				return string.find(path, `.step[{i}]`, 1, true) ~= nil and string.find(path, ".when", 1, true) == nil
+				return string.find(path, `.step[{i}]`, 1, true) ~= nil
+					and string.find(path, ".when", 1, true) == nil
+					and string.find(path, ".file", 1, true) == nil
+			end)
+			local file_err = field_error(ed, function(path)
+				return string.find(path, `.step[{i}].file`, 1, true) ~= nil
 			end)
 			local when_err = field_error(ed, function(path)
 				return string.find(path, `.step[{i}].when`, 1, true) ~= nil
 			end)
-			table.insert(rows, N("col", { key = `s{i}`, gap = "xs", role = "roost.steps" }, {
+			local body: { any } = {
 				N("row", { key = "bar", gap = "sm", align = "center" }, {
 					N("select", {
 						key = "kind",
 						value = kind,
-						options = { { value = "omp", label = "指令" }, { value = "run", label = "命令" } },
+						options = {
+							{ value = "omp", label = "指令" },
+							{ value = "run", label = "命令" },
+							{ value = "file", label = "文件" },
+						},
 						open = ed.opens[sid(i, "bar", "kind")] == true,
 					}),
 					N("button", { key = "up", text = "↑", title = "上移", size = "sm", variant = "quiet", actions = { click = `step-up:{i}` } }),
@@ -1394,22 +1614,51 @@ local function steps_section(ed: Editor): any
 				N("field", { key = "name", label = "名称", error = if err and string.find(err, "名", 1, true) then err else nil }, {
 					input_node(ed, name_id, { key = "input", placeholder = "步骤名称" }),
 				}),
-				N("field", { key = "text", error = err }, {
-					input_node(ed, text_id, { key = "input", placeholder = if kind == "run" then "shell 脚本" else "提示词" }),
-				}),
-				N("field", {
-					key = "when",
-					label = "条件(when)",
-					hint = "out.<输出名> 或 input.<输入名>,可加 ! 取反;为空则总是运行",
-					error = when_err,
-				}, {
-					input_node(ed, when_id, { key = "input", placeholder = "out.verify" }),
-				}),
+			}
+			if kind == "file" then
+				local cur = if type(step.file) == "string" then step.file else ""
+				local opts = with_current(file_opts, cur, if cur == "" then "选择文件" else cur)
+				seed(ed, args_id, args_text(step))
+				table.insert(body, N("field", { key = "file", label = "脚本", error = file_err }, {
+					N("select", {
+						key = "sel",
+						value = cur,
+						placeholder = "选择文件",
+						options = opts,
+						open = ed.opens[sid(i, "file", "sel")] == true,
+					}),
+				}))
+				table.insert(body, N("field", { key = "args", label = "参数", hint = "空格分隔,写入 args 数组" }, {
+					input_node(ed, args_id, { key = "input", placeholder = "--flag value" }),
+				}))
+			else
+				seed(ed, text_id, step_text(step), true)
+				local f = ed.buf[text_id]
+				if f then
+					f.lines = true
+				end
+				table.insert(body, N("field", { key = "text", error = err }, {
+					editor_node(ed, text_id, {
+						key = "input",
+						placeholder = if kind == "run" then "shell 脚本" else "提示词",
+						lines = true,
+						maxLines = FILE_MAX_LINES,
+					}),
+				}))
+			end
+			table.insert(body, N("field", {
+				key = "when",
+				label = "条件(when)",
+				hint = "out.<输出名> 或 input.<输入名>,可加 ! 取反;为空则总是运行",
+				error = when_err,
+			}, {
+				input_node(ed, when_id, { key = "input", placeholder = "out.verify" }),
 			}))
+			table.insert(rows, N("col", { key = `s{i}`, gap = "xs", role = "roost.steps" }, body))
 		end
 	end
 	if not any_extra then
-		table.insert(rows, txt("只有指令一步。需要 shell 或更多指令时再添加。", "empty", "muted"))
+		table.insert(rows, txt("只有指令一步。需要 shell、文件或更多指令时再添加。", "empty", "muted"))
 	end
 	table.insert(rows, N("button", {
 		key = "add",
@@ -1419,6 +1668,101 @@ local function steps_section(ed: Editor): any
 		actions = { click = "step-add" },
 	}))
 	return N("col", { key = "steps", gap = "sm" }, rows)
+end
+
+local function files_section(ed: Editor): any
+	local paths = sorted_file_paths(ed.files)
+	local sel = ed.file_sel
+	if type(sel) == "string" and ed.files[sel] == nil then
+		sel = paths[1]
+		ed.file_sel = sel
+	elseif sel == nil and paths[1] then
+		sel = paths[1]
+		ed.file_sel = sel
+	end
+	local list: { any } = {}
+	for i, path in paths do
+		local text = ed.files[path] or ""
+		local armed = ed.confirm_file == path
+		table.insert(list, N("row", { key = `f{i}`, gap = "sm", align = "center" }, {
+			N("button", {
+				key = "pick",
+				text = path,
+				size = "sm",
+				variant = if sel == path then "primary" else "quiet",
+				on = sel == path,
+				actions = { click = `file-sel:{path}` },
+			}),
+			txt(`{#text} 字节`, "sz", "muted"),
+			N("button", {
+				key = "del",
+				text = if armed then "确认删除" else "删除",
+				size = "sm",
+				variant = if armed then "danger" else "quiet",
+				actions = { click = `file-del:{path}` },
+			}),
+		}))
+	end
+	if #list == 0 then
+		table.insert(list, txt("还没有文件。添加后可在步骤里以「文件」运行。", "empty", "muted"))
+	end
+	seed(ed, FILE_ADD_ID, if ed.buf[FILE_ADD_ID] then ed.buf[FILE_ADD_ID].text else "script.py")
+	local children: { any } = {
+		txt("文件", "h"),
+		N("col", { key = "list", gap = "xs" }, list),
+		N("row", { key = "add", gap = "sm", align = "center" }, {
+			N("field", { key = "path", label = "添加", hint = "相对路径,默认 .py" }, {
+				input_node(ed, FILE_ADD_ID, { key = "input", placeholder = "script.py" }),
+			}),
+			N("button", {
+				key = "go",
+				text = "添加",
+				icon = "plus",
+				size = "sm",
+				actions = { click = "file-add" },
+			}),
+		}),
+	}
+	if type(sel) == "string" and ed.files[sel] ~= nil then
+		if ed.file_edit_for ~= sel then
+			ed.buf[FILE_EDIT_ID] = {
+				text = ed.files[sel],
+				cursor = utf8_len(ed.files[sel]),
+				lines = true,
+			}
+			ed.file_edit_for = sel
+		end
+		if ed.file_ren_for ~= sel then
+			ed.buf[FILE_REN_ID] = { text = sel, cursor = utf8_len(sel) }
+			ed.file_ren_for = sel
+		end
+		table.insert(children, N("row", { key = "ren", gap = "sm", align = "center" }, {
+			N("field", { key = "path", label = "重命名" }, {
+				input_node(ed, FILE_REN_ID, { key = "input", placeholder = sel }),
+			}),
+			N("button", {
+				key = "go",
+				text = "重命名",
+				size = "sm",
+				actions = { click = "file-ren" },
+			}),
+		}))
+		local files_err = field_error(ed, function(path)
+			return string.find(path, ".files", 1, true) ~= nil
+		end)
+		table.insert(children, N("field", {
+			key = "edit",
+			label = sel,
+			error = files_err,
+		}, {
+			editor_node(ed, FILE_EDIT_ID, {
+				key = "input",
+				lang = file_lang(sel),
+				maxLines = FILE_MAX_LINES,
+			}),
+		}))
+	end
+	return N("col", { key = "files", gap = "sm", role = "roost.files" }, children)
 end
 
 local function repo_options(st: any, current: string?): { any }
@@ -1531,6 +1875,53 @@ local function advanced_section(st: any, ed: Editor): any
 		error = budget_err,
 	}, {
 		input_node(ed, BUDGET_ID, { key = "input", placeholder = "5" }),
+	}))
+	local libs = str_list(raw.libs)
+	local lib_chips: { any } = {}
+	for j, name in libs do
+		table.insert(lib_chips, N("button", {
+			key = `l{j}`,
+			text = `{name} ×`,
+			size = "sm",
+			tone = "accent",
+			role = "roost.chip",
+			title = `移除 {name}`,
+			actions = { click = `lib-del:{j}` },
+		}))
+	end
+	seed(ed, LIBS_ADD_ID, if ed.buf[LIBS_ADD_ID] then ed.buf[LIBS_ADD_ID].text else "")
+	local libs_err = field_error(ed, function(path)
+		return path == "libs" or string.sub(path, -5) == ".libs"
+	end)
+	local libs_kids: { any } = {
+		txt("文件库(libs)", "lab", "muted"),
+		txt("在「文件」页管理共享库;此处只引用名称。", "hint", "muted"),
+		N("row", { key = "chips", gap = "xs", wrap = true, role = "roost.chips" }, lib_chips),
+		N("row", { key = "addrow", gap = "sm", align = "center" }, {
+			input_node(ed, LIBS_ADD_ID, { key = "add", placeholder = "库名,回车添加" }),
+			N("button", {
+				key = "go",
+				text = "添加",
+				size = "sm",
+				actions = { click = "lib-add" },
+			}),
+		}),
+	}
+	if libs_err then
+		table.insert(libs_kids, txt(libs_err, "ferr", "warning"))
+	end
+	table.insert(children, N("col", { key = "libs", gap = "xs" }, libs_kids))
+	local state_err = field_error(ed, function(path)
+		return path == "state" or string.sub(path, -6) == ".state"
+	end)
+	seed(ed, STATE_ID, if type(raw.state) == "string" then raw.state else "")
+	table.insert(children, N("field", {
+		key = "state",
+		label = "状态组(state)",
+		hint = "留空则用工作流 id;跨运行持久目录 $ROOST_STATE",
+		error = state_err,
+	}, {
+		input_node(ed, STATE_ID, { key = "input", placeholder = "默认:工作流 id" }),
 	}))
 	local tz_opts = {
 		{ value = "", label = "本机时区" },
@@ -1714,6 +2105,7 @@ function M.view(st: any): any?
 		}),
 		N("col", { key = "triggers", gap = "sm" }, triggers),
 		prompt_section(st, ed),
+		files_section(ed),
 		steps_section(ed),
 		N("field", { key = "notify", label = "通知" }, {
 			N("switch", { key = "sw", variant = "compact", label = "应用通知", on = raw.notify ~= false }),
@@ -1838,6 +2230,13 @@ local function on_select(st: any, ed: Editor, id: string, value: string)
 		if si then
 			set_step_kind(ed, si, value)
 		end
+	elseif string.find(id, ".file.sel", 1, true) then
+		local si = index_in(id, "%.s")
+		local step = if si then steps_of(ed.raw)[si] else nil
+		if type(step) == "table" and step_kind(step) == "file" then
+			step.file = value
+			touch(ed)
+		end
 	elseif string.find(id, ".advanced.ws", 1, true) then
 		ed.raw.workspace = value
 		touch(ed)
@@ -1909,6 +2308,157 @@ local function on_action(st: any, ed: Editor, act: string)
 	end
 	if act == "delete" then
 		delete_workflow(st)
+		return
+	end
+	if act == "file-add" then
+		sync_files(ed)
+		local f = ed.buf[FILE_ADD_ID]
+		local path = util.trim(if f then f.text else "")
+		if path == "" then
+			path = "script.py"
+		elseif string.find(path, ".", 1, true) == nil then
+			path = path .. ".py"
+		end
+		if not model.valid_file_path(path) then
+			st.cx:toast("error", "文件路径无效")
+			render(st)
+			return
+		end
+		if ed.files[path] ~= nil then
+			st.cx:toast("error", "文件已存在")
+			render(st)
+			return
+		end
+		ed.files[path] = ""
+		ed.file_sel = path
+		ed.buf[FILE_EDIT_ID] = { text = "", cursor = 0, lines = true }
+		ed.file_edit_for = path
+		ed.buf[FILE_REN_ID] = { text = path, cursor = utf8_len(path) }
+		ed.file_ren_for = path
+		if f then
+			f.text = "script.py"
+			f.cursor = utf8_len(f.text)
+		end
+		touch(ed)
+		check_now(st)
+		return
+	end
+	if act == "file-ren" then
+		sync_files(ed)
+		local sel = ed.file_sel
+		local f = ed.buf[FILE_REN_ID]
+		local path = util.trim(if f then f.text else "")
+		if type(sel) ~= "string" or ed.files[sel] == nil then
+			return
+		end
+		if path == "" or path == sel then
+			return
+		end
+		if not model.valid_file_path(path) then
+			st.cx:toast("error", "文件路径无效")
+			render(st)
+			return
+		end
+		if ed.files[path] ~= nil then
+			st.cx:toast("error", "文件已存在")
+			render(st)
+			return
+		end
+		local body = ed.files[sel]
+		ed.files[path] = body
+		ed.files[sel] = nil
+		ed.file_sel = path
+		ed.buf[FILE_EDIT_ID] = { text = body, cursor = utf8_len(body), lines = true }
+		ed.file_edit_for = path
+		ed.buf[FILE_REN_ID] = { text = path, cursor = utf8_len(path) }
+		ed.file_ren_for = path
+		touch(ed)
+		check_now(st)
+		return
+	end
+	local file_sel = string.match(act, "^file%-sel:(.+)$")
+	if file_sel then
+		sync_files(ed)
+		if ed.files[file_sel] ~= nil then
+			ed.file_sel = file_sel
+			local body = ed.files[file_sel]
+			ed.buf[FILE_EDIT_ID] = { text = body, cursor = utf8_len(body), lines = true }
+			ed.file_edit_for = file_sel
+			ed.buf[FILE_REN_ID] = { text = file_sel, cursor = utf8_len(file_sel) }
+			ed.file_ren_for = file_sel
+			touch(ed)
+			render(st)
+		end
+		return
+	end
+	local file_del = string.match(act, "^file%-del:(.+)$")
+	if file_del then
+		sync_files(ed)
+		if ed.files[file_del] == nil then
+			return
+		end
+		if ed.confirm_file ~= file_del then
+			ed.confirm_file = file_del
+			render(st)
+			return
+		end
+		ed.files[file_del] = nil
+		ed.confirm_file = nil
+		if ed.file_sel == file_del then
+			ed.file_sel = sorted_file_paths(ed.files)[1]
+			ed.file_edit_for = nil
+			ed.file_ren_for = nil
+			ed.buf[FILE_EDIT_ID] = nil
+			ed.buf[FILE_REN_ID] = nil
+		end
+		touch(ed)
+		check_now(st)
+		return
+	end
+	if act == "lib-add" then
+		local f = ed.buf[LIBS_ADD_ID]
+		local name = util.trim(if f then f.text else "")
+		if name == "" then
+			return
+		end
+		if not model.valid_lib(name) then
+			st.cx:toast("error", "文件库名无效")
+			render(st)
+			return
+		end
+		local cur = str_list(ed.raw.libs)
+		for _, item in cur do
+			if item == name then
+				if f then
+					f.text = ""
+					f.cursor = 0
+				end
+				return
+			end
+		end
+		table.insert(cur, name)
+		ed.raw.libs = cur
+		ed.lib_cache[name] = nil
+		if f then
+			f.text = ""
+			f.cursor = 0
+		end
+		touch(ed)
+		check_now(st)
+		return
+	end
+	local lib_del = string.match(act, "^lib%-del:(%d+)$")
+	if lib_del then
+		local cur = str_list(ed.raw.libs)
+		local idx = tonumber(lib_del) :: number
+		if cur[idx] then
+			local gone = cur[idx]
+			table.remove(cur, idx)
+			ed.raw.libs = if #cur == 0 then nil else cur
+			ed.lib_cache[gone] = nil
+			touch(ed)
+			check_now(st)
+		end
 		return
 	end
 	if act == "advanced" then
@@ -2107,6 +2657,14 @@ function M.event(st: any, ev: any): boolean
 end
 
 local function commit_chip(st: any, ed: Editor, id: string): boolean
+	if id == LIBS_ADD_ID then
+		on_action(st, ed, "lib-add")
+		return true
+	end
+	if id == FILE_ADD_ID then
+		on_action(st, ed, "file-add")
+		return true
+	end
 	local i = index_in(id, "%.t")
 	local key = string.match(id, "%.card%.([%w_]+)%.add$")
 	local tr = trig_at(ed, i)
@@ -2165,7 +2723,7 @@ function M.key(st: any, key: any): boolean
 		return true
 	end
 	if key.name == "enter" and not key.meta and not key.ctrl and not f.lines then
-		if string.sub(id, -4) == ".add" then
+		if id == FILE_ADD_ID or id == LIBS_ADD_ID or string.sub(id, -4) == ".add" then
 			commit_chip(st, ed, id)
 		else
 			check_now(st)
@@ -2187,6 +2745,9 @@ function M.key(st: any, key: any): boolean
 		touch(ed)
 		if id == NAME_ID then
 			ed.raw.name = f.text
+		end
+		if id == FILE_EDIT_ID and type(ed.file_sel) == "string" and ed.files[ed.file_sel] ~= nil then
+			ed.files[ed.file_sel] = f.text
 		end
 		schedule_check(st, ed)
 		render(st)

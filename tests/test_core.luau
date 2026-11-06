@@ -1806,4 +1806,378 @@ do -- an agent step's cost is read from its session files; the daily budget hold
 	eq(#w.started, 2, "the next day the omp step runs again")
 end
 
+local WF_FILES = [==[
+[[workflow]]
+id = "fs"
+workspace = "temp"
+state = "shared"
+[[workflow.step]]
+name = "own"
+file = "tools/run.py"
+args = ["go", "fast"]
+[[workflow.step]]
+name = "lib"
+file = "@kit/hello.sh"
+]==]
+
+do -- file steps run the run's copies of the workflow's files and libraries; scratch goes at the end
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_FILES,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/fs/files/tools/run.py"] = "print(1)\n",
+		[DATA .. "/library/kit/hello.sh"] = "echo hi\n",
+		[DATA .. "/library/kit/__pycache__/x.pyc"] = "junk",
+		[DATA .. "/library/kit/.DS_Store"] = "junk",
+	})
+	local tmp_seen: string? = nil
+	s.behave = function(p)
+		tmp_seen = p.opts.env.ROOST_TMP
+		s.env.files[p.opts.env.ROOST_TMP .. "/scratch.txt"] = "x"
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "fs"), nil)
+	step(s, 2)
+	local run = last_run(s)
+	local dir = `{DATA}/runs/{run.id}`
+	local own, lib = s.procs[1], s.procs[2]
+	eq(table.concat(own.cmd, " "), `python3 {dir}/files/tools/run.py go fast`, "own file, by extension, with args")
+	eq(table.concat(lib.cmd, " "), `/bin/sh {dir}/lib/kit/hello.sh`, "library file")
+	local e = own.opts.env
+	eq(e.ROOST_FILES, `{dir}/files`)
+	eq(e.ROOST_LIB, `{dir}/lib`)
+	eq(e.ROOST_STATE, `{DATA}/state/shared`, "the state group's directory")
+	eq(e.PYTHONPYCACHEPREFIX, `{dir}/tmp/pycache`, "Python caches land in scratch")
+	eq(s.env.files[`{dir}/files/tools/run.py`], "print(1)\n", "copy of the workflow's file")
+	eq(s.env.files[`{dir}/lib/kit/hello.sh`], "echo hi\n", "copy of the library")
+	eq(s.env.files[`{dir}/lib/kit/.DS_Store`], nil, "hidden files are not copied")
+	eq(s.env.files[`{dir}/lib/kit/__pycache__/x.pyc`], nil, "caches are not copied")
+	truthy(s.env.tern.fs.exists(`{DATA}/state/shared`), "state directory made")
+	eq(run.state, "success")
+	step(s, 1)
+	eq(tmp_seen, `{dir}/tmp`)
+	eq(s.env.files[`{dir}/tmp/scratch.txt`], nil, "scratch removed once the run ended")
+	eq(s.env.files[`{dir}/files/tools/run.py`], "print(1)\n", "the run keeps its copies (retention removes them)")
+
+	-- A library that doesn't exist fails the run before any step starts.
+	s.env.files[DATA .. "/library/kit/hello.sh"] = nil
+	s.env.files[DATA .. "/library/kit/__pycache__/x.pyc"] = nil
+	s.env.files[DATA .. "/library/kit/.DS_Store"] = nil
+	s.env.dirs[DATA .. "/library/kit"] = nil
+	local function wrappers(): number
+		local n = 0
+		for _, p in s.procs do
+			n += if p.kind == "wrapper" then 1 else 0
+		end
+		return n
+	end
+	local before = wrappers()
+	eq(s.core.dispatch(s.c, "fs"), nil)
+	step(s, 2)
+	eq(last_run(s).state, "failed")
+	truthy(string.find(last_run(s).reason or "", '文件库 "kit" 不存在', 1, true), tostring(last_run(s).reason))
+	eq(wrappers(), before, "no step started")
+end
+
+do -- the editor saves a workflow's files with it; a new id takes them along and keeps the state
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local raw = { id = "job", name = "Job", step = { { name = "go", file = "main.py" } } }
+	local issues = s.core.check_workflow(s.c, nil, raw, {})
+	truthy(#issues == 1 and string.find(issues[1].message, "本工作流没有文件 main.py", 1, true), "missing own file reported")
+	eq(#s.core.check_workflow(s.c, nil, raw, { ["main.py"] = "print(1)" }), 0)
+	local bad = s.core.check_workflow(s.c, nil, raw, { ["main.py"] = "x", ["main.py/a"] = "y" })
+	truthy(#bad > 0 and string.find(bad[1].message, "既是文件又是目录", 1, true), "file tree checked")
+	eq(s.core.save_workflow(s.c, nil, raw, { ["main.py"] = "print(1)", ["lib/util.py"] = "X = 1" }), nil)
+	eq(s.env.files[DATA .. "/workflows/job/files/main.py"], "print(1)")
+	-- Saving again with fewer files removes the rest.
+	eq(s.core.save_workflow(s.c, "job", raw, { ["main.py"] = "print(2)" }), nil)
+	eq(s.env.files[DATA .. "/workflows/job/files/lib/util.py"], nil, "dropped file removed")
+	eq(s.env.tern.fs.exists(DATA .. "/workflows/job/files/lib"), false, "and its empty directory")
+
+	s.env.files[DATA .. "/state/job/seen.json"] = "{}"
+	local renamed = table.clone(raw)
+	renamed.id = "job2"
+	eq(s.core.save_workflow(s.c, "job", renamed, nil), nil)
+	step(s, 1)
+	eq(s.env.files[DATA .. "/workflows/job2/files/main.py"], "print(2)", "files follow the new id")
+	eq(s.env.files[DATA .. "/workflows/job/files/main.py"], nil, "old directory removed")
+	eq(s.c.workflows.by_id.job2.state, "job", "state group pinned to the old id")
+
+	eq(s.core.delete_workflow(s.c, "job2"), nil)
+	step(s, 1)
+	eq(s.env.tern.fs.exists(DATA .. "/workflows/job2"), false, "deleting a workflow removes its files")
+	eq(s.env.files[DATA .. "/state/job/seen.json"], "{}", "but keeps its state")
+	eq(s.core.states(s.c)[1].name, "job")
+	eq(#s.core.states(s.c)[1].used_by, 0, "an orphaned state directory")
+	eq(s.core.delete_state(s.c, "job"), nil)
+	step(s, 1)
+	eq(s.env.files[DATA .. "/state/job/seen.json"], nil, "removed on request")
+end
+
+local WF_EXPORT = [==[
+[repos."acme/app"]
+path = "~/code/app"
+branch = "dev"
+
+[[workflow]]
+id = "ship"
+name = "发布"
+[[workflow.trigger]]
+schedule = "daily"
+time = "06:00"
+repo = "acme/app"
+[[workflow.step]]
+file = "@kit/hello.sh"
+[[workflow.step]]
+file = "deploy.py"
+args = ["prod"]
+]==]
+
+do -- export writes one self-contained file; import brings it back disabled, files and libraries included
+	local deploy = 'print("a\\b")\nx = """y"""\n'
+	local hello = "echo '''hi'''\n"
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_EXPORT,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/ship/files/deploy.py"] = deploy,
+		[DATA .. "/library/kit/hello.sh"] = hello,
+	})
+	s.core.start(s.c)
+	local path, err = s.core.export_workflows(s.c, { "ship" })
+	truthy(path, tostring(err))
+	truthy(string.match(path :: string, "^/data/exports/%d+%-%d+%-ship%.roost%.toml$"), tostring(path))
+	local text = s.env.files[path :: string]
+	eq(string.find(text, "~/code/app", 1, true), nil, "local paths stay here")
+	truthy(string.find(text, 'branch = "dev"', 1, true), "branch kept")
+	eq(s.core.exports(s.c)[1], string.match(path :: string, "[^/]+$"))
+
+	local t = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL, ["/tmp/in.roost.toml"] = text })
+	t.core.start(t.c)
+	local plan = t.core.import_preview(t.c, "/tmp/in.roost.toml")
+	eq(plan.workflows[1].id, "ship")
+	eq(plan.workflows[1].exists, false)
+	eq(plan.libraries[1].name, "kit")
+	eq(plan.repos[1].exists, false)
+	local summary, ierr = t.core.import_workflows(t.c, "/tmp/in.roost.toml", false)
+	truthy(summary, tostring(ierr))
+	local ship = t.c.workflows.by_id.ship
+	eq(ship.enabled, false, "imported workflows start disabled")
+	eq(t.c.workflows.by_id.sh ~= nil, true, "existing workflows kept")
+	eq(t.env.files[DATA .. "/workflows/ship/files/deploy.py"], deploy, "own files restored byte for byte")
+	eq(t.env.files[DATA .. "/library/kit/hello.sh"], hello, "library restored")
+	eq(t.c.workflows.repos["acme/app"].branch, "dev")
+	eq(t.c.workflows.repos["acme/app"].path, nil, "no local path until you set one")
+	truthy(string.find(summary :: string, "acme/app", 1, true), "summary asks for the path")
+
+	-- Again: an existing workflow is skipped unless overwriting; a changed library is replaced only then.
+	local _, again = t.core.import_workflows(t.c, "/tmp/in.roost.toml", false)
+	truthy(string.find(again or "", "已存在", 1, true), tostring(again))
+	t.env.files[DATA .. "/library/kit/hello.sh"] = "echo local\n"
+	local over = t.core.import_workflows(t.c, "/tmp/in.roost.toml", true)
+	truthy(over and string.find(over, "写入文件库 kit", 1, true), tostring(over))
+	eq(t.env.files[DATA .. "/library/kit/hello.sh"], hello)
+	truthy(t.env.files[DATA .. "/workflows.toml.bak"], "workflows.toml backed up")
+
+	local _, notroost = t.core.import_workflows(t.c, "/tmp/nothing.toml", false)
+	truthy(string.find(notroost or "", "无法读取", 1, true), tostring(notroost))
+end
+
+do -- export blanks workflow env values (they often hold tokens)
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = '[[workflow]]\nid = "keys"\nenv = { API_KEY = "sk-secret-123", MODE = "x" }\n[[workflow.step]]\nrun = "true"\n',
+		[DATA .. "/roost.toml"] = LOCAL,
+	})
+	s.core.start(s.c)
+	local path = s.core.export_workflows(s.c, { "keys" })
+	local text = s.env.files[path :: string]
+	eq(string.find(text, "sk-secret-123", 1, true), nil, "no secret in the export")
+	truthy(string.find(text, "API_KEY", 1, true), "but the names stay")
+	truthy(string.find(text, "只保留了名字", 1, true), "and the header says so")
+end
+
+do -- a directory queued for deletion is not reused until the removal has finished
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_FILES,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/fs/files/tools/run.py"] = "print(1)\n",
+		[DATA .. "/library/kit/hello.sh"] = "echo hi\n",
+		[DATA .. "/state/shared/a"] = "1",
+	})
+	s.core.start(s.c)
+	-- Deleting the state directory and starting a run at once: the run waits for the rm.
+	eq(s.core.delete_state(s.c, "shared"), nil)
+	eq(s.core.dispatch(s.c, "fs"), nil)
+	eq(last_run(s).state, "queued", "the run waits while its state directory is being deleted")
+	step(s, 3)
+	eq(s.env.files[DATA .. "/state/shared/a"], nil, "removed")
+	eq(last_run(s).state, "success", "then it runs")
+
+	-- A library can't be recreated while it is being deleted.
+	eq(s.core.delete_library(s.c, "kit"), "仍被工作流 fs 使用")
+	local t = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL, [DATA .. "/library/old/x.sh"] = "x" })
+	t.core.start(t.c)
+	eq(t.core.delete_library(t.c, "old"), nil)
+	truthy(string.find(t.core.create_library(t.c, "old") or "", "正在删除", 1, true), "refused while pending")
+	step(t, 2)
+	eq(t.core.create_library(t.c, "old"), nil, "allowed once it is gone")
+end
+
+do -- guards use the live file: a broken workflows.toml blocks deleting what might be in use
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_FILES,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/library/kit/hello.sh"] = "echo hi\n",
+		[DATA .. "/library/spare/a.sh"] = "a",
+		[DATA .. "/workflows/ghost/files/x.py"] = "1",
+		[DATA .. "/state/spare/a"] = "1",
+	})
+	s.core.start(s.c)
+	eq(#s.core.orphan_workflow_files(s.c), 1, "ghost is an orphan while the file is valid")
+	s.env.files[DATA .. "/workflows.toml"] = WF_FILES .. "\n[[workflow]]\nid = \"ghost\"\nbogus = 1\n"
+	s.core.reload_files(s.c)
+	truthy(#s.c.workflow_issues > 0, "the file now has an error")
+	eq(#s.core.orphan_workflow_files(s.c), 0, "nothing is an orphan while it is broken")
+	truthy((string.find(s.core.delete_library(s.c, "spare") or "", "有错误", 1, true)), "library delete refused")
+	truthy((string.find(s.core.delete_state(s.c, "spare") or "", "有错误", 1, true)), "state delete refused")
+end
+
+do -- saving does not delete files that appeared after the editor loaded; a changed file blocks the save
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local raw = { id = "job", name = "Job", step = { { name = "go", file = "main.py" } } }
+	eq(s.core.save_workflow(s.c, nil, raw, { ["main.py"] = "v1" }), nil)
+	local base = { ["main.py"] = "v1" }
+	-- Someone else adds a file while the editor is open.
+	s.env.files[DATA .. "/workflows/job/files/extra.py"] = "added elsewhere"
+	eq(s.core.save_workflow(s.c, "job", raw, { ["main.py"] = "v2" }, base), nil)
+	eq(s.env.files[DATA .. "/workflows/job/files/extra.py"], "added elsewhere", "kept: it was not in the editor's base")
+	eq(s.env.files[DATA .. "/workflows/job/files/main.py"], "v2")
+	-- Someone else changes a file the editor also changes.
+	s.env.files[DATA .. "/workflows/job/files/main.py"] = "changed elsewhere"
+	local issues = s.core.save_workflow(s.c, "job", raw, { ["main.py"] = "v3" }, { ["main.py"] = "v2" })
+	truthy(issues and string.find(issues[1].message, "被改动过", 1, true), "refused: " .. tostring(issues and issues[1].message))
+	eq(s.env.files[DATA .. "/workflows/job/files/main.py"], "changed elsewhere", "and nothing was overwritten")
+end
+
+do -- renaming keeps files Roost does not copy, and a file can turn into a directory
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local raw = { id = "job", name = "Job", step = { { name = "go", file = "util" .. ".py" } } }
+	eq(s.core.save_workflow(s.c, nil, raw, { ["util.py"] = "1", util = "plain" }), nil)
+	s.env.files[DATA .. "/workflows/job/files/.env"] = "SECRET=1"
+	local renamed = table.clone(raw)
+	renamed.id = "job2"
+	eq(s.core.save_workflow(s.c, "job", renamed, nil), nil)
+	step(s, 1)
+	eq(s.env.files[DATA .. "/workflows/job2/files/util.py"], "1", "files copied to the new id")
+	eq(s.env.files[DATA .. "/workflows/job/files/.env"], "SECRET=1", "an uncopied hidden file is not deleted")
+	eq(s.env.files[DATA .. "/workflows/job/files/util.py"], nil, "copied files leave the old directory")
+	-- file -> directory in one save
+	eq(s.core.save_workflow(s.c, "job2", renamed, { ["util.py"] = "1", ["util/a.py"] = "2" }, { ["util.py"] = "1", util = "plain" }), nil)
+	eq(s.env.files[DATA .. "/workflows/job2/files/util/a.py"], "2", "a former file is now a directory")
+end
+
+do -- paths that differ only by case are one file on a case-insensitive disk: refused
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local raw = { id = "cs", name = "Case", step = { { name = "go", file = "Run.py" } } }
+	local issues = s.core.save_workflow(s.c, nil, raw, { ["Run.py"] = "a", ["run.py"] = "b" })
+	truthy(issues and string.find(issues[1].message, "大小写", 1, true), "refused: " .. tostring(issues and issues[1].message))
+	local bundle = require("../lib/bundle")
+	local b, err = bundle.decode('[roost]\nformat = 1\n[[workflow]]\nid = "w"\n[[workflow.step]]\nrun = "x"\n[[file]]\nworkflow = "w"\npath = "A.py"\ntext = "1"\n[[file]]\nworkflow = "w"\npath = "a.py"\ntext = "2"\n')
+	eq(b, nil)
+	truthy(string.find(err or "", "大小写", 1, true), tostring(err))
+end
+
+do -- a library file a step runs can be neither deleted nor renamed
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = '[[workflow]]\nid = "uses"\n[[workflow.step]]\nfile = "@kit/a.py"\n',
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/library/kit/a.py"] = "print(1)",
+		[DATA .. "/library/kit/b.py"] = "print(2)",
+	})
+	s.core.start(s.c)
+	truthy((string.find(s.core.delete_library_file(s.c, "kit", "a.py") or "", "uses", 1, true)), "delete refused, names the workflow")
+	truthy((string.find(s.core.save_library_file(s.c, "kit", "c.py", "print(1)", "a.py") or "", "uses", 1, true)), "rename refused")
+	eq(s.env.files[DATA .. "/library/kit/a.py"], "print(1)", "untouched")
+	eq(s.core.delete_library_file(s.c, "kit", "b.py"), nil, "an unused file goes")
+	eq(s.core.save_library_file(s.c, "kit", "a.py", "print(3)", nil), nil, "editing the content in place is fine")
+	eq(s.env.files[DATA .. "/library/kit/a.py"], "print(3)")
+end
+
+do -- a case-only rename (Run.py -> run.py) keeps the content on a case-insensitive disk
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.env.icase = true
+	s.core.start(s.c)
+	local raw = { id = "cs", name = "Case", step = { { name = "go", file = "Run.py" } } }
+	eq(s.core.save_workflow(s.c, nil, raw, { ["Run.py"] = "print(1)" }), nil)
+	local renamed = { id = "cs", name = "Case", step = { { name = "go", file = "run.py" } } }
+	eq(s.core.save_workflow(s.c, "cs", renamed, { ["run.py"] = "print(1)" }, { ["Run.py"] = "print(1)" }), nil)
+	local kept = 0
+	for k, v in s.env.files do
+		if string.lower(k) == string.lower(DATA .. "/workflows/cs/files/run.py") then
+			kept += 1
+			eq(v, "print(1)", "content survived the rename")
+		end
+	end
+	eq(kept, 1, "exactly one copy of the file")
+
+	-- The same in a library.
+	s.env.files[DATA .. "/library/kit/Tool.sh"] = "echo hi"
+	eq(s.core.save_library_file(s.c, "kit", "tool.sh", "echo hi", "Tool.sh"), nil)
+	local libfiles = 0
+	for k, v in s.env.files do
+		if string.lower(k) == string.lower(DATA .. "/library/kit/tool.sh") then
+			libfiles += 1
+			eq(v, "echo hi", "library file kept its content")
+		end
+	end
+	eq(libfiles, 1)
+end
+
+do -- a file the editor did not touch is not reverted to its stale copy
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local raw = { id = "job", name = "Job", step = { { name = "go", file = "a.py" } } }
+	eq(s.core.save_workflow(s.c, nil, raw, { ["a.py"] = "a1", ["b.py"] = "b1" }), nil)
+	-- The editor loaded a1/b1, the user edits a.py; b.py is edited elsewhere meanwhile.
+	s.env.files[DATA .. "/workflows/job/files/b.py"] = "b edited elsewhere"
+	eq(s.core.save_workflow(s.c, "job", raw, { ["a.py"] = "a2", ["b.py"] = "b1" }, { ["a.py"] = "a1", ["b.py"] = "b1" }), nil)
+	eq(s.env.files[DATA .. "/workflows/job/files/a.py"], "a2")
+	eq(s.env.files[DATA .. "/workflows/job/files/b.py"], "b edited elsewhere", "the outside edit was not reverted")
+end
+
+do -- changing the id keeps what the editor never loaded, and refuses a target that already has files
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local raw = { id = "job", name = "Job", step = { { name = "go", file = "a.py" } } }
+	eq(s.core.save_workflow(s.c, nil, raw, { ["a.py"] = "a1" }), nil)
+	s.env.files[DATA .. "/workflows/job/files/added.py"] = "added elsewhere"
+	local moved = { id = "job2", name = "Job", step = { { name = "go", file = "a.py" } } }
+	eq(s.core.save_workflow(s.c, "job", moved, { ["a.py"] = "a1" }, { ["a.py"] = "a1" }), nil)
+	step(s, 1)
+	eq(s.env.files[DATA .. "/workflows/job2/files/a.py"], "a1")
+	eq(s.env.files[DATA .. "/workflows/job/files/added.py"], "added elsewhere", "an extra file stays in the old directory")
+	eq(s.env.files[DATA .. "/workflows/job/files/a.py"], nil, "the moved file left it")
+
+	-- A target id that already has files in its directory is refused, nothing is deleted.
+	s.env.files[DATA .. "/workflows/taken/files/keep.py"] = "mine"
+	local clash = { id = "taken", name = "Job", step = { { name = "go", file = "a.py" } } }
+	local issues = s.core.save_workflow(s.c, "job2", clash, { ["a.py"] = "a1" }, { ["a.py"] = "a1" })
+	truthy(issues and string.find(issues[1].message, "已有文件", 1, true), "refused: " .. tostring(issues and issues[1].message))
+	eq(s.env.files[DATA .. "/workflows/taken/files/keep.py"], "mine")
+end
+
+do -- overwrite-importing an export (env values blanked) keeps the env values the workflow has here
+	local wf = '[[workflow]]\nid = "keys"\nenv = { API_KEY = "sk-secret-123", MODE = "x" }\n[[workflow.step]]\nrun = "true"\n'
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = LOCAL })
+	s.core.start(s.c)
+	local path = s.core.export_workflows(s.c, { "keys" }) :: string
+	local summary = s.core.import_workflows(s.c, path, true)
+	truthy(summary, "imported")
+	eq(s.c.workflows.by_id.keys.env.API_KEY, "sk-secret-123", "the local secret was not erased")
+	eq(s.c.workflows.by_id.keys.env.MODE, "x")
+end
+
 print("ok")

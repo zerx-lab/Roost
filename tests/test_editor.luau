@@ -572,4 +572,163 @@ do -- when and daily_budget round-trip; a non-number budget is a validator issue
 	truthy(hit, "parse_workflows rejects the non-number budget")
 end
 
+
+do -- workflow files: add, type two lines, save reaches disk under workflows/<id>/files
+	local w = world({})
+	click(w, "editor-new")
+	press(w, "backspace", nil, { meta = true })
+	type_text(w, "filesave")
+	focus(w, PROMPT_ID)
+	type_text(w, "noop")
+	local ADD = "layer.editor.body.files.add.input"
+	focus(w, ADD)
+	press(w, "backspace", nil, { meta = true })
+	type_text(w, "main.py")
+	click(w, "file-add")
+	eq(w.st.editor.files["main.py"], "", "file added to editor state")
+	local EDIT = "layer.editor.body.files.edit.input"
+	focus(w, EDIT)
+	type_text(w, "print(1)")
+	press(w, "enter")
+	type_text(w, "print(2)")
+	step(w, 1)
+	eq(w.st.editor.files["main.py"], "print(1)\nprint(2)", "two lines stay in editor state")
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "saved with files")
+	local path = DATA .. "/workflows/filesave/files/main.py"
+	eq(w.env.files[path], "print(1)\nprint(2)", "file content reaches disk via save_workflow")
+	local wf = parsed(w).by_id.filesave
+	truthy(wf, "filesave workflow written")
+end
+
+do -- a file step is selectable and saves as file = "…" with args
+	local w = world({})
+	click(w, "editor-new")
+	press(w, "backspace", nil, { meta = true })
+	type_text(w, "filestep")
+	focus(w, PROMPT_ID)
+	type_text(w, "prep")
+	focus(w, "layer.editor.body.files.add.input")
+	press(w, "backspace", nil, { meta = true })
+	type_text(w, "run.py")
+	click(w, "file-add")
+	focus(w, "layer.editor.body.files.edit.input")
+	type_text(w, "print('go')")
+	click(w, "step-add")
+	-- new step is s2 (s1 is the prompt)
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.steps.s2.bar.kind", value = "file" })
+	eq(w.st.editor.raw.step[2].file, "", "file kind clears omp/run")
+	eq(w.st.editor.raw.step[2].omp, nil)
+	eq(w.st.editor.raw.step[2].run, nil)
+	view(w)
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.steps.s2.file.sel", value = "run.py" })
+	eq(w.st.editor.raw.step[2].file, "run.py")
+	view(w)
+	local ARGS = "layer.editor.body.steps.s2.args.input"
+	focus(w, ARGS)
+	type_text(w, "--flag value")
+	press(w, "enter")
+	local args = w.st.editor.raw.step[2].args
+	truthy(args and args[1] == "--flag" and args[2] == "value", `args split on whitespace: {tostring(args and args[1])} {tostring(args and args[2])}`)
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "file step saved")
+	local text = file_text(w) :: string
+	truthy(has(text, 'file = "run.py"'), "toml has file =")
+	truthy(has(text, 'args = ["--flag", "value"]') or has(text, "args = ["), "toml has args")
+	local steps = parsed(w).by_id.filestep.steps
+	local file_step = nil
+	for _, s in steps do
+		if s.kind == "file" then
+			file_step = s
+		end
+	end
+	truthy(file_step, "parsed file step")
+	eq(file_step.file.path, "run.py")
+	eq(file_step.file.lib, nil)
+	eq(file_step.args[1], "--flag")
+	eq(file_step.args[2], "value")
+end
+
+do -- pasting a multi-line string into an omp/run step keeps the newlines
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "ml"',
+		"[[workflow.step]]",
+		'name = "think"',
+		'omp = "one"',
+		"[[workflow.step]]",
+		'name = "more"',
+		'omp = "two"',
+		"[[workflow.step]]",
+		'name = "shell"',
+		'run = "echo a"',
+	}, "\n")
+	local w = world({ [DATA .. "/workflows.toml"] = wf })
+	click(w, "edit=ml")
+	view(w)
+	-- prompt is s1; extra omp is s2; run is s3
+	local TEXT = "layer.editor.body.steps.s2.text.input"
+	focus(w, TEXT)
+	press(w, "backspace", nil, { meta = true })
+	press(w, "paste", "line1\nline2")
+	eq(w.st.editor.buf[TEXT].text, "line1\nline2", "omp step paste keeps newlines")
+	eq(w.st.editor.buf[TEXT].lines, true, "omp step text is multi-line")
+	local RUN = "layer.editor.body.steps.s3.text.input"
+	view(w)
+	focus(w, RUN)
+	press(w, "backspace", nil, { meta = true })
+	press(w, "paste", "echo 1\necho 2")
+	eq(w.st.editor.buf[RUN].text, "echo 1\necho 2", "run step paste keeps newlines")
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "multi-line steps saved")
+	local steps = parsed(w).by_id.ml.steps
+	eq(steps[2].prompt.parts[1].lit, "line1\nline2", "omp newlines round-trip")
+	eq(steps[3].script, "echo 1\necho 2", "run newlines round-trip")
+end
+
+do -- deleting the open file must not write its text onto the file that is selected next
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "two"',
+		"[[workflow.step]]",
+		'omp = "go"',
+	}, "\n")
+	local w = world({
+		[DATA .. "/workflows.toml"] = wf,
+		[DATA .. "/workflows/two/files/a.py"] = "aaa",
+		[DATA .. "/workflows/two/files/b.py"] = "bbb",
+	})
+	click(w, "edit=two")
+	view(w)
+	eq(w.st.editor.file_sel, "a.py", "the first file is open")
+	click(w, "file-del:a.py")
+	click(w, "file-del:a.py")
+	view(w)
+	eq(w.st.editor.file_sel, "b.py")
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "saved")
+	eq(w.env.files[DATA .. "/workflows/two/files/b.py"], "bbb", "the survivor kept its own text")
+	eq(w.env.files[DATA .. "/workflows/two/files/a.py"], nil, "the deleted file is gone")
+end
+
+do -- an argument with a space survives opening and saving a file step untouched
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "sp"',
+		"[[workflow.step]]",
+		'omp = "go"',
+		"[[workflow.step]]",
+		'file = "run.py"',
+		'args = ["--path", "/tmp/my file"]',
+	}, "\n")
+	local w = world({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/workflows/sp/files/run.py"] = "print(1)" })
+	click(w, "edit=sp")
+	view(w)
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.editor, nil, "saved")
+	local file_step = parsed(w).by_id.sp.steps[2]
+	eq(#file_step.args, 2, "still two arguments")
+	eq(file_step.args[2], "/tmp/my file")
+end
+
 print("ok")

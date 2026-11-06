@@ -448,4 +448,57 @@ do -- PR references for a manual PR run; which workflows can take one
 	eq(kinds(""), nil)
 end
 
+do -- file steps: own files or @library/path, run by extension; libraries they name join `libs`
+	local function parse(steps: string, extra: string?): (model.Workflow?, string?)
+		local w, issues = model.parse_workflows(`[[workflow]]\nid = "w"\n{extra or ""}\n{steps}`)
+		if w == nil then
+			return nil, `{issues[1].path}: {issues[1].message}`
+		end
+		return w.list[1], nil
+	end
+	local wf = parse(
+		'[[workflow.step]]\nfile = "@tools/bin/scan.py"\nargs = ["scan", "--all"]\n[[workflow.step]]\nfile = "local.sh"\n',
+		'libs = ["zeta"]'
+	) :: model.Workflow
+	eq(wf.steps[1].kind, "file")
+	eq((wf.steps[1].file :: model.FileRef).lib, "tools")
+	eq((wf.steps[1].file :: model.FileRef).path, "bin/scan.py")
+	eq(table.concat(wf.steps[1].args, " "), "scan --all", "file steps take args")
+	eq((wf.steps[2].file :: model.FileRef).lib, nil, "no @: the workflow's own file")
+	eq(table.concat(wf.libs, ","), "tools,zeta", "declared and referenced libraries, sorted")
+	eq(wf.state, "w", "state group defaults to the id")
+	eq((parse('[[workflow.step]]\nrun = "true"\n', 'state = "shared"') :: model.Workflow).state, "shared")
+
+	for _, case in {
+		{ '[[workflow.step]]\nfile = "../x.py"\n', "file" },
+		{ '[[workflow.step]]\nfile = ".hidden.py"\n', "file" },
+		{ '[[workflow.step]]\nfile = "@Bad/x.py"\n', "file" },
+		{ '[[workflow.step]]\nfile = "notes.md"\n', "不支持的脚本类型" },
+		{ '[[workflow.step]]\nfile = "a.py"\nrun = "true"\n', "只能选一个" },
+		{ '[[workflow.step]]\nfile = "a.py"\nmodel = "x"\n', "model 只用于 omp" },
+		{ '[[workflow.step]]\nrun = "true"\nargs = ["x"]\n', "run 步骤不接受" },
+	} do
+		local got, err = parse(case[1])
+		eq(got, nil, case[1])
+		assert(string.find(err or "", case[2], 1, true), `{case[1]} → {err}`)
+	end
+	local _, bad_state = parse('[[workflow.step]]\nrun = "true"\n', 'state = "../x"')
+	assert(string.find(bad_state or "", "状态组", 1, true), tostring(bad_state))
+
+	eq(model.valid_file_path("a/b/c.py"), true)
+	eq(model.valid_file_path("a//b"), false)
+	eq(model.valid_file_path("/abs"), false)
+	eq(model.valid_file_path("a/../b"), false)
+	eq(model.valid_file_path("1/2/3/4/5/6/7/8/9"), false, "at most 8 parts")
+	eq((model.interpreter("x.PY") :: { string })[1], "python3", "extension case-insensitive")
+
+	-- Encoding keeps the new keys.
+	local raw = model.raw_workflow('[[workflow]]\nid = "w"\nstate = "s"\nlibs = ["l"]\n[[workflow.step]]\nfile = "@l/a.py"\nargs = ["x"]\n', "w")
+	local again = model.raw_workflow(model.encode_workflow(raw :: any), "w") :: any
+	eq(again.state, "s")
+	eq(again.libs[1], "l")
+	eq(again.step[1].file, "@l/a.py")
+	eq(again.step[1].args[1], "x")
+end
+
 print("ok")

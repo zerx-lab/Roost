@@ -16,6 +16,7 @@ local util = require("./util")
 local agent = require("./agent")
 local editor = require("./editor")
 local stats = require("./stats")
+local files = require("./files")
 
 local ui = tern.ui
 local N = ui.node
@@ -29,6 +30,7 @@ local TABS = {
 	{ id = "events", label = "事件" },
 	{ id = "relay", label = "中继" },
 	{ id = "config", label = "配置" },
+	{ id = "files", label = "文件" },
 }
 local TAB_IDS: { [string]: boolean } = {}
 for _, t in TABS do
@@ -62,6 +64,35 @@ export type Log = {
 	width: number, -- widest complete line in terminal cells (unwrapped view)
 }
 
+-- The files page: the library shown, its open file, and the text fields on the page.
+export type FilesPage = {
+	lib: string?, -- the file library shown
+	sel: string?, -- its file in the editor
+	tree: files.Tree?, -- that library's files as last read
+	tree_err: string?,
+	loaded: string, -- text of `sel` as read: the editor is dirty while it differs
+	focus: string?, -- newlib | newfile | ren | edit: the field the keys go to
+	fields: { [string]: field.Field },
+}
+-- The import overlay: the file to read and what importing it would do.
+export type Import = { path: field.Field, plan: core.ImportPlan?, error: string? }
+
+local function text_field(text: string, lines: boolean?): field.Field
+	return { text = text, cursor = utf8.len(text) or #text, lines = lines }
+end
+
+local function new_fp(): FilesPage
+	return {
+		lib = nil,
+		sel = nil,
+		tree = nil,
+		tree_err = nil,
+		loaded = "",
+		focus = nil,
+		fields = { newlib = text_field(""), newfile = text_field(""), ren = text_field(""), edit = text_field("", true) },
+	}
+end
+
 export type State = {
 	core: core.Core,
 	cx: BlockCx,
@@ -84,6 +115,8 @@ export type State = {
 	app_busy: boolean,
 	confirm: string?, -- the destructive action armed by a first click (delete, clear, forget)
 	confirm_at: number?, -- tern.now() of that click
+	fp: FilesPage,
+	imp: Import?, -- the import overlay while open
 }
 
 -- ---------------------------------------------------------------------------------------------
@@ -113,7 +146,7 @@ local STATE_TONE: { [string]: string } = {
 }
 local TRIGGER_LABEL: { [string]: string } = { github = "GitHub", cron = "定时", manual = "手动", rerun = "重跑" }
 local TRIGGER_ICON: { [string]: string } = { github = "branch", cron = "clock", manual = "user", rerun = "redo" }
-local STEP_ICON: { [string]: string } = { auth = "plug", omp = "omp", run = "terminal", prepare = "folder-plus", cleanup = "trash" }
+local STEP_ICON: { [string]: string } = { auth = "plug", omp = "omp", run = "terminal", file = "file-code", prepare = "folder-plus", cleanup = "trash" }
 local SYNC_LABEL: { [string]: string } = {
 	idle = "待核对",
 	pushing = "推送中",
@@ -411,6 +444,8 @@ function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
 		app_busy = false,
 		confirm = nil,
 		confirm_at = nil,
+		fp = new_fp(),
+		imp = nil,
 	}
 	if st.run_id and c.store.by_id[st.run_id] == nil then
 		st.run_id = nil
@@ -1138,6 +1173,7 @@ local function workflow_card(st: State, wf: model.Workflow, health: stats.Health
 	local body: { Node } = {
 		N("row", { key = "end", gap = "sm", align = "center" }, {
 			btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }),
+			btn("导出", `export={wf.id}`, { variant = "quiet", icon = "file-code", key = "export", title = "导出这个工作流(含脚本文件)到 exports 目录" }),
 			btn("运行", `dispatch={wf.id}`, {
 				icon = "play",
 				key = "run",
@@ -1194,6 +1230,8 @@ local function workflows_toolbar(count: string?): Node
 		N("row", { key = "end", gap = "sm", align = "center" }, {
 			btn("新建自动化", "editor-new", { icon = "plus", size = "md", key = "new" }),
 			editor.template_menu(),
+			btn("导入", "imp-open", { variant = "quiet", icon = "plus", size = "md", key = "import", title = "从导出文件导入工作流" }),
+			btn("导出全部", "export-all", { variant = "quiet", icon = "file-code", size = "md", key = "export", title = "把全部工作流导出到一个文件" }),
 			btn("", "open=workflows", { variant = "quiet", icon = "file-code", size = "md", title = "编辑 workflows.toml", key = "file" }),
 		}),
 	})
@@ -1239,6 +1277,273 @@ local function workflows_tab(st: State): Node
 		workflows_toolbar(count),
 		N("row", { key = "cards", gap = "lg", wrap = true, align = "stretch" }, cards),
 	})
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Files: the file library, state directories, and files left behind by deleted workflows
+
+-- Node ids of the page's text fields (the keys the page routes by hand, like the editor's).
+local FP_IDS: { [string]: string } = {
+	newlib = "main.body.files.libs.new.name.input",
+	newfile = "main.body.files.libfiles.new.name.input",
+	ren = "main.body.files.libfiles.ren.name.input",
+	edit = "main.body.files.libfiles.edit.input",
+}
+
+local function fp_focus(st: State, name: string?)
+	st.fp.focus = name
+	if name then
+		st.cx:frame({ { "focus", FP_IDS[name] } })
+	else
+		st.cx:frame({ pair("focus", tern.json.null) })
+	end
+end
+
+local function fp_dirty(st: State): boolean
+	local fp = st.fp
+	return fp.sel ~= nil and fp.fields.edit.text ~= fp.loaded
+end
+
+-- Moving off a file with unsaved edits would drop them: refuse and say why.
+local function fp_guard(st: State): boolean
+	if fp_dirty(st) then
+		st.cx:toast("error", "文件有未保存的修改:先保存或还原")
+		return false
+	end
+	return true
+end
+
+-- (Re)reads the shown library; its selected file (else the first) goes into the editor.
+local function fp_load(st: State)
+	local fp = st.fp
+	fp.tree, fp.tree_err = nil, nil
+	if fp.lib then
+		local tree, err = core.library_files(st.core, fp.lib)
+		fp.tree, fp.tree_err = tree, err
+	end
+	local tree = fp.tree
+	if tree == nil then
+		fp.sel = nil
+	elseif fp.sel == nil or tree.text[fp.sel] == nil then
+		fp.sel = tree.paths[1]
+	end
+	local sel = fp.sel
+	local text = if tree and sel then tree.text[sel] else ""
+	fp.loaded = text
+	fp.fields.edit = text_field(text, true)
+	fp.fields.ren = text_field(sel or "")
+end
+
+local function fp_newlib(st: State)
+	local fp = st.fp
+	if not fp_guard(st) then
+		return
+	end
+	local name = util.trim(fp.fields.newlib.text)
+	local err = core.create_library(st.core, name)
+	if err then
+		toast_err(st, err)
+		return
+	end
+	fp.fields.newlib = text_field("")
+	fp.lib, fp.sel = name, nil
+	fp_load(st)
+end
+
+local function fp_newfile(st: State)
+	local fp = st.fp
+	local lib = fp.lib
+	if lib == nil or not fp_guard(st) then
+		return
+	end
+	local path = util.trim(fp.fields.newfile.text)
+	if path == "" then
+		toast_err(st, "请填写文件路径")
+		return
+	elseif fp.tree and fp.tree.text[path] ~= nil then
+		toast_err(st, `{path} 已存在`)
+		return
+	end
+	local err = core.save_library_file(st.core, lib, path, "", nil)
+	if err then
+		toast_err(st, err)
+		return
+	end
+	fp.fields.newfile = text_field("")
+	fp.sel = path
+	fp_load(st)
+end
+
+-- Renames the open file; what is in the editor is saved under the new name.
+local function fp_rename(st: State)
+	local fp = st.fp
+	local lib, sel = fp.lib, fp.sel
+	local to = util.trim(fp.fields.ren.text)
+	if lib == nil or sel == nil or to == "" or to == sel then
+		return
+	end
+	local err = core.save_library_file(st.core, lib, to, fp.fields.edit.text, sel)
+	if err then
+		toast_err(st, err)
+		return
+	end
+	fp.sel = to
+	fp_load(st)
+end
+
+local function fp_save(st: State)
+	local fp = st.fp
+	local lib, sel = fp.lib, fp.sel
+	if lib == nil or sel == nil then
+		return
+	end
+	local err = core.save_library_file(st.core, lib, sel, fp.fields.edit.text, nil)
+	if err then
+		toast_err(st, err)
+		return
+	end
+	fp_load(st)
+	st.cx:toast("success", `已保存 {sel}`)
+end
+
+local function file_lang(path: string): string
+	local ext = string.lower(string.match(path, "%.(%w+)$") or "")
+	if ext == "py" then
+		return "python"
+	elseif ext == "sh" or ext == "bash" then
+		return "bash"
+	elseif ext == "js" or ext == "mjs" or ext == "cjs" then
+		return "javascript"
+	elseif ext == "md" then
+		return "markdown"
+	end
+	return "text"
+end
+
+local function files_tab(st: State): Node
+	local c = st.core
+	local fp = st.fp
+	local libs = core.libraries(c)
+	if fp.lib then
+		local there = false
+		for _, info in libs do
+			there = there or info.name == fp.lib
+		end
+		if not there then
+			fp.lib, fp.sel = nil, nil
+			fp_load(st)
+		end
+	end
+	local function input(name: string, placeholder: string): Node
+		local f = fp.fields[name]
+		return N("input", { key = "input", text = f.text, cursor = field.utf16_cursor(f), placeholder = placeholder, variant = "field" })
+	end
+
+	local lib_rows: { Node } = {}
+	for _, info in libs do
+		local used = if #info.used_by > 0 then `{#info.used_by} 个工作流使用:{table.concat(info.used_by, "、")}` else "未被使用"
+		table.insert(lib_rows, N("row", { key = `l_{info.name}`, gap = "sm", align = "center" }, {
+			btn(info.name, `fp-lib={info.name}`, { key = "pick", variant = if fp.lib == info.name then "primary" else "quiet" }),
+			keyed(muted(used), "used"),
+			confirm_btn(st, "删除", "确认删除", `lib-del:{info.name}`, { key = "del", variant = "quiet" }),
+		}))
+	end
+	if #libs == 0 then
+		table.insert(lib_rows, keyed(muted("还没有文件库。文件库放多个工作流共用的脚本和提示词,工作流用 libs 或 file = \"@库/路径\" 引用。"), "none"))
+	end
+	table.insert(lib_rows, N("row", { key = "new", gap = "sm", align = "end" }, {
+		N("field", { key = "name", label = "新建文件库", hint = "a-z 0-9 _ -" }, { input("newlib", "例如 tools") }),
+		btn("新建", "fp-newlib", { key = "go", icon = "plus" }),
+	}))
+
+	local children: { Node } = {
+		N("row", { key = "bar", justify = "between", align = "center" }, {
+			muted("脚本和提示词由 Roost 保管;运行时使用的是开始时复制的副本。"),
+			btn("刷新", "fp-reload", { variant = "quiet", icon = "repeat", key = "reload" }),
+		}),
+		ui.card("文件库", lib_rows, { key = "libs", icon = "folder-open" }),
+	}
+
+	if fp.lib then
+		local rows: { Node } = {}
+		local tree = fp.tree
+		if fp.tree_err then
+			table.insert(rows, keyed(ui.text({ ui.span(fp.tree_err, "error") }), "err"))
+		end
+		if tree then
+			for i, path in tree.paths do
+				table.insert(rows, N("row", { key = `f{i}`, gap = "sm", align = "center" }, {
+					btn(path, `fp-file={path}`, { key = "pick", variant = if fp.sel == path then "primary" else "quiet" }),
+					keyed(muted(util.fmt_bytes(#tree.text[path])), "size"),
+					confirm_btn(st, "删除", "确认删除", `file-del:{path}`, { key = "del", variant = "quiet" }),
+				}))
+			end
+			if #tree.paths == 0 then
+				table.insert(rows, keyed(muted("这个文件库还没有文件。"), "none"))
+			end
+		end
+		table.insert(rows, N("row", { key = "new", gap = "sm", align = "end" }, {
+			N("field", { key = "name", label = "添加文件", hint = "相对路径,如 scan.py 或 prompts/triage.md" }, { input("newfile", "script.py") }),
+			btn("添加", "fp-newfile", { key = "go", icon = "plus" }),
+		}))
+		local sel = fp.sel
+		if sel then
+			local dirty = fp_dirty(st)
+			table.insert(rows, N("row", { key = "ren", gap = "sm", align = "end" }, {
+				N("field", { key = "name", label = "重命名" }, { input("ren", sel) }),
+				btn("重命名", "fp-ren", { key = "go" }),
+			}))
+			table.insert(rows, N("field", { key = "edit", label = sel }, {
+				N("editor", {
+					key = "input",
+					text = fp.fields.edit.text,
+					cursor = field.utf16_cursor(fp.fields.edit),
+					lang = file_lang(sel),
+					maxLines = 24,
+					placeholder = "文件内容",
+				}),
+			}))
+			table.insert(rows, N("row", { key = "save", gap = "sm", align = "center" }, {
+				keyed(muted(if dirty then "有未保存的修改" else "已保存"), "state"),
+				btn("还原", "fp-revert", { key = "revert", variant = "quiet", disabled = if dirty then false else "没有修改" }),
+				btn("保存", "fp-save", { key = "save", variant = "primary", disabled = if dirty then false else "没有修改" }),
+			}))
+		end
+		table.insert(children, ui.card(`文件库 {fp.lib}`, rows, { key = "libfiles", icon = "file-code" }))
+	end
+
+	local state_rows: { Node } = {}
+	for _, info in core.states(c) do
+		local used = if #info.used_by > 0 then `工作流 {table.concat(info.used_by, "、")}` else "没有工作流使用"
+		table.insert(state_rows, N("row", { key = `s_{info.name}`, gap = "sm", align = "center" }, {
+			keyed(ui.text({ ui.span(info.name, "mono") }), "name"),
+			keyed(muted(used), "used"),
+			confirm_btn(st, "删除", "确认删除", `state-del:{info.name}`, { key = "del", variant = "quiet" }),
+		}))
+	end
+	if #state_rows == 0 then
+		table.insert(state_rows, keyed(muted("还没有状态目录。"), "none"))
+	end
+	table.insert(children, ui.card("状态目录", {
+		keyed(muted("跨运行保留的数据($ROOST_STATE)。不会自动删除:删除后使用它的工作流从头开始。"), "note"),
+		N("col", { key = "list", gap = "xs" }, state_rows),
+	}, { key = "states", icon = "folder-open" }))
+
+	local orphans = core.orphan_workflow_files(c)
+	if #orphans > 0 then
+		local rows: { Node } = {}
+		for _, id in orphans do
+			table.insert(rows, N("row", { key = `o_{id}`, gap = "sm", align = "center" }, {
+				keyed(ui.text({ ui.span(id, "mono") }), "name"),
+				confirm_btn(st, "删除", "确认删除", `orphan-del:{id}`, { key = "del", variant = "quiet" }),
+			}))
+		end
+		table.insert(children, ui.card("遗留的工作流文件", {
+			keyed(muted("这些目录对应的工作流已不在 workflows.toml 里(例如手工删掉的)。"), "note"),
+			N("col", { key = "list", gap = "xs" }, rows),
+		}, { key = "orphans", icon = "trash" }))
+	end
+	return N("col", { key = "files", role = "roost.files", gap = "lg" }, children)
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1717,14 +2022,18 @@ local function storage_card(st: State): Node
 		end
 		return util.fmt_bytes(n)
 	end
+	local exports_n = #core.exports(c)
 	local cl = c.cleanup
 	local last = if cl
-		then `{util.ago(cl.at, t)}{if cl.manual then "(手动)" else ""}:{cl.runs} 个运行、{cl.events} 条事件记录、{cl.orphans} 个遗留目录`
+		then `{util.ago(cl.at, t)}{if cl.manual then "(手动)" else ""}:{cl.runs} 个运行、{cl.events} 条事件记录、{cl.exports} 个旧导出文件、{cl.orphans} 个遗留目录`
 		else "尚未执行"
 	local items: { any } = {
 		{ "运行", `{#c.store.runs} 条,{finished} 条已结束 · 保留 {k.runs} 条 / {fmt_age(k.run_age)} · {size({ "runs", "runs.json", "runs.json.bak" })}` },
 		{ "worktree", size({ "worktrees" }) },
 		{ "事件记录", `{#c.events} 条 · 保留 {k.events} 条 / {fmt_age(k.event_age)} · {size({ "events.json", "events.json.bak" })}` },
+		{ "脚本与文件", `文件库 {size({ "library" })} · 工作流文件 {size({ "workflows" })}` },
+		{ "状态目录", `{size({ "state" })} · 不会自动清理,在「文件」页手动删除` },
+		{ "导出文件", `{exports_n} 个 · 保留最新 {core.MAX_EXPORTS} 个 · {size({ "exports" })}` },
 		{ "上次自动清理", last },
 	}
 	if #c.store.trash > 0 then
@@ -1757,6 +2066,11 @@ local function storage_card(st: State): Node
 				key = "clear-events",
 				icon = "trash",
 				disabled = if #c.events == 0 then "没有记录" else false,
+			}),
+			confirm_btn(st, "清空导出文件", "确认清空", "clear-exports", {
+				key = "clear-exports",
+				icon = "trash",
+				disabled = if exports_n == 0 then "没有导出文件" else false,
 			}),
 			btn("调整保留策略", "open=config", { icon = "pen", variant = "quiet", key = "policy", title = "roost.toml 的 [retention]" }),
 			btn("", "refresh-disk", { icon = "repeat", variant = "quiet", key = "refresh", title = "重新统计占用", busy = d.loading }),
@@ -1959,6 +2273,162 @@ local function form_view(st: State): Node?
 end
 
 -- ---------------------------------------------------------------------------------------------
+-- Export and import
+
+-- Writes `ids` to one export file and copies its path.
+local function export_workflows(st: State, ids: { string })
+	local path, err = core.export_workflows(st.core, ids)
+	if path == nil then
+		toast_err(st, err or "导出失败")
+		return
+	end
+	st.cx:copy(path)
+	st.cx:toast("success", `已导出到 {path}(路径已复制)`)
+end
+
+local IMP_PATH_ID = "layer.imp.path.input"
+
+local function imp_close(st: State)
+	st.imp = nil
+	st.cx:frame({ pair("focus", tern.json.null) })
+end
+
+-- The editor and the run form own the overlay layer: import waits until they are closed.
+local function imp_open(st: State)
+	if st.editor or st.form or st.imp then
+		return
+	end
+	st.imp = { path = text_field(""), plan = nil, error = nil }
+	st.cx:frame({ { "focus", IMP_PATH_ID } })
+end
+
+local function imp_preview(st: State)
+	local imp = st.imp
+	if not imp then
+		return
+	end
+	imp.plan, imp.error = core.import_preview(st.core, util.trim(imp.path.text))
+end
+
+local function imp_run(st: State, overwrite: boolean)
+	local imp = st.imp
+	if not imp then
+		return
+	end
+	local summary, err = core.import_workflows(st.core, util.trim(imp.path.text), overwrite)
+	if summary then
+		st.cx:toast("success", summary)
+		imp_close(st)
+	else
+		imp.error = err or "导入失败"
+	end
+end
+
+local function plan_nodes(plan: core.ImportPlan): { Node }
+	local out: { Node } = {}
+	for i, w in plan.workflows do
+		table.insert(out, keyed(ui.text({
+			ui.span("工作流 ", "muted"),
+			ui.span(w.id, "mono"),
+			ui.span(`  {w.name}  `),
+			ui.span(if w.exists then "已存在,默认跳过" else "新增,导入后停用", if w.exists then "warning" else "success"),
+		}), `w{i}`))
+	end
+	for i, l in plan.libraries do
+		local state = if not l.exists then "新建" elseif l.same then "内容相同" else "内容不同,默认保留本机版本"
+		table.insert(out, keyed(ui.text({
+			ui.span("文件库 ", "muted"),
+			ui.span(l.name, "mono"),
+			ui.span("  "),
+			ui.span(state, if l.exists and not l.same then "warning" else "success"),
+		}), `l{i}`))
+	end
+	for i, r in plan.repos do
+		table.insert(out, keyed(ui.text({
+			ui.span("仓库 ", "muted"),
+			ui.span(r.name, "mono"),
+			ui.span("  "),
+			ui.span(if r.exists then "已声明" else "需在 workflows.toml 填写本机路径", if r.exists then "success" else "warning"),
+		}), `r{i}`))
+	end
+	table.insert(out, keyed(muted(`共 {plan.files} 个文件`), "files"))
+	return out
+end
+
+-- Whether importing would replace something here (so "覆盖导入" has a meaning).
+local function plan_overwrites(plan: core.ImportPlan): boolean
+	for _, w in plan.workflows do
+		if w.exists then
+			return true
+		end
+	end
+	for _, l in plan.libraries do
+		if l.exists and not l.same then
+			return true
+		end
+	end
+	return false
+end
+
+local function import_view(st: State): Node?
+	local imp = st.imp
+	if not imp then
+		return nil
+	end
+	local children: { Node } = {
+		N("field", { key = "path", label = "导出文件", hint = "路径,或 exports 目录里的文件名" }, {
+			N("input", {
+				key = "input",
+				text = imp.path.text,
+				cursor = field.utf16_cursor(imp.path),
+				placeholder = "~/Downloads/xxx.roost.toml",
+				variant = "field",
+			}),
+		}),
+	}
+	local names = core.exports(st.core)
+	if #names > 0 then
+		local list: { Node } = {}
+		for i = 1, math.min(#names, 6) do
+			table.insert(list, btn(names[i], `imp-pick={names[i]}`, { key = `x{i}`, variant = "quiet" }))
+		end
+		table.insert(children, keyed(muted("最近的导出文件:"), "recent"))
+		table.insert(children, N("col", { key = "names", gap = "xs" }, list))
+	end
+	if imp.error then
+		table.insert(children, keyed(ui.text({ ui.span(imp.error, "error") }), "error"))
+	end
+	if imp.plan then
+		table.insert(children, N("col", { key = "plan", gap = "xs" }, plan_nodes(imp.plan)))
+	end
+	local foot: { Node } = {
+		btn("取消", "imp-cancel", { variant = "quiet", keys = { "esc" }, key = "cancel", size = "md" }),
+		btn("预览", "imp-preview", { key = "preview", size = "md" }),
+	}
+	if imp.plan and plan_overwrites(imp.plan) then
+		table.insert(foot, confirm_btn(st, "覆盖导入", "确认覆盖", "overwrite-import", { key = "overwrite", size = "md" }))
+	end
+	table.insert(foot, btn("导入", "imp-run", {
+		variant = "primary",
+		key = "run",
+		size = "md",
+		disabled = if imp.plan then false else "先预览",
+	}))
+	table.insert(children, N("row", { key = "foot", justify = "end", gap = "sm" }, foot))
+	return N("col", {}, {
+		N("overlay", {
+			key = "imp",
+			role = "roost.form",
+			head = "导入工作流",
+			icon = "plus",
+			modal = true,
+			size = "md",
+			foot = "layer.imp.foot",
+		}, children),
+	})
+end
+
+-- ---------------------------------------------------------------------------------------------
 -- View
 
 function M.view(st: State): BlockView
@@ -1973,6 +2443,8 @@ function M.view(st: State): BlockView
 		body = relay_tab(st)
 	elseif st.tab == "config" then
 		body = config_tab(st)
+	elseif st.tab == "files" then
+		body = files_tab(st)
 	else
 		body = overview(st)
 	end
@@ -2008,7 +2480,7 @@ function M.view(st: State): BlockView
 			{ body }
 		),
 	})
-	local legend: { any } = { ui.span("1-6", "key"), ui.span(" 切换页面", "muted") }
+	local legend: { any } = { ui.span("1-7", "key"), ui.span(" 切换页面", "muted") }
 	local function hint(k: string, what: string)
 		table.insert(legend, ui.span("   "))
 		table.insert(legend, ui.span(k, "key"))
@@ -2025,7 +2497,7 @@ function M.view(st: State): BlockView
 		hint("Esc", "取消选中")
 	end
 	local dock = N("col", {}, { ui.text(legend) })
-	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) }
+	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) or import_view(st) }
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -2070,6 +2542,37 @@ local function confirmed(st: State, what: string)
 		core.clear_deliveries(c)
 	elseif what == "clear-relay-events" then
 		core.clear_relay_events(c)
+	elseif what == "clear-exports" then
+		core.clear_exports(c)
+	elseif what == "overwrite-import" then
+		imp_run(st, true)
+	elseif string.sub(what, 1, 8) == "lib-del:" then
+		local name = string.sub(what, 9)
+		local err = core.delete_library(c, name)
+		toast_err(st, err)
+		if not err and st.fp.lib == name then
+			st.fp.lib, st.fp.sel = nil, nil
+			fp_load(st)
+		end
+	elseif string.sub(what, 1, 9) == "file-del:" then
+		local path = string.sub(what, 10)
+		local fp = st.fp
+		-- Deleting another file would reload the editor over unsaved edits.
+		if fp.lib and (path == fp.sel or fp_guard(st)) then
+			local err = core.delete_library_file(c, fp.lib, path)
+			toast_err(st, err)
+			-- A refused delete leaves the editor (and any unsaved text in it) alone.
+			if err == nil then
+				if path == fp.sel then
+					fp.sel = nil
+				end
+				fp_load(st)
+			end
+		end
+	elseif string.sub(what, 1, 10) == "state-del:" then
+		toast_err(st, core.delete_state(c, string.sub(what, 11)))
+	elseif string.sub(what, 1, 11) == "orphan-del:" then
+		toast_err(st, core.delete_workflow_files(c, string.sub(what, 12)))
 	end
 end
 
@@ -2206,6 +2709,52 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 				end
 			end)
 		end
+	elseif act == "export" and value then
+		export_workflows(st, { value })
+	elseif act == "export-all" then
+		local ids: { string } = {}
+		local list: { model.Workflow } = if c.workflows then c.workflows.list else {}
+		for _, wf in list do
+			table.insert(ids, wf.id)
+		end
+		export_workflows(st, ids)
+	elseif act == "imp-open" then
+		imp_open(st)
+	elseif act == "imp-cancel" then
+		imp_close(st)
+	elseif act == "imp-preview" then
+		imp_preview(st)
+	elseif act == "imp-run" then
+		imp_run(st, false)
+	elseif act == "imp-pick" and value then
+		if st.imp then
+			st.imp.path = text_field(value)
+			imp_preview(st)
+		end
+	elseif act == "fp-lib" and value then
+		if fp_guard(st) then
+			st.fp.lib, st.fp.sel = value, nil
+			fp_load(st)
+		end
+	elseif act == "fp-file" and value then
+		if fp_guard(st) then
+			st.fp.sel = value
+			fp_load(st)
+		end
+	elseif act == "fp-reload" then
+		if fp_guard(st) then
+			fp_load(st)
+		end
+	elseif act == "fp-revert" then
+		fp_load(st)
+	elseif act == "fp-save" then
+		fp_save(st)
+	elseif act == "fp-newlib" then
+		fp_newlib(st)
+	elseif act == "fp-newfile" then
+		fp_newfile(st)
+	elseif act == "fp-ren" then
+		fp_rename(st)
 	elseif act == "housekeep" then
 		core.housekeep(c, true)
 	elseif act == "refresh-disk" then
@@ -2267,7 +2816,9 @@ function M.event(st: State, ev: UiEvent)
 			do_action(st, act, ev.value, if type(ev.item) == "string" then ev.item else nil)
 		end
 	elseif ev.ev == "focus" then
-		if st.form then
+		if st.imp then
+			st.cx:frame({ { "focus", IMP_PATH_ID } })
+		elseif st.form then
 			local i = tonumber(string.match(ev.id or "", "^layer%.form%.field(%d+)%.input$") or "")
 			if i and st.form.fields[i] then
 				st.form.focus = i
@@ -2278,6 +2829,11 @@ function M.event(st: State, ev: UiEvent)
 			st.cx:frame({ pair("focus", ev.id) })
 		else
 			st.app_focus = false
+			for fname, id in FP_IDS do
+				if st.tab == "files" and ev.id == id then
+					fp_focus(st, fname)
+				end
+			end
 		end
 	end
 end
@@ -2334,6 +2890,44 @@ function M.key(st: State, key: Key): boolean?
 			return true
 		end
 		return false
+	end
+	local imp = st.imp
+	if imp then
+		if key.name == "escape" then
+			imp_close(st)
+			return true
+		elseif key.name == "enter" then
+			if imp.plan then
+				imp_run(st, false)
+			else
+				imp_preview(st)
+			end
+			return true
+		end
+		if field.key(imp.path, key) then
+			imp.plan, imp.error = nil, nil
+			return true
+		end
+		return false
+	end
+	local fpn = st.fp.focus
+	if st.tab == "files" and fpn then
+		if key.name == "escape" then
+			fp_focus(st, nil)
+			return true
+		elseif key.name == "enter" and fpn ~= "edit" then
+			if fpn == "newlib" then
+				fp_newlib(st)
+			elseif fpn == "newfile" then
+				fp_newfile(st)
+			else
+				fp_rename(st)
+			end
+			return true
+		end
+		if field.key(st.fp.fields[fpn], key) then
+			return true
+		end
 	end
 	local app = if st.tab == "relay" and st.app_focus and st.app_org then core.app(st.core) else nil
 	-- Keys go to the org field only while it is drawn (no App yet, relay status known).
