@@ -73,6 +73,7 @@ lib/relay.luau       # 中继客户端(wire 协议,主会话维护)
 lib/model.luau      # 两个配置文件的解析与校验、订阅计算
 lib/store.luau       # runs.json 历史、保留策略与分批删除(高风险:持久化,主会话维护)
 lib/eventlog.luau    # events.json:事件页历史(高风险:持久化,主会话维护)
+lib/loginenv.luau    # 登录 shell(fish 等)环境的读取与合成:shell 步骤和 gh/omp 调用的环境底座(只放内存)
 lib/match.luau lib/template.luau lib/cron.luau lib/toml.luau lib/util.luau lib/stats.luau   # 纯函数(stats:概览的按日统计与工作流健康度)
 lib/ui.luau lib/editor.luau lib/sidebar.luau lib/field.luau  # 面板视图、自动化编辑器、会话侧栏与文本输入
 tests/               # run.py + fake_tern.luau + harness.luau + test_*.luau

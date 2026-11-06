@@ -49,6 +49,8 @@ local function classify(argv: { string }): Proc
 		p.kind = "token"
 	elseif string.find(script, 'find "$1"', 1, true) then
 		p.kind = "tally"
+	elseif string.find(script, "UserShell", 1, true) then
+		p.kind = "login"
 	end
 	return p
 end
@@ -70,6 +72,8 @@ type Scenario = {
 	-- A fake Tern window running lib/launcher.luau, once `window(s)` attached one.
 	win: any,
 	L: any,
+	-- What the login-shell capture prints (lib/loginenv.luau), or false while it hasn't answered.
+	login: string | false,
 }
 
 local function scenario(files: { [string]: string }, opts: { [string]: any }?): Scenario
@@ -94,10 +98,20 @@ local function scenario(files: { [string]: string }, opts: { [string]: any }?): 
 		tally = "0.000000 0\n",
 		win = nil :: any,
 		L = nil :: any,
+		login = if o.login ~= nil
+			then o.login
+			else "motd noise__ROOST_LOGIN_ENV__PATH=/login/bin:/usr/bin\0FROM_FISH=yes\0GITHUB_TOKEN=mine\0PWD=/x\0__ROOST_LOGIN_ENV__",
 	}
 	env.process = function(argv: { string }, popts: any): any
 		local p = classify(argv)
 		p.opts = popts
+		if p.kind == "login" then
+			-- Infrastructure, not one of the runner's processes: kept out of `procs`.
+			if s.login == false then
+				return false
+			end
+			return { status = 0, stdout = s.login, stderr = "/opt/homebrew/bin/fish", timed_out = false }
+		end
 		table.insert(s.procs, p)
 		if p.kind == "wrapper" then
 			env.files[argv[6]] = "4242"
@@ -271,6 +285,46 @@ do -- cron fires once per matching minute; the omp step runs as an agent tab in 
 	eq(#s.c.store.runs, 1, "no second fire within the same 5 minutes")
 	eq(#w.started, 1, "a finished step is never reopened")
 	truthy(s.env.files[DATA .. "/runs.json"] and s.env.files[DATA .. "/runs.json.bak"], "history saved twice")
+end
+
+local WF_SHELL = [==[
+[[workflow]]
+id = "sh"
+workspace = "temp"
+[[workflow.step]]
+name = "say"
+run = "echo hi"
+]==]
+local RUNNER_ENV = LOCAL .. '[runner]\nenv = { FROM_FISH = "roost" }\n'
+
+do -- shell steps inherit the login shell's environment; runs start only once it has been read
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = RUNNER_ENV }, {
+		login = "fish greeting__ROOST_LOGIN_ENV__PATH=/login/bin\0FROM_FISH=yes\0ONLY_FISH=a=b\nc\0PWD=/x\0__ROOST_LOGIN_ENV__\nbye",
+	})
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "sh"), nil)
+	eq(last_run(s).state, "queued", "the run waits for the login environment")
+	eq(#s.procs, 0, "nothing started before it")
+	step(s, 2)
+	local say = s.procs[1]
+	eq(say.kind, "wrapper")
+	local e = say.opts.env
+	eq(e.ONLY_FISH, "a=b\nc", "login variables reach shell steps, values whole")
+	eq(e.FROM_FISH, "roost", "[runner] env wins over the login shell")
+	eq(e.PWD, nil, "the capturing shell's PWD is dropped")
+	eq(string.find(e.PATH, "/home/test/.local/bin:", 1, true), 1, "extra_path first")
+	eq(string.sub(e.PATH, -#":/login/bin"), ":/login/bin", "then the login shell's PATH")
+	eq(last_run(s).state, "success")
+end
+
+do -- a failed capture is reported and runs go on with the daemon's environment
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_SHELL, [DATA .. "/roost.toml"] = RUNNER_ENV }, { login = "no marks" })
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "sh"), nil)
+	step(s, 2)
+	eq(last_run(s).state, "success", "the run still ran")
+	eq(s.procs[1].opts.env.ONLY_FISH, nil)
+	truthy(string.find(s.c.notices[1].text, "读取登录 shell 的环境变量失败", 1, true), "failure noticed: " .. s.c.notices[1].text)
 end
 
 local WF_SOLO = [==[
@@ -1531,6 +1585,8 @@ do -- a run as the App: token first, gh/git as the bot in shell and omp steps, t
 	local e = (wrapper_for(s, 3) :: Proc).opts.env
 	eq(e.GH_TOKEN, "run-tok")
 	eq(e.ROOST_GH_TOKEN_FILE, tokf)
+	eq(e.GITHUB_TOKEN, nil, "the login shell's GitHub token stays out of App runs")
+	eq(prep.opts.env.GITHUB_TOKEN, "mine", "while your own steps keep it")
 	eq(string.sub(e.PATH, 1, #DATA + 5), DATA .. "/bin:", "the gh shim comes first on PATH")
 	eq(e.GIT_CONFIG_COUNT, "4")
 	eq(e.GIT_CONFIG_KEY_0, "credential.https://github.com.helper")
@@ -1547,6 +1603,7 @@ do -- a run as the App: token first, gh/git as the bot in shell and omp steps, t
 	local script = s.env.files[envf] or ""
 	truthy(string.find(script, "export GIT_AUTHOR_NAME='roost-x[bot]'", 1, true), script)
 	truthy(not string.find(script, "run-tok", 1, true), "the token stays out of the env file")
+	truthy(string.find(script, "unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN\n", 1, true), "Tern's own GitHub tokens are unset: " .. script)
 	local log = s.env.files[`{DATA}/runs/{run.id}/log.txt`] or ""
 	truthy(string.find(log, "以 GitHub App roost-x[bot] 的身份操作 acme/web", 1, true), log)
 	truthy(string.find(log, "默认分支 main 禁止强推与删除", 1, true), log)

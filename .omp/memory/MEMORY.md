@@ -32,7 +32,7 @@
 
 ## 约束与陷阱
 
-- [2026-11-06] 插件 host 的 `tern.process.run` 只有 daemon 的精简 PATH + `[runner] extra_path`,本机 omp 在 `~/.bun/bin`(bun 全局安装)不在其中,直接调 `omp` 会 127;agent 步骤不受影响(Tern agent block 用登录 shell 环境)。已把 `~/.bun/bin` 加进 `DEFAULT_EXTRA_PATH` — 依据:编辑器模型下拉框报「exec: omp: not found」、`which omp`
+- [2026-11-06] 插件 host 的 `tern.process.run` 继承的是 daemon 的精简环境(launchd),没有 fish 配置里的 PATH 与变量(omp 在 `~/.bun/bin`,直接调会 127)。现由 `lib/loginenv.luau` 在启动与每 10 分钟用登录 shell(dscl UserShell → $SHELL)`-l -i -c` 输出带标记的 `env -0`,shell 步骤与 gh/omp 调用都以它为底;首次读取结束前 runner 的 `pump`/`check` 不推进(不能在 `next_step`/`start_step` 里挡:exit 文件还在,下一轮 check 会重复 step_done)。只放内存,因为含 fish 导出的密钥。agent 步骤不受影响(Tern agent block 用登录环境) — 依据:编辑器模型下拉框报「exec: omp: not found」、`env -i … fish -l -i -c env -0` 实测、用户要求「继承系统变量和 fish 的变量」
 - [2026-11-06] Tern 视图布局:`.sf-tbl` 自带 `margin: 0 -7px`,在不裁剪的容器里会让窗格轻微横向滚动,Roost 用 `roost.run { overflow-x: clip }` 兜住。让 split 铺满剩余高度、长内容只在内部滚动:Tern 的布局对直接挂在 `.sf-main` 下的 col 即使 `flex: 1 1 0; min-height: 0` 也按内容高度撑开(整页滚动),必须再加 `overflow: hidden`,下层(split、窗格 col、日志 scroll)才跟着收缩;节点 `grow`/`min` 属性同样无效。`ansi` 节点忽略自己的 `min` 属性,要给它套一层 col 设 `min.w` — 依据:headless `tern serve` + TSP 探针的 layout JSON 实测
 - [2026-11-06] 不碰用户界面也能验证插件布局:`TERN_CONFIG_DIR=<tmp> TERN_DAEMON_SOCKET=<tmp> tern serve --control <sock>` 起隔离的无头实例,Python 脚本经 TSP(`tsp;q` hello → `o` screen surface,`role = "plugin.roost.console"` → `f` 节点树)画出同样的结构,`tern ctl --control <sock> css <名> roost.css` 以全局表注入真实样式(TSP `s` 表会被加 `[data-scope]` 前缀,`[data-surface]` 选择器匹配不到),再 `shot` 取 layout JSON。探针用 raw tty 时 Ctrl+C 杀不掉,要 pkill。`tern ctl dump` 只能看用户当前可见的 block — 依据:本次实测
 - [2026-11-06] ZerxLabBot 已由用户关闭;脚本仍认它留下的 `fd-triage:needs-info` 标记(算作提问时间),`OTHER_BOTS` 的「两天内评论过就跳过」已无实际作用 — 依据:用户告知

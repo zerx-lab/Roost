@@ -10,6 +10,7 @@ local cron = require("./cron")
 local match = require("./match")
 local util = require("./util")
 local eventlog = require("./eventlog")
+local loginenv = require("./loginenv")
 
 local M = {}
 
@@ -98,6 +99,8 @@ export type Core = {
 	gh_cache: { [string]: GhList },
 	gh_order: { string },
 	omp_models: OmpModels?,
+	login: loginenv.State, -- the login-shell environment local tools and shell steps inherit
+	login_waiters: { () -> () }, -- actions waiting for the first capture
 }
 
 local DEFAULT_CONFIG = [[
@@ -688,6 +691,31 @@ local function housekeep_loop(c: Core)
 	end)
 end
 
+local LOGIN_REFRESH_MS = 10 * 60 * 1000
+
+-- Captures the login-shell environment now and every ten minutes (picks up edits to the shell's
+-- config). Runs wait for the first capture; a failure keeps the last good one.
+local function login_loop(c: Core)
+	local before = c.login.error
+	loginenv.capture(c.login, now, function()
+		local err = c.login.error
+		if err and err ~= before then
+			local fallback = if c.login.env then "沿用上次读到的环境" else "本地进程只继承 Tern daemon 的环境"
+			M.notice(c, "error", `读取登录 shell 的环境变量失败:{err};{fallback}`)
+		end
+		runner.schedule(c.runner, 0)
+		local waiting = c.login_waiters
+		c.login_waiters = {}
+		for _, fn in waiting do
+			fn()
+		end
+		M.changed(c)
+	end)
+	tern.timer(LOGIN_REFRESH_MS, function()
+		login_loop(c)
+	end)
+end
+
 function M.new(data: string): Core
 	local paths = {
 		config = `{data}/roost.toml`,
@@ -729,11 +757,16 @@ function M.new(data: string): Core
 		gh_cache = {},
 		gh_order = {},
 		omp_models = nil,
+		login = loginenv.new(),
+		login_waiters = {},
 	}
 	c.runner = runner.new({
 		data = data,
 		home = tern.getenv("HOME"),
 		path = tern.getenv("PATH"),
+		login = function()
+			return c.login
+		end,
 		store = st,
 		config = function()
 			return c.config
@@ -816,6 +849,7 @@ function M.start(c: Core)
 	end
 	table.move(saved, 1, #saved, 1, c.events)
 	watch_loop(c)
+	login_loop(c)
 	runner.recover(c.runner)
 	housekeep_loop(c)
 	local wait = 60 - (now() % 60) + 1
@@ -929,18 +963,19 @@ function M.dispatch(c: Core, id: string, inputs: { [string]: string }?, repo: st
 	return nil
 end
 
--- PATH for local tools (gh, omp): `[runner] extra_path` before the daemon's own.
-local function local_path(c: Core): string
+-- The environment for local tools (gh, omp): the login environment and `[runner] env`, PATH being
+-- `[runner] extra_path` before the login shell's (the daemon's until one is known).
+local function local_env(c: Core): { [string]: string }
 	local home = tern.getenv("HOME")
 	local paths: { string } = {}
 	for _, p in c.config.runner.extra_path do
 		table.insert(paths, util.expand(p, home))
 	end
-	table.insert(paths, tern.getenv("PATH") or "/usr/bin:/bin")
-	return table.concat(paths, ":")
+	return loginenv.compose(c.login, { c.config.runner.env }, paths, tern.getenv("PATH") or "/usr/bin:/bin")
 end
 
 local PR_FETCH_MS = 20000
+local MAX_LOGIN_WAITERS = 32
 
 -- Runs PR workflow `id` on one pull request (`owner/name#12`, its URL, or a bare number when the
 -- workflow names one repository) the way a PR event would: the same event fields and payload
@@ -971,12 +1006,23 @@ function M.dispatch_pr(
 		cb(`{wf.name} 不只一个仓库:写 owner/name#{number} 或 PR 链接`)
 		return
 	end
-	local path = local_path(c)
+	if c.login.pending then
+		-- gh may only be on the login shell's PATH: go on once the first capture ends.
+		if #c.login_waiters >= MAX_LOGIN_WAITERS then
+			cb("正在读取登录 shell 的环境变量,稍后再试")
+			return
+		end
+		table.insert(c.login_waiters, function()
+			M.dispatch_pr(c, id, inputs, pr, cb, wanted)
+		end)
+		return
+	end
+	local env = local_env(c)
 	local name = `{repo}#{number}`
 	local ok, err = pcall(function(): string?
 		tern.process.run(
 			{ "/bin/sh", "-c", 'exec gh api "repos/$1/pulls/$2"', "roost", repo :: string, tostring(number) },
-			{ env = { PATH = path }, timeout_ms = PR_FETCH_MS },
+			{ env = env, timeout_ms = PR_FETCH_MS },
 			function(res: ProcessResult)
 				if res.timed_out then
 					cb(`读取 {name} 超时`)
@@ -1340,6 +1386,10 @@ function M.omp_models(c: Core): OmpModels
 	if cur and (cur.loading or (cur.at and now() - cur.at < OMP_TTL)) then
 		return cur
 	end
+	if c.login.pending then
+		-- omp may only be on the login shell's PATH; the capture's end re-renders.
+		return { roles = if cur then cur.roles else {}, models = if cur then cur.models else {}, loading = true }
+	end
 	local entry: OmpModels = {
 		roles = if cur then cur.roles else {},
 		models = if cur then cur.models else {},
@@ -1349,7 +1399,7 @@ function M.omp_models(c: Core): OmpModels
 	}
 	c.omp_models = entry
 	local omp = c.config.runner.omp
-	local path = local_path(c)
+	local env = local_env(c)
 	local pending = 2
 	local errors: { string } = {}
 	local function settle()
@@ -1372,7 +1422,7 @@ function M.omp_models(c: Core): OmpModels
 			table.insert(argv, a)
 		end
 		local ok, err = pcall(function(): string?
-			tern.process.run(argv, { env = { PATH = path }, timeout_ms = OMP_MS }, function(res: ProcessResult)
+			tern.process.run(argv, { env = env, timeout_ms = OMP_MS }, function(res: ProcessResult)
 				local out = res.stdout or ""
 				if res.timed_out then
 					table.insert(errors, `{what}超时`)

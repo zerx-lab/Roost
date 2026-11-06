@@ -17,6 +17,7 @@ local util = require("./util")
 local match = require("./match")
 local agent = require("./agent")
 local stats = require("./stats")
+local loginenv = require("./loginenv")
 
 local M = {}
 
@@ -158,7 +159,10 @@ export type AppToken = {
 export type Env = {
 	data: string,
 	home: string?,
-	path: string?, -- the daemon's PATH
+	path: string?, -- the daemon's PATH (used while no login environment is known)
+	-- The login-shell environment (lib/loginenv.luau). Shell steps inherit it; nothing advances
+	-- or starts while the first capture is pending.
+	login: () -> loginenv.State,
 	store: store.Store,
 	config: () -> model.Config,
 	workflows: () -> model.Workflows?,
@@ -671,25 +675,19 @@ local function template_ctx(r: Runner, run: Run, wf: Workflow, needs_payload: bo
 	}
 end
 
-local function step_env(r: Runner, run: Run, wf: Workflow): { [string]: string }
+-- GitHub tokens a login shell may export: they would act as you in a run acting as the App.
+local GITHUB_TOKENS = { "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN" }
+
+-- `app`: the step acts as the App, so the login shell's GitHub tokens are left out (tokens you set
+-- in `[runner] env` / workflow `env` stay).
+local function step_env(r: Runner, run: Run, wf: Workflow, app: boolean): { [string]: string }
 	local cfg = r.env.config().runner
-	local env: { [string]: string } = {}
-	for k, v in cfg.env do
-		env[k] = v
-	end
-	for k, v in wf.env do
-		env[k] = v
-	end
 	local paths = {}
 	for _, p in cfg.extra_path do
 		table.insert(paths, util.expand(p, r.env.home))
 	end
-	if r.env.path then
-		table.insert(paths, r.env.path)
-	end
-	if env.PATH == nil then
-		env.PATH = table.concat(paths, ":")
-	end
+	local drop = if app then GITHUB_TOKENS else nil
+	local env = loginenv.compose(r.env.login(), { cfg.env, wf.env }, paths, r.env.path, drop)
 	local e: { [string]: any } = run.event or {}
 	local function put(k: string, v: any)
 		env[k] = if v == nil then "" else tostring(v)
@@ -769,7 +767,9 @@ local function app_script(r: Runner, run: Run): string
 		table.insert(lines, `export {k}={util.shq(v[k])}`)
 	end
 	table.insert(lines, `export PATH={util.shq(bin_dir(r))}:"$PATH"`)
-	-- No token, no start: an inherited GH_TOKEN would otherwise act as someone else.
+	-- No token, no start: an inherited GH_TOKEN would otherwise act as someone else; the other
+	-- GitHub tokens of Tern's login environment go too.
+	table.insert(lines, "unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN")
 	table.insert(lines, 'GH_TOKEN=$(cat "$ROOST_GH_TOKEN_FILE") || exit 97')
 	table.insert(lines, "export GH_TOKEN")
 	return table.concat(lines, "\n") .. "\n"
@@ -1299,12 +1299,13 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	pcall(tern.fs.remove, `{d}/s{i}.pid`)
 	pcall(tern.fs.remove, `{d}/s{i}.pid.w`)
 	local log = `{d}/log.txt`
-	local env = step_env(r, run, wf)
+	local app = run.app ~= nil and s.kind ~= "prepare" and s.kind ~= "cleanup"
+	local env = step_env(r, run, wf, app)
 	if def then
 		env.ROOST_OUTPUT = `{d}/s{i}.out`
 		pcall(tern.fs.remove, env.ROOST_OUTPUT)
 	end
-	if run.app and s.kind ~= "prepare" and s.kind ~= "cleanup" then
+	if app then
 		with_app(r, run, env)
 	end
 	env.ROOST_BANNER = `\27[1;36m▶ {s.name}\27[0m`
@@ -1444,7 +1445,7 @@ local function probe(r: Runner, run: Run, i: number)
 end
 
 function check(r: Runner, run: Run)
-	if run.state ~= "running" or run.step < 1 then
+	if run.state ~= "running" or run.step < 1 or r.env.login().pending then
 		return
 	end
 	-- Without a valid workflows.toml, deadlines and signals still apply; only advancing to the
@@ -1530,7 +1531,7 @@ end
 
 -- Starts queued runs while capacity allows, oldest first, one per workflow.
 function M.pump(r: Runner)
-	if r.env.workflows() == nil then
+	if r.env.workflows() == nil or r.env.login().pending then
 		return
 	end
 	local max = r.env.config().runner.max_concurrent
