@@ -54,4 +54,22 @@ do -- paste drops newlines; meta+backspace clears to the start
 	eq(f.cursor, 4)
 end
 
+do -- multi-line prompts: Enter breaks the line, Up/Down keep a sticky column, Home/End per line
+	local f: field.Field = { text = "你好吗\n\nab", cursor = 2, lines = true }
+	eq(field.key(f, key("down")), true)
+	eq(f.cursor, 4, "empty middle line: column clamps to 0")
+	eq(field.key(f, key("down")), true)
+	eq(f.cursor, 7, "sticky column 2 restored on the last line")
+	eq(field.key(f, key("down")), false, "no line below")
+	eq(field.key(f, key("up")), true)
+	eq(field.key(f, key("up")), true)
+	eq(f.cursor, 2, "back to column 2 of the first line")
+	eq(field.key(f, key("end")), true)
+	eq(f.cursor, 3)
+	eq(field.key(f, key("enter")), true)
+	eq(f.text, "你好吗\n\n\nab")
+	eq(field.key(f, key("paste", "x\r\ny")), true)
+	eq(f.text, "你好吗\nx\ny\n\nab", "pasted CRLF becomes newlines")
+end
+
 print("ok")

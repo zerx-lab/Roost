@@ -1,15 +1,16 @@
-//! HTTP surface: the GitHub webhook endpoint and the bearer-token admin API the plugin uses.
+//! HTTP surface: the GitHub webhook endpoint, the GitHub App registration pages, and the
+//! bearer-token admin API the plugin uses.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ use tokio::sync::watch;
 
 use crate::config::{AgentConfig, Issue, RepoSub, Subscriptions};
 use crate::event::EventInfo;
-use crate::github::{self, SyncReport};
+use crate::github::{self, Failure, Github};
 use crate::store::{EventStore, MAX_PAGE, StoredEvent};
 
 const MAX_DELIVERIES: usize = 200;
@@ -60,17 +61,15 @@ pub struct AppState {
     pub cfg: Arc<AgentConfig>,
     pub subs: RwLock<Arc<Subscriptions>>,
     pub store: Arc<EventStore>,
+    pub gh: Arc<Github>,
     pub deliveries: Mutex<VecDeque<Delivery>>,
     pub delivery_total: Mutex<u64>,
     pub clients: Mutex<BTreeMap<String, ClientSeen>>,
-    pub hooks: Mutex<Option<SyncReport>>,
     pub boot_id: String,
     pub started_at: DateTime<Utc>,
     pub shutdown: watch::Sender<Option<Shutdown>>,
     /// Serializes writers of `subscriptions.toml`.
     pub subs_write: tokio::sync::Mutex<()>,
-    /// Serializes GitHub hook syncs.
-    pub hook_lock: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -104,32 +103,7 @@ impl AppState {
             .await
             .map_err(|e| vec![Issue::new("reload", e.to_string())])??;
         self.set_subs(subs);
-        let s = self.subs();
-        self.spawn_hook_sync();
-        Ok(s)
-    }
-
-    /// Runs hook sync in the background when `auto_sync_hooks` is on.
-    fn spawn_hook_sync(self: &Arc<Self>) {
-        if !self.cfg.auto_sync_hooks {
-            return;
-        }
-        let me = self.clone();
-        tokio::spawn(async move {
-            me.sync_hooks_now(false).await;
-        });
-    }
-
-    /// One hook sync at a time, against the subscriptions current when it starts: two
-    /// overlapping syncs would both miss the hook and create duplicates.
-    pub async fn sync_hooks_now(&self, dry_run: bool) -> SyncReport {
-        let _one = self.hook_lock.lock().await;
-        let subs = self.subs();
-        let report = github::sync_hooks(&self.cfg, &subs, dry_run).await;
-        if !dry_run {
-            *lock(&self.hooks) = Some(report.clone());
-        }
-        report
+        Ok(self.subs())
     }
 }
 
@@ -141,13 +115,20 @@ fn issues(status: StatusCode, list: Vec<Issue>) -> Response {
     (status, Json(json!({ "error": "invalid", "issues": list }))).into_response()
 }
 
+fn failure(f: Failure) -> Response {
+    let code = StatusCode::from_u16(f.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    err(code, f.message)
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
         .route("/status", get(status))
         .route("/subscriptions", get(get_subs).put(put_subs))
         .route("/reload", post(reload))
         .route("/restart", post(restart))
-        .route("/github/sync", post(hook_sync))
+        .route("/github/app", delete(app_forget))
+        .route("/github/app/manifest", post(app_manifest))
+        .route("/github/{what}", get(gh_list))
         .route("/events", get(events))
         .route("/events/test", post(test_event))
         .route("/deliveries", get(deliveries))
@@ -158,6 +139,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/hooks/github",
             post(webhook).layer(DefaultBodyLimit::max(state.cfg.max_body_bytes)),
         )
+        .route("/github/app/new", get(app_page))
+        .route("/github/app/callback", get(app_callback))
+        .route("/github/app/installed", get(app_installed))
         .route("/healthz", get(healthz))
         .nest("/api/v1", admin)
         .with_state(state)
@@ -211,19 +195,15 @@ async fn webhook(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Byte
         reason: None,
         seq: None,
     };
-    let Some(secret) = &st.cfg.webhook_secret else {
-        d.reason = Some("github.webhook_secret is not configured".into());
+    let Some(secret) = st.gh.webhook_secret() else {
+        d.reason = Some("no GitHub App yet".into());
         st.record(d);
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "webhook secret not configured on the agent",
+            "GitHub App not created on this agent yet",
         );
     };
-    if !github::verify_signature(
-        secret.expose(),
-        &body,
-        header(&headers, "x-hub-signature-256"),
-    ) {
+    if !github::verify_signature(&secret, &body, header(&headers, "x-hub-signature-256")) {
         d.reason = Some("bad or missing X-Hub-Signature-256".into());
         st.record(d);
         return err(StatusCode::UNAUTHORIZED, "bad signature");
@@ -249,22 +229,20 @@ async fn webhook(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Byte
         st.record(d);
         return Json(json!({ "ok": true, "pong": true })).into_response();
     }
+    if event == "installation" || event == "installation_repositories" {
+        // Repos were added to or removed from the App: look installations up again.
+        st.gh.forget_installs();
+    }
 
     let subs = st.subs();
     let ignore = |d: &mut Delivery, why: String| {
         d.outcome = "ignored";
         d.reason = Some(why);
     };
-    match info.repo.as_deref().and_then(|r| subs.repo(r)) {
-        None => ignore(&mut d, "repo not subscribed".into()),
-        Some((_, sub)) if !sub.events.contains(&event) && !sub.events.contains("*") => {
-            ignore(
-                &mut d,
-                format!("event {event} not subscribed for this repo"),
-            );
-        }
-        Some(_) if st.cfg.ignore_bots && info.sender_is_bot => {
-            ignore(&mut d, "sender is a bot (github.ignore_bots)".into());
+    match info.repo.as_deref() {
+        None => ignore(&mut d, "not about a repository".into()),
+        Some(r) if !subs.wants(r, &event) => {
+            ignore(&mut d, format!("{event} not subscribed for {r}"));
         }
         Some(_) if st.store.has_delivery(&delivery) => {
             d.outcome = "duplicate";
@@ -313,9 +291,9 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<Value> {
     let (head, oldest, count, bytes) = st.store.stats();
     let last = lock(&st.deliveries).back().cloned();
     let clients: Vec<ClientSeen> = lock(&st.clients).values().cloned().collect();
-    let hooks = lock(&st.hooks).clone();
+    let app = st.gh.info().await;
     Json(json!({
-        "api": 1,
+        "api": 2,
         "version": env!("CARGO_PKG_VERSION"),
         "boot_id": st.boot_id,
         "started_at": st.started_at,
@@ -324,10 +302,8 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<Value> {
         "public_url": st.cfg.public_url,
         "webhook_url": st.cfg.webhook_url(),
         "github": {
-            "token": st.cfg.github_token.is_some(),
-            "webhook_secret": st.cfg.webhook_secret.is_some(),
-            "auto_sync_hooks": st.cfg.auto_sync_hooks,
-            "ignore_bots": st.cfg.ignore_bots,
+            "app": app,
+            "events": github::APP_EVENTS,
         },
         "subscriptions": {
             "revision": subs.revision,
@@ -343,7 +319,6 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<Value> {
         },
         "deliveries": { "total": *lock(&st.delivery_total), "last": last },
         "clients": clients,
-        "hooks": hooks,
     }))
 }
 
@@ -416,14 +391,7 @@ async fn put_subs(State(st): State<Arc<AppState>>, Json(body): Json<PutSubs>) ->
     }
     let revision = next.revision.clone();
     st.set_subs(next);
-    drop(_w);
-    st.spawn_hook_sync();
-    Json(json!({
-        "revision": revision,
-        "changed": true,
-        "hook_sync": if st.cfg.auto_sync_hooks { "started" } else { "off" },
-    }))
-    .into_response()
+    Json(json!({ "revision": revision, "changed": true })).into_response()
 }
 
 async fn reload(State(st): State<Arc<AppState>>) -> Response {
@@ -460,15 +428,100 @@ async fn restart(State(st): State<Arc<AppState>>, body: Option<Json<RestartBody>
         .into_response()
 }
 
+// ---------------------------------------------------------------------------------------------
+// GitHub App
+
 #[derive(Deserialize, Default)]
-struct SyncBody {
-    #[serde(default)]
-    dry_run: bool,
+struct ManifestBody {
+    org: Option<String>,
+    name: Option<String>,
 }
 
-async fn hook_sync(State(st): State<Arc<AppState>>, body: Option<Json<SyncBody>>) -> Json<Value> {
-    let dry = body.map(|b| b.0.dry_run).unwrap_or(false);
-    Json(json!(st.sync_hooks_now(dry).await))
+/// Starts registering the App: the page the user opens to post the manifest to GitHub.
+async fn app_manifest(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<ManifestBody>>,
+) -> Response {
+    let b = body.map(|b| b.0).unwrap_or_default();
+    match st.gh.begin(b.org, b.name) {
+        Ok(url) => Json(json!({ "url": url })).into_response(),
+        Err(f) => failure(f),
+    }
+}
+
+#[derive(Deserialize)]
+struct StateQuery {
+    state: Option<String>,
+    code: Option<String>,
+}
+
+fn html(status: StatusCode, title: &str, body: &str) -> Response {
+    (status, Html(github::page(title, body))).into_response()
+}
+
+async fn app_page(State(st): State<Arc<AppState>>, Query(q): Query<StateQuery>) -> Response {
+    match q.state.as_deref().and_then(|s| st.gh.manifest_page(s)) {
+        Some(page) => (StatusCode::OK, Html(page)).into_response(),
+        None => html(
+            StatusCode::NOT_FOUND,
+            "链接已失效",
+            "<p>这个创建链接不存在或已过期,请回到 Roost 的「中继」页重新创建 GitHub App。</p>",
+        ),
+    }
+}
+
+/// GitHub's redirect after the App was created: keep its credentials, then go install it.
+async fn app_callback(State(st): State<Arc<AppState>>, Query(q): Query<StateQuery>) -> Response {
+    let (Some(code), Some(state)) = (q.code, q.state) else {
+        return html(
+            StatusCode::BAD_REQUEST,
+            "创建失败",
+            "<p>GitHub 回调缺少 code 或 state。</p>",
+        );
+    };
+    match st.gh.finish(&code, &state).await {
+        Ok(install) => Redirect::to(&install).into_response(),
+        Err(f) => {
+            tracing::warn!("GitHub App registration failed: {}", f.message);
+            html(
+                StatusCode::from_u16(f.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                "创建失败",
+                "<p>没能完成 GitHub App 的创建,详情见 roost-agent 日志。回到 Roost 重新创建即可。</p>",
+            )
+        }
+    }
+}
+
+async fn app_installed() -> Response {
+    html(
+        StatusCode::OK,
+        "GitHub App 已安装",
+        "<p>安装完成。回到 Roost 即可在工作流的仓库筛选中选到这些仓库;以后要增减仓库,在 GitHub 的 App 安装设置里修改。</p>",
+    )
+}
+
+async fn app_forget(State(st): State<Arc<AppState>>) -> Response {
+    match st.gh.forget().await {
+        Ok(had) => Json(json!({ "ok": true, "deleted": had })).into_response(),
+        Err(f) => failure(f),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    repo: Option<String>,
+}
+
+/// Editor suggestions: `repos`, or per repo `people` / `labels` / `branches` / `workflows`.
+async fn gh_list(
+    State(st): State<Arc<AppState>>,
+    Path(what): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    match st.gh.list(&what, q.repo.as_deref()).await {
+        Ok(items) => Json(json!({ "items": items })).into_response(),
+        Err(f) => failure(f),
+    }
 }
 
 #[derive(Deserialize)]
@@ -594,9 +647,7 @@ struct TestBody {
 /// Puts a synthetic `roost_test` event in the store so a client can check the whole relay path.
 async fn test_event(State(st): State<Arc<AppState>>, body: Option<Json<TestBody>>) -> Response {
     let subs = st.subs();
-    let repo = body
-        .and_then(|b| b.0.repo)
-        .or_else(|| subs.repos.keys().next().cloned());
+    let repo = body.and_then(|b| b.0.repo).or_else(|| subs.first_repo());
     let info = EventInfo {
         event: "roost_test".into(),
         action: Some("ping".into()),
@@ -656,15 +707,32 @@ mod tests {
 
     const TOKEN: &str = "0123456789abcdef-token";
 
+    /// An agent with a GitHub App whose webhook secret is "hush"; `api` points the App's GitHub
+    /// calls at a fake server.
     fn state(dir: &std::path::Path) -> Arc<AppState> {
+        // Nothing listens on port 9: App calls fail at once instead of reaching GitHub.
+        state_with(dir, Some("http://127.0.0.1:9"), true)
+    }
+
+    fn state_with(dir: &std::path::Path, api: Option<&str>, with_app: bool) -> Arc<AppState> {
+        let api_line = api
+            .map(|a| format!("api_url=\"{a}\"\n"))
+            .unwrap_or_default();
         let cfg = AgentConfig::parse(
             &format!(
-                "[auth]\ntoken=\"{TOKEN}\"\n[github]\nwebhook_secret=\"hush\"\nauto_sync_hooks=false\n"
+                "[auth]\ntoken=\"{TOKEN}\"\n[server]\npublic_url=\"https://r.dev\"\n[github]\n{api_line}"
             ),
             &dir.join("agent.toml"),
             dir,
         )
         .unwrap();
+        if with_app {
+            let (pem, _) = github::tests::test_key();
+            let file = github::tests::test_file(&pem, "hush");
+            std::fs::create_dir_all(cfg.app_path.parent().unwrap()).unwrap();
+            std::fs::write(&cfg.app_path, serde_json::to_vec(&file).unwrap()).unwrap();
+        }
+        let gh = Arc::new(Github::new(&cfg).unwrap());
         let store = EventStore::open(
             cfg.data_dir.clone(),
             crate::store::Limits {
@@ -681,15 +749,14 @@ mod tests {
             cfg: Arc::new(cfg),
             subs: RwLock::new(Arc::new(Subscriptions::parse(subs_text).unwrap())),
             store: Arc::new(store),
+            gh,
             deliveries: Mutex::new(VecDeque::new()),
             delivery_total: Mutex::new(0),
             clients: Mutex::new(BTreeMap::new()),
-            hooks: Mutex::new(None),
             boot_id: "boot".into(),
             started_at: Utc::now(),
             shutdown: watch::channel(None).0,
             subs_write: tokio::sync::Mutex::new(()),
-            hook_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -747,10 +814,11 @@ mod tests {
         assert_eq!(v["outcome"], "ignored");
         let other = ISSUE.replace("acme/web", "acme/other");
         let (_, v) = call(&app, signed("issues", "d3", &other, "hush")).await;
-        assert_eq!(v["reason"], "repo not subscribed");
+        assert_eq!(v["reason"], "issues not subscribed for acme/other");
+        // Bots are relayed: whether they fire is each trigger's choice (ignore_bots).
         let bot = ISSUE.replace("\"User\"", "\"Bot\"");
         let (_, v) = call(&app, signed("issues", "d4", &bot, "hush")).await;
-        assert_eq!(v["outcome"], "ignored");
+        assert_eq!(v["outcome"], "relayed");
         let (_, v) = call(&app, signed("ping", "d5", "{}", "hush")).await;
         assert_eq!(v["pong"], true);
 
@@ -764,12 +832,18 @@ mod tests {
         assert_eq!(c, StatusCode::OK);
         assert_eq!(v["events"][0]["info"]["number"], 1);
         assert_eq!(v["events"][0]["payload"]["issue"]["title"], "x");
-        assert_eq!(v["head"], 1);
+        assert_eq!(v["head"], 2, "the issue and the bot's");
         let (_, v) = call(&app, admin("GET", "/api/v1/deliveries", None)).await;
         assert_eq!(v["total"], 7);
         let (_, v) = call(&app, admin("GET", "/api/v1/status", None)).await;
         assert_eq!(v["clients"][0]["id"], "mac-1");
-        assert_eq!(v["store"]["head"], 1);
+        assert_eq!(v["store"]["head"], 2);
+        assert_eq!(v["github"]["app"]["slug"], "roost-test");
+        assert_eq!(
+            v["github"]["app"]["installations"],
+            Value::Null,
+            "GitHub unreachable"
+        );
     }
 
     #[tokio::test]
@@ -858,5 +932,146 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(*rx.borrow(), Some(Shutdown::Restart));
+    }
+
+    /// A fake GitHub API: the manifest conversion and what the editor lists use.
+    async fn fake_github(pem: String) -> String {
+        use axum::extract::Path as P;
+        let pem = Arc::new(pem);
+        let gh = Router::new()
+            .route(
+                "/app-manifests/{code}/conversions",
+                post(move |P(code): P<String>| {
+                    let pem = pem.clone();
+                    async move {
+                        assert_eq!(code, "abc123");
+                        Json(json!({
+                            "id": 9, "slug": "roost-x", "name": "Roost x",
+                            "owner": { "login": "zero", "type": "User" },
+                            "html_url": "https://github.com/apps/roost-x",
+                            "webhook_secret": "fresh", "pem": *pem,
+                            "client_secret": "never-kept",
+                        }))
+                    }
+                }),
+            )
+            .route("/app/installations", get(|| async { Json(json!([{ "id": 7 }])) }))
+            .route(
+                "/app/installations/{id}/access_tokens",
+                post(|| async {
+                    Json(json!({ "token": "inst-tok", "expires_at": (Utc::now() + chrono::Duration::hours(1)).to_rfc3339() }))
+                }),
+            )
+            .route(
+                "/installation/repositories",
+                get(|h: HeaderMap| async move {
+                    assert_eq!(header(&h, "authorization"), Some("Bearer inst-tok"));
+                    Json(json!({ "repositories": [{ "full_name": "acme/web" }, { "full_name": "acme/api" }] }))
+                }),
+            )
+            .route("/repos/{o}/{r}/installation", get(|| async { Json(json!({ "id": 7 })) }))
+            .route(
+                "/repos/{o}/{r}/assignees",
+                get(|| async { Json(json!([{ "login": "alice" }, { "login": "Bob" }])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, gh).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn app_registration_lists_and_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, _) = github::tests::test_key();
+        let api = fake_github(pem).await;
+        let st = state_with(dir.path(), Some(&api), false);
+        let app = router(st.clone());
+
+        let (c, _) = call(&app, signed("issues", "d1", ISSUE, "hush")).await;
+        assert_eq!(
+            c,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no App: no webhook secret"
+        );
+        let (c, v) = call(&app, admin("GET", "/api/v1/github/repos", None)).await;
+        assert_eq!(c, StatusCode::CONFLICT, "{v}");
+
+        let (c, v) = call(
+            &app,
+            admin("POST", "/api/v1/github/app/manifest", Some(json!({}))),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let url = v["url"].as_str().unwrap();
+        let state = url.split("state=").nth(1).unwrap().to_string();
+        assert!(url.starts_with("https://r.dev/github/app/new?state="));
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/github/app/new?state={state}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+
+        let (c, _) = call(
+            &app,
+            Request::get("/github/app/callback?code=abc123&state=forged")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c, StatusCode::BAD_REQUEST, "unknown state refused");
+        let done = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/github/app/callback?code=abc123&state={state}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            done.headers()["location"],
+            "https://github.com/apps/roost-x/installations/new"
+        );
+        let kept = std::fs::read_to_string(&st.cfg.app_path).unwrap();
+        assert!(!kept.contains("never-kept"), "client secret not stored");
+
+        let (c, _) = call(&app, signed("issues", "d2", ISSUE, "fresh")).await;
+        assert_eq!(
+            c,
+            StatusCode::ACCEPTED,
+            "webhooks verify with the App's secret"
+        );
+        let (_, v) = call(&app, admin("GET", "/api/v1/github/repos", None)).await;
+        assert_eq!(v["items"], json!(["acme/api", "acme/web"]));
+        let (_, v) = call(
+            &app,
+            admin("GET", "/api/v1/github/people?repo=acme/web", None),
+        )
+        .await;
+        assert_eq!(v["items"], json!(["alice", "Bob"]));
+        let (c, _) = call(&app, admin("GET", "/api/v1/github/people?repo=../x", None)).await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        let (_, v) = call(&app, admin("GET", "/api/v1/status", None)).await;
+        assert_eq!(v["github"]["app"]["owner"], "zero");
+        assert_eq!(v["github"]["app"]["installations"], 1);
+        let (c, _) = call(
+            &app,
+            admin("POST", "/api/v1/github/app/manifest", Some(json!({}))),
+        )
+        .await;
+        assert_eq!(c, StatusCode::CONFLICT, "one App at a time");
+
+        let (c, _) = call(&app, admin("DELETE", "/api/v1/github/app", None)).await;
+        assert_eq!(c, StatusCode::OK);
+        assert!(!st.cfg.app_path.exists());
+        let (c, _) = call(&app, signed("issues", "d3", ISSUE, "fresh")).await;
+        assert_eq!(c, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

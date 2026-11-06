@@ -243,7 +243,7 @@ local function resolve(r: Runner, run: Run): (Workflow?, boolean)
 		name = run.workflow_name,
 		enabled = false,
 		manual = false,
-		repos = {},
+		notify = false,
 		concurrency = "queue",
 		workspace = "temp",
 		env = {},

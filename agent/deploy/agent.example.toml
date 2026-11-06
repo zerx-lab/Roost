@@ -4,7 +4,8 @@
 
 [server]
 listen = "0.0.0.0:8787"
-# Public base URL GitHub can reach (behind a TLS proxy). The webhook URL is <public_url>/hooks/github.
+# Public base URL GitHub can reach (behind a TLS proxy). Required for the GitHub App: GitHub
+# redirects back to <public_url>/github/app/callback and delivers webhooks to <public_url>/hooks/github.
 public_url = "https://roost.example.com"
 # max_body_bytes = 26214400
 
@@ -13,15 +14,12 @@ public_url = "https://roost.example.com"
 token = "env:ROOST_TOKEN"
 
 [github]
-# The secret configured on the GitHub webhook; deliveries without a valid signature are refused.
-webhook_secret = "env:ROOST_WEBHOOK_SECRET"
-# Optional: lets the agent create/update webhooks itself (classic scope admin:repo_hook, or
-# fine-grained "Webhooks: read and write"). Without it, hooks are set up by hand.
-token = "env:GITHUB_TOKEN"
+# The agent runs as a GitHub App, created from the Roost relay page (「创建 GitHub App」): GitHub
+# shows the read-only App for confirmation, then you pick the repositories to install it on.
+# Its id, private key and webhook secret are kept in <data>/github-app.json (mode 600).
 # api_url = "https://api.github.com"     # GitHub Enterprise: https://HOST/api/v3
-# web_url = "https://github.com"
-# auto_sync_hooks = true                 # sync webhooks after every subscriptions change
-# ignore_bots = true                     # drop events sent by bot accounts (loop guard)
+# web_url = "https://github.com"         # GitHub Enterprise: https://HOST
+# app = "/var/lib/roost/github-app.json" # where the App credentials live
 
 [store]
 # keep_events = 2000

@@ -14,6 +14,12 @@
  *   [data-role='roost.relay']                relay page
  *   [data-role='roost.config']               config page
  *   [data-role='roost.form']                 manual-run form overlay
+ *   [data-role='roost.editor']               automation editor overlay
+ *   [data-role='roost.trigger']              one trigger card inside the editor
+ *   [data-role='roost.chips']                filter chips and their add field
+ *   [data-role='roost.templates']            template gallery card
+ *   [data-role='roost.summary']              validation summary above the editor footer
+ *   [data-role='roost.warn']                 a field or card warning
  *   [data-surface='plugin.roost.sessions']  the sessions sidebar; its list is [data-role='roost.sessions']
  *
  * Nodes also carry data-tone (accent, success, warning, error, pending, muted); `--tc` is the
@@ -43,4 +49,25 @@
 	[data-surface='plugin.roost.console'] [data-role='roost.log'] {
 		scroll-behavior: auto;
 	}
+}
+
+[data-surface='plugin.roost.console'] [data-role='roost.editor'] {
+	max-width: 72ch;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.trigger'] {
+	border-radius: 6px;
+	background: var(--card);
+	padding: 6px 8px;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.chips'] {
+	gap: 4px;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.templates'] {
+	border-radius: 6px;
+	background: var(--raise);
+	padding: 6px 8px;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.summary'],
+[data-surface='plugin.roost.console'] [data-role='roost.warn'] {
+	color: var(--warn);
 }

@@ -15,6 +15,19 @@ pub struct EventInfo {
     pub default_branch: Option<String>,
     pub sender: Option<String>,
     pub sender_is_bot: bool,
+    /// Who wrote what the event is about: the comment or review, else the PR or issue; the
+    /// actor of a workflow run; the sender otherwise (a push's pusher).
+    pub author: Option<String>,
+    /// Logins assigned to the PR or issue.
+    pub assignees: Vec<String>,
+    /// The PR is a draft.
+    pub draft: bool,
+    /// The PR was merged (a `closed` action).
+    pub merged: bool,
+    /// The push deleted its branch.
+    pub deleted: bool,
+    /// A submitted review's state, lower-cased: approved, changes_requested, commented.
+    pub review_state: Option<String>,
     pub number: Option<u64>,
     pub title: Option<String>,
     pub body: Option<String>,
@@ -60,15 +73,19 @@ fn u(v: &Value, path: &[&str]) -> Option<u64> {
     cur.as_u64()
 }
 
-fn labels(v: Option<&Value>) -> Vec<String> {
-    v.and_then(|l| l.get("labels"))
+fn names(v: Option<&Value>, list: &str, field: &str) -> Vec<String> {
+    v.and_then(|l| l.get(list))
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+                .filter_map(|l| l.get(field).and_then(Value::as_str).map(str::to_string))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn labels(v: Option<&Value>) -> Vec<String> {
+    names(v, "labels", "name")
 }
 
 impl EventInfo {
@@ -97,6 +114,10 @@ impl EventInfo {
             e.branch = s(pr, &["base", "ref"]);
             e.sha = s(pr, &["head", "sha"]);
             e.labels = labels(Some(pr));
+            e.assignees = names(Some(pr), "assignees", "login");
+            e.author = s(pr, &["user", "login"]);
+            e.draft = pr.get("draft").and_then(Value::as_bool).unwrap_or(false);
+            e.merged = pr.get("merged").and_then(Value::as_bool).unwrap_or(false);
             e.association = s(pr, &["author_association"]);
             e.fetch_ref = e.number.map(|n| format!("refs/pull/{n}/head"));
         } else if let Some(issue) = issue {
@@ -106,6 +127,8 @@ impl EventInfo {
             e.body = s(issue, &["body"]);
             e.url = s(issue, &["html_url"]);
             e.labels = labels(Some(issue));
+            e.assignees = names(Some(issue), "assignees", "login");
+            e.author = s(issue, &["user", "login"]);
             e.association = s(issue, &["author_association"]);
             if e.is_pr {
                 e.fetch_ref = e.number.map(|n| format!("refs/pull/{n}/head"));
@@ -115,11 +138,14 @@ impl EventInfo {
             e.comment = s(r, &["body"]);
             e.association = s(r, &["author_association"]).or(e.association);
             e.url = s(r, &["html_url"]).or(e.url);
+            e.author = s(r, &["user", "login"]).or(e.author);
+            e.review_state = s(r, &["state"]).map(|x| x.to_ascii_lowercase());
         }
         if let Some(c) = comment {
             e.comment = s(c, &["body"]);
             e.association = s(c, &["author_association"]).or(e.association);
             e.url = s(c, &["html_url"]).or(e.url);
+            e.author = s(c, &["user", "login"]).or(e.author);
         }
 
         match event {
@@ -129,9 +155,9 @@ impl EventInfo {
                     .as_deref()
                     .and_then(|r| r.strip_prefix("refs/heads/"))
                     .map(str::to_string);
-                let deleted = p.get("deleted").and_then(Value::as_bool).unwrap_or(false);
+                e.deleted = p.get("deleted").and_then(Value::as_bool).unwrap_or(false);
                 e.sha = s(p, &["after"]);
-                if !deleted {
+                if !e.deleted {
                     e.fetch_ref = e.sha.clone();
                 }
                 e.title = s(p, &["head_commit", "message"])
@@ -148,6 +174,7 @@ impl EventInfo {
                 e.url = s(p, &[key, "html_url"]);
                 e.title = e.workflow_name.clone();
                 e.fetch_ref = e.sha.clone();
+                e.author = e.author.or_else(|| s(p, &[key, "actor", "login"]));
                 if let Some(n) = p
                     .get(key)
                     .and_then(|w| w.get("pull_requests"))
@@ -182,6 +209,9 @@ impl EventInfo {
         }
         if e.fetch_ref.is_none() {
             e.fetch_ref = e.default_branch.clone();
+        }
+        if e.author.is_none() {
+            e.author = e.sender.clone();
         }
         let head_repo = match event {
             "workflow_run" => s(p, &["workflow_run", "head_repository", "full_name"]),
@@ -307,5 +337,44 @@ mod tests {
         assert_eq!(e.sha.as_deref(), Some("h"));
         assert_eq!(e.fetch_ref.as_deref(), Some("refs/pull/3/head"));
         assert!(e.body.unwrap().len() <= MAX_TEXT + '…'.len_utf8());
+    }
+
+    #[test]
+    fn authors_assignees_and_pr_state() {
+        let review = json!({"action": "submitted", "repository": {"full_name": "a/b"},
+            "sender": {"login": "rev", "type": "User"},
+            "review": {"state": "APPROVED", "user": {"login": "rev"}, "author_association": "MEMBER"},
+            "pull_request": {"number": 1, "draft": true, "merged": false, "user": {"login": "pr-author"},
+                "assignees": [{"login": "x"}, {"login": "y"}]}});
+        let e = EventInfo::from_github("pull_request_review", &review);
+        assert_eq!(
+            e.author.as_deref(),
+            Some("rev"),
+            "the review's author, not the PR's"
+        );
+        assert_eq!(e.review_state.as_deref(), Some("approved"));
+        assert_eq!(e.assignees, vec!["x".to_string(), "y".to_string()]);
+        assert!(e.draft && !e.merged);
+        let merged = json!({"action": "closed", "sender": {"login": "m"},
+            "pull_request": {"number": 2, "merged": true, "user": {"login": "pr-author"}}});
+        let e = EventInfo::from_github("pull_request", &merged);
+        assert!(e.merged);
+        assert_eq!(e.author.as_deref(), Some("pr-author"));
+        let push = json!({"ref": "refs/heads/x", "deleted": true, "sender": {"login": "pusher"}});
+        let e = EventInfo::from_github("push", &push);
+        assert!(e.deleted);
+        assert_eq!(
+            e.author.as_deref(),
+            Some("pusher"),
+            "push falls back to the sender"
+        );
+        let run = json!({"action": "completed", "sender": {"login": "s"},
+            "workflow_run": {"name": "CI", "actor": {"login": "actor"}}});
+        assert_eq!(
+            EventInfo::from_github("workflow_run", &run)
+                .author
+                .as_deref(),
+            Some("actor")
+        );
     }
 }

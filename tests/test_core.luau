@@ -181,6 +181,7 @@ local WF_CRON = [==[
 id = "tick"
 workspace = "temp"
 [[workflow.trigger]]
+schedule = "cron"
 cron = "*/5 * * * *"
 tz = "UTC"
 [[workflow.step]]
@@ -307,10 +308,10 @@ branch = "main"
 
 [[workflow]]
 id = "fix"
-repos = ["acme/web"]
 concurrency = "replace"
 [[workflow.trigger]]
-github = "issue_comment"
+github = "comment"
+repos = ["acme/web"]
 comment = "/roost"
 [[workflow.step]]
 name = "work"
@@ -680,7 +681,8 @@ do -- an edit during a push is pushed right after it; offline pushes retry on re
 	s.core.start(s.c)
 	step(s, 1)
 	eq(#puts, 1, "first push in flight")
-	s.env.files[DATA .. "/workflows.toml"] = string.gsub(WF_TREE, 'github = "issue_comment"', 'github = "issues"')
+	local edited = string.gsub(string.gsub(WF_TREE, 'github = "comment"', 'github = "issue_opened"'), '\ncomment = "/roost"', "")
+	s.env.files[DATA .. "/workflows.toml"] = edited
 	step(s, 4)
 	eq(#puts, 1, "second push waits for the first")
 	local d = table.remove(s.env.deferred, 1)
@@ -846,6 +848,115 @@ do -- an omp step that was running headless before the upgrade keeps the process
 	s2.env.files[`{dir}/s1.exit`] = "143\n" -- the old wrapper records its child's death
 	step(s2, 2)
 	eq(old.state, "cancelled")
+end
+
+local WF_ONCE = [==[
+[[workflow]]
+id = "once"
+workspace = "temp"
+[[workflow.trigger]]
+schedule = "once"
+at = "2026-11-05 12:03"
+tz = "UTC"
+[[workflow.step]]
+run = "echo once"
+]==]
+
+do -- a once schedule fires at its minute and never again
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_ONCE, [DATA .. "/roost.toml"] = "" })
+	s.core.start(s.c)
+	eq(s.c.crons[1].next, T0 + 180, "next fire is the set time")
+	step(s, 179)
+	eq(#s.c.store.runs, 0, "nothing before the minute")
+	step(s, 3)
+	eq(#s.c.store.runs, 1, "fired at 12:03")
+	step(s, 600)
+	eq(#s.c.store.runs, 1, "once means once")
+	eq(s.c.crons[1].next, nil, "a past once has no next fire")
+end
+
+do -- the editor's save path: validates, writes with a backup, reloads; delete removes the block
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TWO, [DATA .. "/roost.toml"] = "" })
+	s.core.start(s.c)
+	local raw = s.core.workflow_raw(s.c, "w") :: { [string]: any }
+	raw.name = "改名"
+	raw.trigger = { { github = "pr_opened" } }
+	local issues = s.core.check_workflow(s.c, "w", raw)
+	eq(#issues, 1, "only this workflow's problem")
+	truthy(string.find(issues[1].message, "至少添加一个筛选器", 1, true), issues[1].message)
+	eq(#(s.core.save_workflow(s.c, "w", raw) or {}), 1, "invalid edit refused")
+	eq(s.env.files[DATA .. "/workflows.toml"], WF_TWO, "file untouched")
+	raw.trigger[1].repos = { "acme/web" }
+	eq(s.core.save_workflow(s.c, "w", raw), nil, "valid edit saved")
+	eq(s.env.files[DATA .. "/workflows.toml.bak"], WF_TWO, "previous file kept")
+	eq((s.c.workflows :: any).by_id.w.name, "改名", "reloaded at once")
+	eq((s.c.workflows :: any).by_id.w.timeout, 10, "keys the edit didn't touch survive")
+	eq(s.core.save_workflow(s.c, nil, { name = "Nightly Build", step = { { run = "true" } } }), nil)
+	truthy((s.c.workflows :: any).by_id["nightly-build"], "new workflow id from its name")
+	eq(s.core.delete_workflow(s.c, "w"), nil)
+	eq((s.c.workflows :: any).by_id.w, nil, "deleted")
+	eq(#(s.c.workflows :: any).list, 1)
+
+	-- An unreadable file is never treated as empty: saving would drop every other workflow.
+	local huge = (s.env.files[DATA .. "/workflows.toml"] :: string) .. "\n#" .. string.rep("x", 1024 * 1024)
+	s.env.files[DATA .. "/workflows.toml"] = huge
+	local refused = s.core.save_workflow(s.c, nil, { name = "x", step = { { run = "true" } } }) :: { any }
+	truthy(refused and string.find(refused[1].message, "无法读取", 1, true), "save refused")
+	eq(s.env.files[DATA .. "/workflows.toml"], huge, "file untouched")
+	truthy(s.core.delete_workflow(s.c, "nightly-build"), "delete refused too")
+end
+
+do -- runtime checks: a past once time; @me without a known login once the relay status is in
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TWO, [DATA .. "/roost.toml"] = ROOST })
+	s.http = function(_method, path)
+		if path == "/api/v1/status" then
+			return 200, { boot_id = "b", github = { app = { slug = "r", owner = "acme", owner_type = "Organization" } } }
+		end
+		return 200, { store_id = "S", head = 0, events = {} }
+	end
+	s.core.start(s.c)
+	step(s, 1)
+	local raw: { [string]: any } = { name = "x", step = { { run = "true" } }, trigger = {
+		{ schedule = "once", at = "2020-01-01 09:00" } :: any,
+		{ github = "comment", authors = { "@me" } },
+	} }
+	local msgs: { string } = {}
+	for _, i in s.core.check_workflow(s.c, nil, raw) do
+		table.insert(msgs, i.message)
+	end
+	local all = table.concat(msgs, "\n")
+	truthy(string.find(all, "已经过去", 1, true), all)
+	truthy(string.find(all, "[github] login", 1, true), "org App: @me unknown\n" .. all)
+end
+
+do -- any repo can trigger (undeclared ones run in a temp dir); @me is roost.toml's [github] login
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "mine"',
+		"[[workflow.trigger]]",
+		'github = "comment"',
+		'repos = ["other/*"]',
+		'authors = ["@me"]',
+		"[[workflow.step]]",
+		'run = "true"',
+	}, "\n")
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = '[github]\nlogin = "zero"\n' })
+	s.core.start(s.c)
+	local function event(seq: number, sender: string): any
+		local info = { event = "issue_comment", action = "created", repo = "other/x", sender = sender, author = sender, association = "OWNER" }
+		return { seq = seq, delivery = `d{seq}`, info = info }
+	end
+	s.core.on_events(s.c, { event(1, "Zero"), event(2, "someone") })
+	eq(#s.c.events[2].runs, 1, "my own comment fires because I named myself")
+	truthy(string.find(s.c.events[1].reasons.mine or "", "作者", 1, true), "others filtered by author")
+	step(s, 2)
+	local run = s.c.store.by_id[s.c.events[2].runs[1]]
+	eq(run.repo, "other/x")
+	eq(run.workspace, "temp", "no local checkout: temporary directory")
+	step(s, 2)
+	local done = s.env.kv.status.done
+	eq(done[1].id, run.id, "finished run published for the notification toast")
+	eq(done[1].state, "success")
 end
 
 print("ok")

@@ -143,6 +143,14 @@ fn check(path: &std::path::Path) -> ExitCode {
                     .unwrap_or_else(|| "(server.public_url not set)".into())
             );
             println!(
+                "github app: {}",
+                if cfg.app_path.exists() {
+                    format!("credentials at {}", cfg.app_path.display())
+                } else {
+                    "not created yet (create it from the Roost relay page)".into()
+                }
+            );
+            println!(
                 "subscriptions ok: {} repos, revision {}",
                 s.repos.len(),
                 s.revision
@@ -214,21 +222,24 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
         .get(..6)
         .unwrap_or_default(),
     );
+    let gh = github::Github::new(&cfg).map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::FAILURE
+    })?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(None);
     let listen = cfg.listen;
     let state = Arc::new(AppState {
         cfg: Arc::new(cfg),
         subs: RwLock::new(Arc::new(subs)),
         store: Arc::new(store),
+        gh: Arc::new(gh),
         deliveries: Mutex::new(VecDeque::new()),
         delivery_total: Mutex::new(0),
         clients: Mutex::new(BTreeMap::new()),
-        hooks: Mutex::new(None),
         boot_id: boot_id.clone(),
         started_at,
         shutdown: shutdown_tx.clone(),
         subs_write: tokio::sync::Mutex::new(()),
-        hook_lock: tokio::sync::Mutex::new(()),
     });
 
     let listener = tokio::net::TcpListener::bind(listen).await.map_err(|e| {
@@ -237,16 +248,13 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
     })?;
     tracing::info!(%listen, boot_id = %boot_id, "roost-agent {} ready", env!("CARGO_PKG_VERSION"));
     if let Some(u) = state.cfg.webhook_url() {
-        tracing::info!("GitHub webhook payload URL: {u}");
+        tracing::info!("GitHub App webhook URL: {u}");
+    }
+    if !state.gh.configured() {
+        tracing::info!("no GitHub App yet: create it from the Roost relay page");
     }
 
     spawn_signals(state.clone(), shutdown_tx.clone());
-    if state.cfg.auto_sync_hooks && !state.subs().repos.is_empty() {
-        let st = state.clone();
-        tokio::spawn(async move {
-            st.sync_hooks_now(false).await;
-        });
-    }
 
     let app = api::router(state.clone());
     let mut wait_rx = shutdown_rx.clone();

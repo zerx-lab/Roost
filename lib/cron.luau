@@ -616,6 +616,16 @@ function M.matches(c: Cron, epoch: number, utc: boolean): boolean
 	return day_matches(c, t.day, t.dow)
 end
 
+-- Epoch of a civil minute (local time unless `utc`), or nil when that local time doesn't exist
+-- (a DST gap). A repeated local hour resolves to its first occurrence.
+function M.epoch(y: number, m: number, d: number, h: number, minute: number, utc: boolean): number?
+	local e = utc_epoch(y, m, d, h, minute)
+	if utc then
+		return e
+	end
+	return local_resolve(y, m, d, h, minute, e - 2 * 86400)
+end
+
 function M.next(c: Cron, after: number, utc: boolean): number?
 	local epoch = first_candidate(after)
 	if epoch == nil then

@@ -18,6 +18,8 @@ local WATCH_MS = 3000
 local MAX_FILE = 1024 * 1024
 local MAX_EVENTS = 100
 local MAX_NOTICES = 30
+-- How long a finished run stays in the published status for the window's notification toast.
+local NOTIFY_WINDOW = 600
 
 export type Notice = { at: number, level: string, text: string }
 export type EventRow = {
@@ -40,6 +42,18 @@ export type CronRow = {
 	repo: string?,
 	enabled: boolean,
 	next: number?,
+}
+-- Editor suggestions fetched through the relay (core.gh).
+export type GhList = { items: { string }, loading: boolean, error: string?, at: number? }
+export type AppInfo = {
+	configured: boolean,
+	name: string?,
+	slug: string?,
+	owner: string?,
+	owner_type: string?,
+	html_url: string?,
+	install_url: string?,
+	installations: number?,
 }
 
 export type Core = {
@@ -65,6 +79,8 @@ export type Core = {
 	notify_timer: any?,
 	status_json: string?,
 	started: boolean,
+	gh_cache: { [string]: GhList },
+	gh_order: { string },
 }
 
 local DEFAULT_CONFIG = [[
@@ -94,35 +110,34 @@ local DEFAULT_CONFIG = [[
 ]]
 
 local DEFAULT_WORKFLOWS = [==[
-# Roost 工作流。保存后自动生效;GitHub 事件订阅会自动同步到中继。
+# Roost 自动化。推荐在 Roost 面板的「工作流」页用表单新建和编辑;手改保存后同样自动生效,
+# GitHub 事件订阅会自动同步到中继(GitHub App)。
 #
-# [repos."owner/name"]          # GitHub 仓库 → 本机检出
-# path = "~/code/name"          # 本机路径;事件运行默认在临时 git worktree 中进行
-# branch = "main"               # cron / 手动运行时检出的分支
+# [repos."owner/name"]          # 可选:GitHub 仓库 → 本机检出;没有声明的仓库在临时目录中运行
+# path = "~/code/name"
+# branch = "main"               # 定时 / 手动运行时检出的分支
 # worktree = true               # false:直接在 path 中运行
-# hook = true                   # false:中继不自动管理该仓库的 webhook
 #
 # [[workflow]]
-# id = "triage"                 # a-z 0-9 _ -
-# name = "Issue 分诊"
-# repos = ["owner/name"]        # 留空 = 所有 [repos]
-# concurrency = "queue"         # queue | skip | replace
-# workspace = "auto"            # auto | worktree | repo | temp
-# timeout = "20m"
+# id = "pr-review"              # a-z 0-9 _ -
+# name = "PR 审查"
+# notify = true                 # 运行结束时弹出通知
 #
-# [[workflow.trigger]]          # 被动:GitHub 事件(经中继)
-# github = "issues"
-# actions = ["opened", "labeled"]
-# labels = ["roost"]
+# [[workflow.trigger]]          # GitHub:pr_opened pr_draft pr_pushed pr_merged comment push label
+# github = "pr_opened"          #   check_completed issue_comment review_comment review review_thread
+# repos = ["owner/name"]        #   workflow_run issue_opened event;至少一个筛选器
+# authors = ["@me"]
 #
-# [[workflow.trigger]]          # 主动:定时(本机时区,或 tz = "UTC")
-# cron = "0 9 * * 1-5"
+# [[workflow.trigger]]          # 定时:once hourly daily weekly monthly yearly cron(本机时区,或 tz = "UTC")
+# schedule = "weekly"
+# days = ["mon", "fri"]
+# time = "09:00"
 #
-# [[workflow.step]]                # omp 步骤:提示词可用 {{...}} 模板;不会收到 env / ROOST_* 环境变量
-# omp = "分析 issue #{{number}}:{{title}}\n\n{{body}}"
+# [[workflow.step]]             # omp 步骤:提示词可用 {{...}} 模板;不会收到 env / ROOST_* 环境变量
+# omp = "审查 PR #{{number}}:{{title}}\n\n{{url}}"
 #
 # [[workflow.step]]
-# run = "gh issue comment $ROOST_NUMBER --body-file reply.md"
+# run = "gh pr comment $ROOST_NUMBER --body-file review.md"
 
 [[workflow]]
 id = "hello"
@@ -131,7 +146,9 @@ enabled = false
 workspace = "temp"
 
 [[workflow.trigger]]
-cron = "0 9 * * 1-5"
+schedule = "weekly"
+days = ["mon", "tue", "wed", "thu", "fri"]
+time = "09:00"
 
 [[workflow.step]]
 name = "问候"
@@ -177,7 +194,25 @@ local function publish_status(c: Core)
 			next_cron = row.next
 		end
 	end
-	local s = { running = running, queued = queued, relay = relay_state, failed = failed, next_cron = next_cron }
+	-- Finished runs of workflows with notify on, for the window's toasts (recent ones only).
+	local done: { { [string]: any } } = {}
+	local w = c.workflows
+	-- Newest first (runs append), so a burst of more than ten still announces the latest.
+	for i = #c.store.runs, 1, -1 do
+		local r = c.store.runs[i]
+		local wf = if w then w.by_id[r.workflow] else nil
+		if r.finished_at and now() - r.finished_at < NOTIFY_WINDOW and wf and wf.notify and #done < 10 then
+			table.insert(done, { id = r.id, name = r.workflow_name, title = r.title, state = r.state })
+		end
+	end
+	local s = {
+		running = running,
+		queued = queued,
+		relay = relay_state,
+		failed = failed,
+		next_cron = next_cron,
+		done = tern.json.array(done),
+	}
 	local enc = tern.json.encode(s)
 	if enc ~= c.status_json then
 		c.status_json = enc
@@ -223,16 +258,24 @@ local function refresh_crons(c: Core)
 			for i, tr in wf.triggers do
 				if tr.kind == "cron" then
 					local ct = tr :: model.CronTrigger
+					local nxt: number? = nil
+					if wf.enabled then
+						if ct.schedule == "once" then
+							nxt = if ct.at and ct.at > t then ct.at else nil
+						elseif ct.cron then
+							nxt = cron.next(ct.cron, t, ct.utc)
+						end
+					end
 					table.insert(rows, {
 						key = `{wf.id}#{i}`,
 						workflow = wf.id,
 						name = wf.name,
-						expr = ct.expr,
-						desc = cron.describe(ct.cron),
+						expr = if ct.schedule == "once" then ct.at_text or "" else ct.expr,
+						desc = model.describe_trigger(ct),
 						utc = ct.utc,
 						repo = ct.repo,
 						enabled = wf.enabled,
-						next = if wf.enabled then cron.next(ct.cron, t, ct.utc) else nil,
+						next = nxt,
 					})
 				end
 			end
@@ -317,9 +360,11 @@ local function defaults(wf: model.Workflow): { [string]: string }
 	return out
 end
 
--- Relayed events: match every enabled workflow serving the repo; a workflow fires once per event.
+-- Relayed events: match every enabled workflow's GitHub triggers; a workflow fires once per event.
+-- Repos declared in [repos] run in their checkout; any other repo runs in a temporary directory.
 function M.on_events(c: Core, list: { { [string]: any } })
 	local w = c.workflows
+	local ctx: match.Ctx = { me = M.me(c) }
 	for _, e in list do
 		local info: { [string]: any } = if type(e.info) == "table" then e.info else {}
 		local delivery = tostring(e.delivery or e.seq)
@@ -340,19 +385,16 @@ function M.on_events(c: Core, list: { { [string]: any } })
 			c.relay.state.last_test = now()
 			M.notice(c, "success", "中继测试事件已送达本机")
 		elseif w and info.repo then
-			local key = util.ifind(w.repos, info.repo)
+			local key = util.ifind(w.repos, info.repo) or info.repo
 			for _, wf in w.list do
-				if not key then
-					break
-				end
-				if not wf.enabled or not model.serves(wf, key :: string) then
+				if not wf.enabled then
 					continue
 				end
 				local why: string? = nil
 				local fired = false
 				for _, tr in wf.triggers do
 					if tr.kind == "github" then
-						local miss = match.mismatch(tr :: any, info)
+						local miss = match.mismatch(tr :: model.GithubTrigger, info, ctx)
 						if miss == nil then
 							fired = true
 							break
@@ -379,9 +421,6 @@ function M.on_events(c: Core, list: { { [string]: any } })
 					row.reasons[wf.id] = why
 				end
 			end
-			if not key then
-				row.reasons["*"] = "仓库未在 workflows.toml 的 [repos] 中声明"
-			end
 		end
 		table.insert(c.events, 1, row)
 		while #c.events > MAX_EVENTS do
@@ -390,6 +429,9 @@ function M.on_events(c: Core, list: { { [string]: any } })
 	end
 	M.changed(c)
 end
+
+-- How late a missed `once` schedule still fires (the machine was asleep at that minute).
+local ONCE_GRACE = 3600
 
 local function cron_tick(c: Core)
 	local t = now()
@@ -404,24 +446,35 @@ local function cron_tick(c: Core)
 		local keep: { [string]: number } = {}
 		for _, wf in w.list do
 			for i, tr in wf.triggers do
-				if tr.kind == "cron" then
-					local ct = tr :: model.CronTrigger
-					local key = `{wf.id}#{i}`
-					keep[key] = last[key]
-					if wf.enabled and last[key] ~= minute and cron.matches(ct.cron, minute, ct.utc) then
-						keep[key] = minute
-						fired_any = true
-						local repo = ct.repo
-						local ref = ct.ref or (if repo and w.repos[repo] then w.repos[repo].branch else nil)
-						local run, err = runner.submit(c.runner, wf, {
-							trigger = { kind = "cron", detail = ct.expr },
-							repo = repo,
-							ref = ref,
-							inputs = defaults(wf),
-						})
-						if not run then
-							M.notice(c, "error", `{wf.name} 定时运行未排队:{err}`)
-						end
+				if tr.kind ~= "cron" then
+					continue
+				end
+				local ct = tr :: model.CronTrigger
+				local key: string
+				local due: boolean
+				if ct.schedule == "once" then
+					-- Keyed by its time, so a once trigger fires once however the list is reordered.
+					key = `{wf.id}#once:{ct.at_text or ""}`
+					local at = ct.at
+					due = at ~= nil and last[key] == nil and at <= minute and minute - at < ONCE_GRACE
+				else
+					key = `{wf.id}#{i}`
+					due = last[key] ~= minute and ct.cron ~= nil and cron.matches(ct.cron :: cron.Cron, minute, ct.utc)
+				end
+				keep[key] = last[key]
+				if wf.enabled and due then
+					keep[key] = minute
+					fired_any = true
+					local repo = ct.repo
+					local ref = ct.ref or (if repo and w.repos[repo] then w.repos[repo].branch else nil)
+					local run, err = runner.submit(c.runner, wf, {
+						trigger = { kind = "cron", detail = model.describe_trigger(ct) },
+						repo = repo,
+						ref = ref,
+						inputs = defaults(wf),
+					})
+					if not run then
+						M.notice(c, "error", `{wf.name} 定时运行未排队:{err}`)
 					end
 				end
 			end
@@ -477,6 +530,8 @@ function M.new(data: string): Core
 		notify_timer = nil,
 		status_json = nil,
 		started = false,
+		gh_cache = {},
+		gh_order = {},
 	}
 	c.runner = runner.new({
 		data = data,
@@ -513,7 +568,9 @@ function M.new(data: string): Core
 		now = now,
 		client_id = client_id,
 		ready = function()
-			return c.workflows ~= nil
+			-- Events wait for the relay status too unless roost.toml names the login: matching
+			-- `@me` and ignore_self needs it (the App owner comes with the status).
+			return c.workflows ~= nil and (c.config.github.login ~= nil or c.relay.state.agent ~= nil)
 		end,
 		subs = function()
 			local w = c.workflows
@@ -570,13 +627,9 @@ function M.dispatch(c: Core, id: string, inputs: { [string]: string }?, repo: st
 		end
 	end
 	if repo == nil then
-		if #wf.repos == 1 then
-			repo = wf.repos[1]
-		elseif #wf.repos == 0 then
-			local names = util.keys(w.repos)
-			if #names == 1 then
-				repo = names[1]
-			end
+		local names = util.keys(w.repos)
+		if #names == 1 then
+			repo = names[1]
 		end
 	end
 	if repo and not ref then
@@ -635,23 +688,277 @@ function M.remote_restart(c: Core)
 	relay.restart_remote(c.relay, report(c, "中继正在重启…"))
 end
 
-function M.hook_sync(c: Core)
-	relay.sync_hooks(c.relay, false, function(ok, msg, body)
-		if not ok then
-			M.notice(c, "error", msg)
-			return
+-- ---------------------------------------------------------------------------------------------
+-- The automation editor: workflows.toml written back one workflow at a time.
+
+local function file_issue(message: string): { model.Issue }
+	return { { file = "workflows.toml", path = "workflows", message = message } }
+end
+
+-- `raw` with an id: its own, else a fresh one from its name (unique among the other workflows).
+local function with_id(c: Core, old_id: string?, raw: { [string]: any }): { [string]: any }
+	if type(raw.id) == "string" and raw.id ~= "" then
+		return raw
+	end
+	local taken: { [string]: boolean } = {}
+	local list: { model.Workflow } = if c.workflows then c.workflows.list else {}
+	for _, wf in list do
+		if wf.id ~= old_id then
+			taken[wf.id] = true
 		end
-		local manual = 0
-		for _, r in (type(body) == "table" and body.repos) or {} do
-			if r.status == "manual" or r.status == "error" then
-				manual += 1
+	end
+	local out = table.clone(raw)
+	out.id = model.slug(if type(raw.name) == "string" then raw.name else "", taken)
+	return out
+end
+
+-- The current workflows.toml: "" only when there is no file yet; an unreadable file is an error,
+-- never an empty one (saving over it would drop every other workflow).
+local function current_text(c: Core): (string?, string?)
+	if not tern.fs.exists(c.paths.workflows) then
+		return "", nil
+	end
+	local text = read_file(c.paths.workflows)
+	if text == nil then
+		return nil, "无法读取 workflows.toml(文件过大或没有权限),没有做任何修改"
+	end
+	return text, nil
+end
+
+-- The whole new workflows.toml text with `raw` in place of `old_id` (appended when nil), and the
+-- text it was made from.
+local function compose(c: Core, old_id: string?, raw: { [string]: any }): (string?, string?, string?)
+	local old, err = current_text(c)
+	if old == nil then
+		return nil, err, nil
+	end
+	local text, serr = model.splice_workflow(old, old_id, model.encode_workflow(raw))
+	return text, serr, old
+end
+
+-- Problems the file alone can't show: a `once` time already past, and `@me` / ignore_self
+-- without a known GitHub login (once the relay status is known).
+local function runtime_issues(c: Core, wf: model.Workflow, out: { model.Issue })
+	local base = `workflow.{wf.id}`
+	local known = M.app(c) ~= nil
+	local me = M.me(c)
+	for i, tr in wf.triggers do
+		local path = `{base}.trigger[{i}]`
+		if tr.kind == "cron" then
+			local ct = tr :: model.CronTrigger
+			if ct.schedule == "once" and ct.at and ct.at <= now() then
+				table.insert(out, { file = "workflows.toml", path = `{path}.at`, message = "这个时间已经过去,不会再触发", line = ct.line })
+			end
+		elseif known and me == nil then
+			local gt = tr :: model.GithubTrigger
+			local uses_me = table.find(gt.authors, "@me") ~= nil or table.find(gt.assignees, "@me") ~= nil
+			if uses_me or gt.ignore_self then
+				table.insert(out, {
+					file = "workflows.toml",
+					path = if uses_me then `{path}.authors` else `{path}.ignore_self`,
+					message = if uses_me
+						then "不知道你的 GitHub 用户名(@me):在 roost.toml 设置 [github] login"
+						else "「忽略我自己的活动」需要你的 GitHub 用户名:在 roost.toml 设置 [github] login,或关闭此项",
+					line = gt.line,
+				})
 			end
 		end
-		if manual > 0 then
-			M.notice(c, "error", `{manual} 个仓库需要在 GitHub 上手动配置 webhook(见「中继」页)`)
-		else
-			M.notice(c, "success", "webhook 已同步")
+	end
+end
+
+-- Issues of `raw` as it would be saved: its own (path under workflow.<id>) and file-level ones.
+function M.check_workflow(c: Core, old_id: string?, raw: { [string]: any }): { model.Issue }
+	local full = with_id(c, old_id, raw)
+	local text, err = compose(c, old_id, full)
+	if text == nil then
+		return file_issue(err or "无法写回 workflows.toml")
+	end
+	local w, issues = model.parse_workflows(text)
+	local base = `workflow.{full.id}`
+	local out: { model.Issue } = {}
+	for _, i in issues do
+		local p = i.path
+		if p == "workflows.toml" or p == base or string.sub(p, 1, #base + 1) == base .. "." then
+			table.insert(out, i)
 		end
+	end
+	local wf = if w then w.by_id[full.id] else nil
+	if wf then
+		runtime_issues(c, wf, out)
+	end
+	return out
+end
+
+-- Writes `text` over workflows.toml after copying `old` (what it was made from) to .bak; a failed
+-- backup stops the write.
+local function write_workflows(c: Core, old: string, text: string): string?
+	if old ~= "" then
+		local ok, err = pcall(function(): string?
+			tern.fs.write(c.paths.workflows .. ".bak", old)
+			return nil
+		end)
+		if not ok then
+			return `无法备份 workflows.toml,没有写入:{err}`
+		end
+	end
+	local ok, err = pcall(function(): string?
+		tern.fs.write(c.paths.workflows, text)
+		return nil
+	end)
+	if not ok then
+		return `无法写入 workflows.toml:{err}`
+	end
+	M.reload_files(c)
+	return nil
+end
+
+-- Saves `raw` over workflow `old_id` (nil: a new one). Nil when written and reloaded, else the
+-- issues that stopped it. workflows.toml.bak keeps the previous file.
+function M.save_workflow(c: Core, old_id: string?, raw: { [string]: any }): { model.Issue }?
+	local issues = M.check_workflow(c, old_id, raw)
+	if #issues > 0 then
+		return issues
+	end
+	local text, err, old = compose(c, old_id, with_id(c, old_id, raw))
+	if text == nil or old == nil then
+		return file_issue(err or "无法写回 workflows.toml")
+	end
+	local werr = write_workflows(c, old, text)
+	return if werr then file_issue(werr) else nil
+end
+
+function M.delete_workflow(c: Core, id: string): string?
+	local old, rerr = current_text(c)
+	if old == nil then
+		return rerr
+	end
+	local text, err = model.splice_workflow(old, id, nil)
+	if text == nil then
+		return err
+	end
+	return write_workflows(c, old, text)
+end
+
+-- The TOML-shaped table of workflow `id` as it is in the file now.
+function M.workflow_raw(c: Core, id: string): { [string]: any }?
+	local text = read_file(c.paths.workflows)
+	return if text then model.raw_workflow(text, id) else nil
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- GitHub (through the relay's GitHub App)
+
+local GH_TTL = 300
+local GH_MAX = 64
+local GH_RETRY = 15
+
+local function query_escape(s: string): string
+	return (string.gsub(s, "[^%w%-_%.~/]", function(ch: string): string
+		return string.format("%%%02X", string.byte(ch))
+	end))
+end
+
+-- Suggestions for the editor (`what`: repos | people | labels | branches | workflows), cached for
+-- five minutes. Returns what is known now and starts a fetch when stale; listeners hear when it lands.
+function M.gh(c: Core, what: string, repo: string?): GhList
+	if what ~= "repos" and repo == nil then
+		return { items = {}, loading = false }
+	end
+	if not c.relay.state.configured then
+		return { items = {}, loading = false, error = "中继未配置" }
+	end
+	local key = if what == "repos" then "repos" else `{what}:{string.lower(repo :: string)}`
+	local cur = c.gh_cache[key]
+	if cur and (cur.loading or (cur.at and now() - cur.at < GH_TTL)) then
+		return cur
+	end
+	local entry: GhList = { items = if cur then cur.items else {}, loading = true, error = nil, at = nil }
+	c.gh_cache[key] = entry
+	if cur == nil then
+		table.insert(c.gh_order, key)
+		while #c.gh_order > GH_MAX do
+			c.gh_cache[table.remove(c.gh_order, 1) :: string] = nil
+		end
+	end
+	local path = `/api/v1/github/{what}`
+	if repo then
+		path ..= `?repo={query_escape(repo)}`
+	end
+	relay.request(c.relay, "GET", path, nil, 20000, function(ok, _status, body, err)
+		entry.loading = false
+		if ok and type(body) == "table" and type(body.items) == "table" then
+			local items: { string } = {}
+			for _, x in body.items do
+				if type(x) == "string" then
+					table.insert(items, x)
+				end
+			end
+			entry.items, entry.error, entry.at = items, nil, now()
+		else
+			-- Errors are retried soon (the App may have just been installed on the repo).
+			entry.error = err or "响应无效"
+			entry.at = now() - GH_TTL + GH_RETRY
+		end
+		M.changed(c)
+	end)
+	return entry
+end
+
+-- The relay's GitHub App, or nil while the relay status is unknown.
+function M.app(c: Core): AppInfo?
+	local agent = c.relay.state.agent
+	if type(agent) ~= "table" then
+		return nil
+	end
+	local gh = if type(agent.github) == "table" then agent.github else {}
+	local a = gh.app
+	if type(a) ~= "table" then
+		return { configured = false }
+	end
+	return {
+		configured = true,
+		name = a.name,
+		slug = a.slug,
+		owner = a.owner,
+		owner_type = a.owner_type,
+		html_url = a.html_url,
+		install_url = a.install_url,
+		installations = a.installations,
+	}
+end
+
+-- The user's GitHub login: roost.toml [github] login, else the owner of a personal GitHub App.
+function M.me(c: Core): string?
+	if c.config.github.login then
+		return c.config.github.login
+	end
+	local a = M.app(c)
+	if a and a.configured and a.owner_type == "User" then
+		return a.owner
+	end
+	return nil
+end
+
+-- Starts creating the GitHub App: `cb` gets the agent page that registers it on GitHub.
+function M.create_app(c: Core, org: string?, cb: (string?, string?) -> ())
+	local body: { [string]: any } = {}
+	if org and util.trim(org) ~= "" then
+		body.org = util.trim(org)
+	end
+	relay.request(c.relay, "POST", "/api/v1/github/app/manifest", body, 15000, function(ok, _s, resp, err)
+		if ok and type(resp) == "table" and type(resp.url) == "string" then
+			cb(resp.url, nil)
+		else
+			cb(nil, err or "响应无效")
+		end
+	end)
+end
+
+-- Drops the App credentials on the relay (the App itself stays on GitHub).
+function M.forget_app(c: Core)
+	relay.request(c.relay, "DELETE", "/api/v1/github/app", nil, 15000, function(ok, _s, _b, err)
+		M.notice(c, if ok then "success" else "error", if ok then "已删除中继上的 GitHub App 凭据" else err or "失败")
+		relay.refresh_status(c.relay)
 	end)
 end
 

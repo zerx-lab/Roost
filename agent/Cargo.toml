@@ -11,7 +11,9 @@ name = "roost-agent"
 path = "src/main.rs"
 
 [dependencies]
+aws-lc-rs = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 hex = "0.4"
 hmac = "0.12"

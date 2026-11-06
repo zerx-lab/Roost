@@ -3,3 +3,4 @@ tern.d.luau
 # Rust 产物应在 /tmp/roost-cargo-target(见 .cargo/config.toml),这里兜底
 target/
 .DS_Store
+__pycache__/

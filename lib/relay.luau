@@ -1,7 +1,7 @@
 --!strict
 -- The relay agent client: long-polls relayed GitHub events, keeps the agent's subscriptions in
 -- line with the local workflows (local first; on failure the UI offers the manual fallback), and
--- runs remote operations (reload, restart, hook sync, test event).
+-- runs remote operations (reload, restart, test event). GitHub App calls go through `request`.
 --
 -- Persistent client state lives in tern.kv, keyed by relay URL so pointing at another agent
 -- starts clean: `cursor` = { url, store_id, seq }, `subs` = { url, rev, fp }.
@@ -48,7 +48,7 @@ export type State = {
 	waiting: boolean, -- polling paused until a valid workflows.toml loads
 }
 
-export type Subs = { [string]: { events: { string }, hook: boolean } }
+export type Subs = { [string]: { events: { string } } }
 
 export type Handlers = {
 	-- Handles one relayed event; errors are caught and logged.
@@ -171,10 +171,9 @@ end
 function M.encode_subs(subs: Subs): { [string]: any }
 	local out: { [string]: any } = {}
 	for _, name in util.keys(subs) do
-		local s = subs[name]
-		local evs = table.clone(s.events)
+		local evs = table.clone(subs[name].events)
 		table.sort(evs)
-		out[name] = { events = tern.json.array(evs), hook = s.hook }
+		out[name] = { events = tern.json.array(evs) }
 	end
 	return out
 end
@@ -182,10 +181,9 @@ end
 function M.fingerprint(subs: Subs): string
 	local parts = {}
 	for _, name in util.keys(subs) do
-		local s = subs[name]
-		local evs = table.clone(s.events)
+		local evs = table.clone(subs[name].events)
 		table.sort(evs)
-		table.insert(parts, `{string.lower(name)}={table.concat(evs, ",")}:{tostring(s.hook)}`)
+		table.insert(parts, `{string.lower(name)}={table.concat(evs, ",")}`)
 	end
 	return table.concat(parts, ";")
 end
@@ -532,15 +530,6 @@ function M.restart_remote(r: Relay, cb: (boolean, string, any) -> ())
 				r.status_timer = nil
 				status_loop(r, gen)
 			end)
-		end
-		cb(ok, msg, body)
-	end)
-end
-
-function M.sync_hooks(r: Relay, dry: boolean, cb: (boolean, string, any) -> ())
-	op(r, "hooks", "POST", "/api/v1/github/sync", { dry_run = dry }, 90000, function(ok, msg, body)
-		if ok then
-			M.refresh_status(r)
 		end
 		cb(ok, msg, body)
 	end)

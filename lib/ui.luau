@@ -14,6 +14,7 @@ local model = require("./model")
 local field = require("./field")
 local util = require("./util")
 local agent = require("./agent")
+local editor = require("./editor")
 
 local ui = tern.ui
 local N = ui.node
@@ -65,6 +66,12 @@ export type State = {
 	log: Log,
 	cols: number,
 	rows: number,
+	editor: any, -- lib/editor.luau's state while the automation editor is open
+	tpl: string, -- template gallery group
+	app_org: field.Field?, -- organization typed for a new GitHub App
+	app_focus: boolean,
+	app_busy: boolean,
+	app_confirm: boolean, -- 忘记本地凭据 armed by a first click
 }
 
 -- ---------------------------------------------------------------------------------------------
@@ -113,17 +120,7 @@ local SYNC_TONE: { [string]: string } = {
 	offline = "error",
 	unconfigured = "muted",
 }
-local HOOK_LABEL: { [string]: string } = {
-	created = "已创建",
-	updated = "已更新",
-	unchanged = "已同步",
-	would_create = "将创建",
-	would_update = "将更新",
-	unused = "无事件",
-	disabled = "手动管理",
-	manual = "需手动配置",
-	error = "错误",
-}
+
 
 local function state_badge(state: string): Node
 	return ui.badge(STATE_LABEL[state] or state, STATE_TONE[state] or "muted")
@@ -341,6 +338,12 @@ function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
 		log = { id = nil, text = "", offset = 0, eof = false, done = false, gen = 0, busy = false, timer = nil, cut = false },
 		cols = cx.cols,
 		rows = cx.rows,
+		editor = nil,
+		tpl = "全部",
+		app_org = nil,
+		app_focus = false,
+		app_busy = false,
+		app_confirm = false,
 	}
 	if st.run_id and c.store.by_id[st.run_id] == nil then
 		st.run_id = nil
@@ -683,54 +686,24 @@ end
 -- ---------------------------------------------------------------------------------------------
 -- Workflows
 
-local function trigger_line(tr: model.Trigger, t: number): Node
-	if tr.kind == "cron" then
-		local ct = tr :: model.CronTrigger
-		local nxt = require("./cron").next(ct.cron, t, ct.utc)
-		return ui.text({
-			ui.span("定时  ", "muted"),
-			ui.span(require("./cron").describe(ct.cron)),
-			ui.span(`  {ct.expr}{if ct.utc then " UTC" else ""}`, "mono muted"),
-			ui.span(if nxt then `  · {util.until_(nxt, t)}` else "", "muted"),
-		})
-	end
-	local gt = tr :: model.GithubTrigger
-	local parts: { string } = {}
-	if #gt.actions > 0 then
-		table.insert(parts, table.concat(gt.actions, "/"))
-	end
-	if #gt.labels > 0 then
-		table.insert(parts, "标签 " .. table.concat(gt.labels, ","))
-	end
-	if #gt.branches > 0 then
-		table.insert(parts, "分支 " .. table.concat(gt.branches, ","))
-	end
-	if gt.comment then
-		table.insert(parts, `评论以 {gt.comment} 开头`)
-	end
-	if #gt.conclusions > 0 then
-		table.insert(parts, "结论 " .. table.concat(gt.conclusions, ","))
-	end
-	if gt.associations then
-		table.insert(parts, "作者 " .. table.concat(gt.associations, ","))
-	end
-	return ui.text({
-		ui.span("GitHub  ", "muted"),
-		ui.span(gt.event, "mono"),
-		ui.span(if #parts > 0 then "  " .. table.concat(parts, " · ") else "", "muted"),
-	})
-end
-
 local function workflows_tab(st: State): Node
 	local c = st.core
 	local w = c.workflows
+	local head = N("row", { key = "head", gap = "xs", align = "center" }, {
+		btn("新建自动化", "editor-new", { variant = "primary", icon = "sparkle", key = "new" }),
+		N("spacer", { key = "sp" }),
+		btn("编辑 workflows.toml", "open=workflows", { variant = "quiet", icon = "file", key = "file" }),
+	})
 	if not w then
-		return N("empty", {
-			key = "workflows",
-			tone = "error",
-			title = "workflows.toml 还没有可用的版本",
-			text = "修好「配置」页列出的错误后自动加载。",
-		}, { btn("编辑 workflows.toml", "open=workflows", { variant = "primary", size = "md" }) })
+		return N("col", { key = "workflows", role = "roost.workflows", gap = "md" }, {
+			head,
+			N("empty", {
+				key = "broken",
+				tone = "error",
+				title = "workflows.toml 还没有可用的版本",
+				text = "修好「配置」页列出的错误后自动加载。",
+			}),
+		})
 	end
 	local latest = store.latest(c.store)
 	local t = now()
@@ -742,7 +715,7 @@ local function workflows_tab(st: State): Node
 		end
 		local trig_nodes: { Node } = {}
 		for i, tr in wf.triggers do
-			table.insert(trig_nodes, keyed(trigger_line(tr, t), `t{i}`))
+			table.insert(trig_nodes, keyed(ui.text(model.describe_trigger(tr)), `t{i}`))
 		end
 		if #trig_nodes == 0 then
 			table.insert(trig_nodes, keyed(muted("仅手动运行"), "t0"))
@@ -758,8 +731,7 @@ local function workflows_tab(st: State): Node
 		table.insert(body, keyed(ui.text(step_spans), "steps"))
 		local last = latest[wf.id]
 		local meta = {
-			ui.span(`{if #wf.repos > 0 then table.concat(wf.repos, ", ") else "所有仓库"}`, "mono"),
-			ui.span(`  · {wf.concurrency} · {wf.workspace}`, "muted"),
+			ui.span(`{wf.concurrency} · {wf.workspace}`, "muted"),
 		}
 		local row: { Node } = {
 			btn("运行", `dispatch={wf.id}`, {
@@ -768,7 +740,7 @@ local function workflows_tab(st: State): Node
 				key = "run",
 				disabled = if not wf.manual then "manual = false:只允许自动触发" else false,
 			}),
-			btn("编辑", "open=workflows", { variant = "quiet", icon = "pen", key = "edit" }),
+			btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }),
 		}
 		if last then
 			table.insert(row, keyed(with(state_badge(last.state), { actions = { click = `open-run={last.id}` }, title = "查看最近一次运行" }), "last"))
@@ -780,16 +752,25 @@ local function workflows_tab(st: State): Node
 			ui.card(
 				{ ui.span(wf.name, "strong"), ui.span(if wf.enabled then "" else "  已停用", "muted") },
 				body,
-				{ key = wf.id, role = "roost.workflow", icon = if wf.enabled then "flow" else "pause", meta = meta, tone = if wf.enabled then nil else "muted" }
+				{
+					key = wf.id,
+					role = "roost.workflow",
+					icon = wf.icon or if wf.enabled then "flow" else "pause",
+					meta = meta,
+					tone = if wf.enabled then nil else "muted",
+				}
 			)
 		)
 	end
+	local body: { Node } = { head, editor.templates(st) }
 	if #cards == 0 then
-		return N("empty", { key = "workflows", title = "还没有工作流", text = "在 workflows.toml 中添加 [[workflow]]" }, {
-			btn("编辑 workflows.toml", "open=workflows", { variant = "primary", size = "md" }),
-		})
+		table.insert(body, N("empty", { key = "none", title = "还没有工作流", text = "从模板开始,或新建一个自动化。" }))
+	else
+		for _, card in cards do
+			table.insert(body, card)
+		end
 	end
-	return N("col", { key = "workflows", role = "roost.workflows", gap = "md" }, cards)
+	return N("col", { key = "workflows", role = "roost.workflows", gap = "md" }, body)
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -873,9 +854,7 @@ local function relay_tab(st: State): Node
 		local started = rfc3339(agent.started_at)
 		table.insert(conn, { "中继", `roost-agent {agent.version} · 启动于 {util.ago(started, t)} · boot {agent.boot_id or "—"}` })
 	end
-	if type(agent.webhook_url) == "string" then
-		table.insert(conn, pair("Webhook", { ui.span(agent.webhook_url, "mono") }))
-	end
+
 	if type(agent.store) == "table" then
 		table.insert(conn, { "事件缓存", `{agent.store.count or 0} 条 · 头 {agent.store.head or 0} · 本机游标 {rs.head or "—"}` })
 	end
@@ -953,73 +932,60 @@ local function relay_tab(st: State): Node
 	end
 	local sub_card = ui.card("事件订阅", sub_body, { key = "subs", icon = "broadcast" })
 
-	-- Webhooks
-	local hooks: { [string]: any }? = if type(agent.hooks) == "table" then agent.hooks else nil
-	local hook_body: { Node } = {}
-	if hooks then
-		local rows = {}
-		local manual_cards: { Node } = {}
-		for _, h in hooks.repos or {} do
-			local tone = if h.status == "manual" or h.status == "error"
-				then "warning"
-				elseif h.status == "unused" or h.status == "disabled" then "muted"
-				else "success"
-			table.insert(rows, {
-				id = h.repo,
-				cells = list_of(
-					{ text = h.repo, icon = "branch" },
-					{ badge = { text = HOOK_LABEL[h.status] or h.status, tone = tone } },
-					table.concat(h.events or {}, ", "),
-					h.message or ""
-				),
-			})
-			if type(h.manual) == "table" then
-				local m = h.manual
-				table.insert(
-					manual_cards,
-					ui.section({ ui.span(`在 GitHub 上为 {h.repo} 添加 webhook`, "strong") }, {
-						ui.kv({
-							pair("Payload URL", { ui.span(m.payload_url or "(先在 agent.toml 设置 server.public_url)", "mono") }),
-							pair("Content type", { ui.span(m.content_type or "application/json", "mono") }),
-							pair("Secret", m.secret or ""),
-							pair("事件", { ui.span(table.concat(m.events or {}, ", "), "mono") }),
-						} :: any),
-						N("row", { key = "links", gap = "xs" }, {
-							keyed(ui.text({ ui.link("打开仓库 Webhook 设置", m.settings_url or "") }), "link"),
-							btn("复制 Payload URL", `copy=url:{h.repo}`, { icon = "copy", key = "copy" }),
-						}),
-					})
-				)
-			end
-		end
-		if hooks.blocked then
-			table.insert(hook_body, keyed(ui.text({ ui.span(`中继无法自动配置:{hooks.blocked}`, "warning") }), "blocked"))
-		end
+	-- GitHub App
+	local info = core.app(c)
+	local app_body: { Node } = {}
+	if info == nil then
+		table.insert(app_body, keyed(muted("中继未连接:连接后可在这里创建 GitHub App"), "state"))
+	elseif not info.configured then
 		table.insert(
-			hook_body,
+			app_body,
 			keyed(
-				ui.table({
-					{ id = "repo", head = "仓库", mono = true },
-					{ id = "status", head = "状态" },
-					{ id = "events", head = "事件", grow = 1, truncate = "end", priority = 1 },
-					{ id = "msg", head = "说明", grow = 1, truncate = "end", priority = 2 },
-				}, rows :: any, { empty = "没有订阅的仓库" }),
-				"table"
+				muted("roost-agent 以 GitHub App 接收所装仓库的事件(只读权限),不需要个人令牌,也不用逐个仓库配置 webhook。"),
+				"explain"
 			)
 		)
-		for i, mc in manual_cards do
-			table.insert(hook_body, keyed(mc, `manual{i}`))
-		end
-		table.insert(hook_body, keyed(muted(`上次同步 {util.ago(rfc3339(hooks.at), t)}`), "at"))
+		local org = st.app_org or { text = "", cursor = 0 }
+		st.app_org = org
+		table.insert(
+			app_body,
+			N("field", { key = "org", label = "组织", hint = "留空则建在你的个人账号下" }, {
+				N("input", {
+					key = "input",
+					text = org.text,
+					cursor = field.utf16_cursor(org),
+					placeholder = "my-org",
+					variant = "field",
+				}),
+			})
+		)
+		table.insert(app_body, N("row", { key = "actions", gap = "xs" }, {
+			btn("创建 GitHub App", "app-create", { key = "create", variant = "primary", icon = "plug", busy = st.app_busy }),
+		}))
 	else
-		table.insert(hook_body, keyed(muted("还没有同步过 webhook"), "none"))
+		table.insert(app_body, ui.kv({
+			pair("名称", { ui.span(info.name or "—", "strong"), ui.span(`  {info.slug or ""}`, "mono muted") }),
+			pair("所有者", { ui.span(info.owner or "—", "mono"), ui.span(`  {info.owner_type or ""}`, "muted") }),
+			pair("已安装", if info.installations then `{info.installations} 个账号或组织` else "—"),
+		} :: any))
+		table.insert(app_body, N("row", { key = "actions", gap = "xs" }, {
+			btn("安装到仓库", "app-install", { key = "install", icon = "plus" }),
+			btn("在 GitHub 上管理", "app-manage", { key = "manage", icon = "open" }),
+			btn(
+				if st.app_confirm then "确认删除本地凭据" else "忘记本地凭据",
+				"app-forget",
+				{
+					key = "forget",
+					variant = "danger",
+					icon = "trash",
+					title = "只删除中继上的 App 凭据;App 本身要到 GitHub 设置里删除,删除后只能重新创建",
+				}
+			),
+		}))
 	end
-	table.insert(hook_body, N("row", { key = "actions", gap = "xs" }, {
-		btn("同步 webhook", "hooks", { icon = "plug", busy = busy.hooks == true, key = "sync" }),
-	}))
-	local hook_card = ui.card("GitHub Webhook", hook_body, { key = "hooks", icon = "plug" })
+	local app_card = ui.card("GitHub App", app_body, { key = "app", icon = "plug" })
 
-	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, { conn_card, sub_card, hook_card })
+	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, { conn_card, sub_card, app_card })
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1226,7 +1192,7 @@ function M.view(st: State): BlockView
 			ui.span(" 重跑", "muted"),
 		}),
 	})
-	return { main = main, dock = dock, layer = form_view(st) }
+	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) }
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1249,6 +1215,10 @@ end
 local function do_action(st: State, act: string, value: string?, item: string?)
 	local c = st.core
 	local target = value or item
+	if act ~= "app-forget" then
+		-- 忘记本地凭据 needs two clicks in a row; anything in between disarms it.
+		st.app_confirm = false
+	end
 	if act == "tab" and value and TAB_IDS[value] then
 		st.tab = value
 	elseif act == "open" and value then
@@ -1312,24 +1282,50 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		core.remote_reload(c)
 	elseif act == "restart_remote" then
 		core.remote_restart(c)
-	elseif act == "hooks" then
-		core.hook_sync(c)
 	elseif act == "test" then
 		core.test_relay(c)
-	elseif act == "copy" and value then
-		if value == "subs" then
-			local text = manual_subs_text(st)
-			if text then
-				st.cx:copy(text)
-				st.cx:toast("success", "已复制 subscriptions.toml")
+	elseif act == "editor-new" then
+		editor.open(st, "new", nil)
+	elseif act == "edit" and value then
+		editor.open(st, "edit", value)
+	elseif act == "template" and value then
+		editor.open(st, "template", value)
+	elseif act == "app-create" then
+		local org = st.app_org
+		local text = if org then util.trim(org.text) else ""
+		st.app_focus = false
+		st.app_busy = true
+		core.create_app(c, if text == "" then nil else text, function(url, err)
+			st.app_busy = false
+			if st.closed then
+				return
 			end
-		elseif string.sub(value, 1, 4) == "url:" then
-			local agent = c.relay.state.agent
-			local url = agent and agent.webhook_url
-			if type(url) == "string" then
-				st.cx:copy(url)
-				st.cx:toast("success", "已复制 Payload URL")
+			if type(url) == "string" and url ~= "" then
+				st.cx:open(url)
+			else
+				st.cx:toast("error", if type(err) == "string" and err ~= "" then err else "创建失败")
 			end
+			st.cx:render()
+		end)
+	elseif act == "app-install" or act == "app-manage" then
+		local info = core.app(c)
+		local url = info and (if act == "app-install" then info.install_url else info.html_url)
+		if url and url ~= "" then
+			st.cx:open(url)
+		end
+	elseif act == "app-forget" then
+		-- The private key can't be fetched again: the first click only arms the button.
+		if st.app_confirm then
+			st.app_confirm = false
+			core.forget_app(c)
+		else
+			st.app_confirm = true
+		end
+	elseif act == "copy" and value == "subs" then
+		local text = manual_subs_text(st)
+		if text then
+			st.cx:copy(text)
+			st.cx:toast("success", "已复制 subscriptions.toml")
 		end
 	elseif act == "form_submit" then
 		submit_form(st)
@@ -1339,6 +1335,9 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 end
 
 function M.event(st: State, ev: UiEvent)
+	if st.editor and editor.event(st, ev) then
+		return
+	end
 	local name = last_segment(ev.id)
 	if ev.ev == "select" or ev.ev == "activate" then
 		local item = ev.item
@@ -1347,6 +1346,9 @@ function M.event(st: State, ev: UiEvent)
 		end
 		if name == "nav" and TAB_IDS[item] then
 			st.tab = item
+			st.app_confirm = false
+		elseif name == "tpl" then
+			st.tpl = item
 		elseif name == "filter" then
 			st.filter = item
 		elseif name == "runs" then
@@ -1369,11 +1371,18 @@ function M.event(st: State, ev: UiEvent)
 		if type(act) == "string" then
 			do_action(st, act, ev.value, if type(ev.item) == "string" then ev.item else nil)
 		end
-	elseif ev.ev == "focus" and st.form then
-		local i = tonumber(string.match(ev.id or "", "^layer%.form%.field(%d+)%.input$") or "")
-		if i and st.form.fields[i] then
-			st.form.focus = i
-			focus_form(st)
+	elseif ev.ev == "focus" then
+		if st.form then
+			local i = tonumber(string.match(ev.id or "", "^layer%.form%.field(%d+)%.input$") or "")
+			if i and st.form.fields[i] then
+				st.form.focus = i
+				focus_form(st)
+			end
+		elseif string.match(ev.id or "", "relay%.app%.org%.input$") then
+			st.app_focus = true
+			st.cx:frame({ pair("focus", ev.id) })
+		else
+			st.app_focus = false
 		end
 	end
 end
@@ -1402,6 +1411,9 @@ local function move_selection(st: State, delta: number): boolean
 end
 
 function M.key(st: State, key: Key): boolean?
+	if st.editor and editor.key(st, key) then
+		return true
+	end
 	local f = st.form
 	if f then
 		if key.name == "escape" then
@@ -1424,6 +1436,18 @@ function M.key(st: State, key: Key): boolean?
 			return true
 		end
 		return false
+	end
+	local app = if st.tab == "relay" and st.app_focus and st.app_org then core.app(st.core) else nil
+	-- Keys go to the org field only while it is drawn (no App yet, relay status known).
+	if app and not app.configured and st.app_org then
+		if key.name == "escape" or key.name == "enter" then
+			st.app_focus = false
+			st.cx:frame({ pair("focus", tern.json.null) })
+			return true
+		end
+		if field.key(st.app_org, key) then
+			return true
+		end
 	end
 	if key.ctrl or key.alt or key.meta then
 		return false

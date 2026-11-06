@@ -61,8 +61,52 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 end)
 
 -- Status segment: what the host last published, read on a timer (formatters must stay cheap).
-type Status = { running: number?, queued: number?, relay: string?, failed: number? }
+type Done = { id: string, name: string?, title: string?, state: string? }
+type Status = { running: number?, queued: number?, relay: string?, failed: number?, done: { Done }? }
 local status: Status = {}
+-- Finished runs already toasted (or present when this window VM started: never re-announced).
+local announced: { [string]: boolean }? = nil
+
+local STATE_TEXT: { [string]: string } = {
+	success = "完成",
+	failed = "失败",
+	timed_out = "超时",
+	cancelled = "已取消",
+	interrupted = "中断",
+	skipped = "已跳过",
+}
+
+-- One toast per newly finished run of a workflow with notify on (status.done).
+local function announce(cx: WindowCx?)
+	local list: { Done } = status.done or {}
+	local seen: { [string]: boolean }? = announced
+	if seen == nil then
+		-- First look in this VM: what is already listed was announced before a reload.
+		local first: { [string]: boolean } = {}
+		for _, d in list do
+			first[d.id] = true
+		end
+		announced = first
+		return
+	end
+	if cx == nil then
+		-- No window to toast in on this tick: keep them pending for the next one.
+		return
+	end
+	for _, d in list do
+		if not seen[d.id] then
+			local state = d.state or ""
+			local level: ToastLevel = if state == "success" then "success" elseif state == "failed" or state == "timed_out" then "error" else "info"
+			cx:toast(level, `Roost:{d.name or "工作流"} {STATE_TEXT[state] or state}`, d.title)
+		end
+	end
+	-- Keep only ids still listed, so the set stays as small as the published list.
+	local keep: { [string]: boolean } = {}
+	for _, d in list do
+		keep[d.id] = true
+	end
+	announced = keep
+end
 local status_json = ""
 
 tern.chrome.status(function(_pane: StatusPaneInfo): { StatusSegment }?
@@ -84,7 +128,7 @@ end)
 -- theme.css in the data directory restyles the console without touching the plugin folder.
 local theme = ""
 
-local function poll()
+local function poll(cx: WindowCx?)
 	local ok, s = pcall(tern.kv.get, "status")
 	if ok and type(s) == "table" then
 		local enc = tern.json.encode(s)
@@ -94,6 +138,7 @@ local function poll()
 			tern.chrome.refresh()
 		end
 	end
+	announce(cx)
 	if tern.fs.exists(THEME) then
 		local okr, css = pcall(tern.fs.read, THEME, MAX_THEME)
 		if okr and css ~= theme then

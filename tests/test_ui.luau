@@ -28,16 +28,16 @@ path = "~/code/web"
 [[workflow]]
 id = "triage"
 name = "Issue 分诊"
-repos = ["acme/web"]
 workspace = "temp"
 [[workflow.input]]
 name = "focus"
 description = "关注点"
 required = true
 [[workflow.trigger]]
-github = "issues"
-actions = ["opened"]
+github = "issue_opened"
+repos = ["acme/web"]
 [[workflow.trigger]]
+schedule = "cron"
 cron = "0 9 * * 1-5"
 [[workflow.step]]
 name = "think"
@@ -139,6 +139,12 @@ do -- the host block renders every page; keys switch pages
 		local v = view(w)
 		truthy(F.text(v.main) ~= "", `page {id} has content`)
 	end
+	w.st.tab = "workflows"
+	local cards = view(w)
+	local card_text = F.text(cards.main)
+	truthy(string.find(card_text, "新建自动化", 1, true), "new automation button")
+	truthy(string.find(card_text, "Issue 已打开", 1, true), "trigger line uses the kind label")
+	eq(string.find(card_text, 'github = "issues"', 1, true), nil, "raw github field is not the card line")
 	eq(press(w, "x"), false, "unbound key changes nothing")
 	-- The relay page shows the manual fallback while pushes fail.
 	w.st.tab = "relay"
@@ -150,6 +156,10 @@ do -- the host block renders every page; keys switch pages
 	truthy(string.find(code.p.text, 'events = ["issues"]', 1, true), "with the subscribed events")
 	w.ui.event(w.st, { ev = "action", id = "main.body.relay.subs.manual.copy", act = "copy", value = "subs" })
 	eq(w.cx.copied[1], code.p.text, "copy puts the same text on the clipboard")
+	local relay_text = F.text(v.main)
+	truthy(string.find(relay_text, "GitHub App", 1, true), "GitHub App card")
+	eq(string.find(relay_text, "GitHub Webhook", 1, true), nil, "webhook card is gone")
+	truthy(string.find(relay_text, "中继未连接", 1, true), "disconnected relay explains itself")
 end
 
 do -- manual run with a required input goes through the form; the log tails by appends

@@ -1,10 +1,11 @@
 //! Configuration files.
 //!
-//! * `agent.toml`: server binding (listen address, admin token, webhook secret, GitHub token,
-//!   storage limits). Never synced: secrets stay on the server; changes take a restart.
+//! * `agent.toml`: server binding (listen address, admin token, GitHub API base, storage
+//!   limits). Never synced: secrets stay on the server; changes take a restart. The GitHub App's
+//!   credentials live next to the data in `github-app.json`, written by the registration flow.
 //! * `subscriptions.toml`: which repos the relay accepts and which events each needs. Pushed by
 //!   the plugin (computed from its local workflows) and hot-reloaded; editable by hand on the
-//!   server when the push can't reach it, then applied with a remote reload.
+//!   server when the push can't reach it, then applied with a remote reload. `"*"` is any repo.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -174,12 +175,10 @@ struct AuthRaw {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GithubRaw {
-    webhook_secret: Option<String>,
-    token: Option<String>,
     api_url: Option<String>,
     web_url: Option<String>,
-    auto_sync_hooks: Option<bool>,
-    ignore_bots: Option<bool>,
+    /// Where the GitHub App credentials are kept (default `<data>/github-app.json`).
+    app: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -206,12 +205,9 @@ pub struct AgentConfig {
     pub public_url: Option<String>,
     pub max_body_bytes: usize,
     pub admin_token: Secret,
-    pub webhook_secret: Option<Secret>,
-    pub github_token: Option<Secret>,
     pub api_url: String,
     pub web_url: String,
-    pub auto_sync_hooks: bool,
-    pub ignore_bots: bool,
+    pub app_path: PathBuf,
     pub keep_events: usize,
     pub max_age: Duration,
     pub max_payload_bytes: usize,
@@ -299,8 +295,6 @@ impl AgentConfig {
             }
         };
         let admin_token = secret("auth.token", &raw.auth.token);
-        let webhook_secret = secret("github.webhook_secret", &raw.github.webhook_secret);
-        let github_token = secret("github.token", &raw.github.token);
         let admin_token = match admin_token {
             Some(t) if t.expose().len() >= 16 => t,
             Some(_) => {
@@ -359,14 +353,13 @@ impl AgentConfig {
         if !issues.is_empty() {
             return Err(issues);
         }
+        let data_dir = base.join(raw.paths.data.as_deref().unwrap_or("data"));
         Ok(AgentConfig {
             path: path.to_path_buf(),
             listen,
             public_url,
             max_body_bytes: as_usize(max_body_bytes),
             admin_token,
-            webhook_secret,
-            github_token,
             api_url: raw
                 .github
                 .api_url
@@ -379,13 +372,15 @@ impl AgentConfig {
                 .unwrap_or_else(|| "https://github.com".into())
                 .trim_end_matches('/')
                 .to_string(),
-            auto_sync_hooks: raw.github.auto_sync_hooks.unwrap_or(true),
-            ignore_bots: raw.github.ignore_bots.unwrap_or(true),
+            app_path: match raw.github.app.as_deref() {
+                Some(p) => base.join(p),
+                None => data_dir.join("github-app.json"),
+            },
             keep_events: as_usize(keep_events),
             max_age,
             max_payload_bytes: as_usize(max_payload_bytes),
             max_total_bytes: as_usize(max_total_bytes),
-            data_dir: base.join(raw.paths.data.as_deref().unwrap_or("data")),
+            data_dir,
             subscriptions_path: base.join(
                 raw.paths
                     .subscriptions
@@ -402,16 +397,9 @@ impl AgentConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RepoSub {
-    /// GitHub event names this repo's webhook delivers and the relay keeps.
+    /// GitHub event names the relay keeps for this repo (`"*"`: every event).
     #[serde(default)]
     pub events: BTreeSet<String>,
-    /// Whether hook sync manages this repo's webhook (false: set up by hand).
-    #[serde(default = "yes")]
-    pub hook: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,11 +430,18 @@ impl Subscriptions {
         }
     }
 
-    /// The repo entry matching `name` case-insensitively (GitHub names are case-insensitive).
-    pub fn repo(&self, name: &str) -> Option<(&String, &RepoSub)> {
-        self.repos
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    /// Whether `event` of `repo` is subscribed: by the repo's own entry (case-insensitive, as
+    /// GitHub names are) or by the `"*"` entry for any repo.
+    pub fn wants(&self, repo: &str, event: &str) -> bool {
+        self.repos.iter().any(|(k, s)| {
+            (k == ANY_REPO || k.eq_ignore_ascii_case(repo))
+                && (s.events.contains(event) || s.events.contains("*"))
+        })
+    }
+
+    /// A named repo to point a test event at (not the `"*"` entry).
+    pub fn first_repo(&self) -> Option<String> {
+        self.repos.keys().find(|k| k.as_str() != ANY_REPO).cloned()
     }
 
     pub fn load(path: &Path) -> Result<Subscriptions, Vec<Issue>> {
@@ -498,8 +493,11 @@ fn validate_repos(
     let mut seen = BTreeSet::new();
     for (name, sub) in &repos {
         let path = format!("repos.{name:?}");
-        if !valid_repo_name(name) {
-            issues.push(Issue::new(&path, "repo keys must be \"owner/name\""));
+        if name != ANY_REPO && !valid_repo_name(name) {
+            issues.push(Issue::new(
+                &path,
+                "repo keys must be \"owner/name\" or \"*\"",
+            ));
         }
         if !seen.insert(name.to_ascii_lowercase()) {
             issues.push(Issue::new(
@@ -522,6 +520,9 @@ fn validate_repos(
         Err(issues)
     }
 }
+
+/// The subscriptions key that matches every repository.
+pub const ANY_REPO: &str = "*";
 
 pub fn valid_event(e: &str) -> bool {
     !e.is_empty() && e.len() <= 64 && e.chars().all(|c| c.is_ascii_lowercase() || c == '_')
@@ -552,27 +553,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscriptions_roundtrip_and_validation() {
+    fn subscriptions_roundtrip_wildcard_and_validation() {
         let mut repos = BTreeMap::new();
         repos.insert(
             "acme/web".to_string(),
             RepoSub {
                 events: ["issues".to_string(), "push".to_string()].into(),
-                hook: true,
+            },
+        );
+        repos.insert(
+            "*".to_string(),
+            RepoSub {
+                events: ["release".to_string()].into(),
             },
         );
         let s = Subscriptions::from_repos(repos.clone()).unwrap();
         let back = Subscriptions::parse(&s.text).unwrap();
         assert_eq!(back.repos, repos);
         assert_eq!(back.revision, s.revision);
-        assert!(s.repo("ACME/Web").is_some());
+        assert!(s.wants("ACME/Web", "push"), "names are case-insensitive");
+        assert!(!s.wants("acme/other", "push"), "push only for acme/web");
+        assert!(s.wants("acme/other", "release"), "\"*\" covers any repo");
+        assert_eq!(s.first_repo().as_deref(), Some("acme/web"));
 
         let e = Subscriptions::parse("[repos.\"bad\"]\nevents = [\"Issues\"]\n").unwrap_err();
         assert_eq!(e.len(), 2, "{e:?}");
-        let e = Subscriptions::parse("[repos.\"a/b\"]\nbogus = 1\n").unwrap_err();
+        let e = Subscriptions::parse("[repos.\"a/b\"]\nhook = true\n").unwrap_err();
         assert_eq!(e[0].line, Some(2), "{e:?}");
-        let hook_default = Subscriptions::parse("[repos.\"a/b\"]\n").unwrap();
-        assert!(hook_default.repos["a/b"].hook);
     }
 
     #[test]
