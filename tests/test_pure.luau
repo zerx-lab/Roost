@@ -544,6 +544,66 @@ do -- tab / upgrade steps, evolve scopes and roost triggers
 	assert(string.find(enc, 'evolve = ["a"]', 1, true) and string.find(enc, 'roost = "run_failed"', 1, true), enc)
 end
 
+do -- run_succeeded: sample percent, its own keys, wording, encoding; sampling and roost.toml redaction
+	local evolve = require("../lib/evolve")
+	local function truthy_find(msg: string?, needle: string, why: string)
+		assert(msg and string.find(msg, needle, 1, true), `{why}: {tostring(msg)}`)
+	end
+	local base = '[[workflow]]\nid = "a"\n[[workflow.step]]\nrun = "true"\n[[workflow]]\nid = "d"\nevolve = ["*"]\n[[workflow.trigger]]\nroost = "run_succeeded"\n'
+	local w = model.parse_workflows(base .. 'sample = 30\n[[workflow.step]]\nrun = "true"\n') :: model.Workflows
+	local rt = w.by_id.d.triggers[1] :: model.RoostTrigger
+	eq(rt.on, "run_succeeded")
+	eq(rt.sample, 30)
+	eq(model.describe_trigger(rt), "抽查被迭代的工作流 30% 的成功运行")
+	local all = model.parse_workflows(base .. '[[workflow.step]]\nrun = "true"\n') :: model.Workflows
+	eq((all.by_id.d.triggers[1] :: model.RoostTrigger).sample, 100, "every success by default")
+	local function first(text: string): string?
+		local _, issues = model.parse_workflows(text)
+		return if issues[1] then `{issues[1].path}: {issues[1].message}` else nil
+	end
+	truthy_find(first(base .. 'streak = 2\n[[workflow.step]]\nrun = "true"\n'), "streak", "streak belongs to run_failed")
+	truthy_find(first(base .. 'sample = 0\n[[workflow.step]]\nrun = "true"\n'), "sample", "sample is 1..100")
+	truthy_find(
+		first('[[workflow]]\nid = "d"\nevolve = ["*"]\n[[workflow.trigger]]\nroost = "run_failed"\nsample = 5\n[[workflow.step]]\nrun = "true"\n'),
+		"sample",
+		"sample belongs to run_succeeded"
+	)
+	local enc = model.encode_workflow(model.raw_workflow(base .. 'sample = 30\n[[workflow.step]]\nrun = "true"\n', "d") :: any)
+	assert(string.find(enc, 'roost = "run_succeeded"\nsample = 30', 1, true), enc)
+
+	eq(evolve.sampled("anything", 100), true)
+	eq(evolve.sampled("006aeead050b14", 37), evolve.sampled("006aeead050b14", 37), "the same run answers the same")
+	local hit = 0
+	for i = 1, 1000 do
+		if evolve.sampled(string.format("%014x", i * 7919), 30) then
+			hit += 1
+		end
+	end
+	assert(hit > 220 and hit < 380, `about 30% sampled, got {hit}/1000`)
+
+	local red = evolve.redact(
+		'[relay]\nurl = "https://r.example"\ntoken = "abc123secret"\n# token = "old-one"\nclient_name = "me"\n'
+			.. "'api_key' = 'quoted-k3y'\n"
+			.. 'mirror = "https://bob:pw9xyz@git.example/x"\n'
+			.. 'secret = """\nmulti-line-s3cret\n"""\nafter = 1\n'
+			.. "[runner]\nenv = { GH_TOKEN = \"t0k\" }\nmax_concurrent = 2\n[runner.env]\nX = \"plain-but-env\"\n[github]\nidentity = \"app\"\n"
+	)
+	for _, leak in { "abc123secret", "old-one", "t0k", "plain-but-env", "quoted-k3y", "pw9xyz", "multi-line-s3cret" } do
+		eq(string.find(red, leak, 1, true), nil, `{leak} hidden: {red}`)
+	end
+	for _, keep in {
+		'url = "https://r.example"',
+		'client_name = "me"',
+		"max_concurrent = 2",
+		'identity = "app"',
+		'# token = "<已隐藏>"',
+		"after = 1",
+		"https://<已隐藏>@git.example/x",
+	} do
+		assert(string.find(red, keep, 1, true), `{keep} kept: {red}`)
+	end
+end
+
 do -- workflow groups: ids, names, order, sections and tolerant decoding
 	local groups = require("../lib/groups")
 	local g = groups.empty()

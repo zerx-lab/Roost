@@ -1606,11 +1606,15 @@ end
 local function roost_card(st: any, ed: Editor, i: number, tr: any): any
 	local on = if type(tr.roost) == "string" then tr.roost else ""
 	local label, detail = roost_meta(on)
-	local streak = if type(tr.streak) == "number" then tostring(tr.streak) else "1"
+	local sampled = on == "run_succeeded"
+	local key = if sampled then "sample" else "streak"
+	local value = if sampled
+		then (if type(tr.sample) == "number" then tostring(tr.sample) else "100")
+		else (if type(tr.streak) == "number" then tostring(tr.streak) else "1")
 	local opts: { any } = {}
 	for n = 1, 10 do
-		local v = tostring(n)
-		table.insert(opts, { value = v, label = v })
+		local v = tostring(if sampled then n * 10 else n)
+		table.insert(opts, { value = v, label = if sampled then `{v}%` else v })
 	end
 	local body: { any } = {
 		N("row", { key = "h", gap = "sm", align = "center" }, {
@@ -1628,12 +1632,12 @@ local function roost_card(st: any, ed: Editor, i: number, tr: any): any
 		}),
 		txt(detail, "detail", "muted"),
 		roost_workflows(st, ed, i, tr),
-		N("field", { key = "streak", label = "连续失败次数", variant = "row" }, {
+		N("field", { key = key, label = if sampled then "抽查比例" else "连续失败次数", variant = "row" }, {
 			N("select", {
 				key = "sel",
-				value = streak,
-				options = with_current(opts, streak, streak),
-				open = ed.opens[tid(i, "card", "streak", "sel")] == true,
+				value = value,
+				options = with_current(opts, value, if sampled then `{value}%` else value),
+				open = ed.opens[tid(i, "card", key, "sel")] == true,
 			}),
 		}),
 	}
@@ -2664,6 +2668,12 @@ local function on_select(st: any, ed: Editor, id: string, value: string)
 		local n = tonumber(value)
 		if n and n >= 1 and n <= 10 then
 			tr.streak = if n == 1 then nil else n
+		end
+		touch(ed)
+	elseif tr and string.find(id, ".sample.sel", 1, true) then
+		local n = tonumber(value)
+		if n and n >= 1 and n <= 100 then
+			tr.sample = if n == 100 then nil else n
 		end
 		touch(ed)
 	elseif string.find(id, ".file.sel", 1, true) then

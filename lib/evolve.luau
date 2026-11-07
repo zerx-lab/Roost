@@ -436,33 +436,57 @@ local README = [==[
 
 <目标>
 
+## 触发方式
+
+见 `digest.md` 第一行:
+
+- **失败**:被迭代的工作流运行失败或超时。找根因,能在下面的文件里修就修。
+- **抽查**:被迭代的工作流运行成功,抽出来复查。逐项看这次运行的结果与过程是否有可改进的地方:结论是否正确、有没有多余或重复的步骤与费用、耗时、日志与临时数据是否冗余、调试后是否清理干净、哪些人工环节可以自动化。没有值得改的就什么都不改。
+- **巡检**:定时运行,没有指定运行,看所有工作流近期的整体表现。
+
 ## 目录
 
 - `digest.md`、`digest.json`:近期运行的结果、失败原因、近 7 天健康度,以及以往的修订和回滚记录。
-- `logs/<运行 id>.txt`:失败运行日志的末尾(每个最多 48 KiB)。
+- `logs/<运行 id>.txt`:触发本次的运行与近期失败运行的日志末尾(每个最多 48 KiB)。
+- `context/`:只读的背景资料,不会被应用。
+  - `roost.toml`:本机 Roost 配置(令牌、密钥与 env 的值已隐藏)。
+  - `repos.md`:仓库与本机检出路径。
+  - `suggestions.md`:近期迭代运行已经提出、需要人处理的建议;不要重复提出,除非有新的证据。
 - `edit/`:可以修改的副本,只改这里。
   - `edit/workflows/<id>/workflow.toml`:该工作流的 `[[workflow]]` 块。不能改 `id`,不能加 `evolve`。
   - `edit/workflows/<id>/files/…`:该工作流的私有文件(脚本、提示词)。
   - `edit/library/<库>/…`:只被上面这些工作流使用的文件库。
 - `base/`:运行开始时的原样,不要改。
+- `suggestions.md`(你来写,可选):`edit/` 改不了、需要人处理的改进,例如系统配置(roost.toml、omp、本机或调试机环境)、新的自动化、Roost 本身的代码。每条一段:现象与证据(运行 id、日志位置)、建议的改法、预期收益。Roost 会把它写进运行日志并通知。
 
 ## 规则
 
 - 本次运行成功结束后,Roost 比较 `edit/` 与 `base/`,校验通过就自动应用(和编辑器保存一样);校验不通过的改动会被丢弃,原因写进运行日志。
 - 应用后,被改动的工作流接下来的运行如果明显变差(至少 2 次失败,且失败率比改动前高 25% 以上),Roost 会自动回滚。
 - 改动期间如果有人在编辑器里改了同一个工作流,这次的改动会被跳过。
-- 找不到明确原因、或问题不在这些文件里(网络、凭据、外部服务),就不要改,保持 `edit/` 原样,在回复里说明。
-- 只做能解释失败的最小改动;不要顺手重构。
+- 找不到明确原因、或问题不在这些文件里(网络、凭据、外部服务),就不要改 `edit/`,在回复或 `suggestions.md` 里说明。
+- 只做有证据支撑的最小改动;不要顺手重构,不要放宽任何安全约束。
 ]==]
+
+local function find_run(s: store.Store, id: string): Run?
+	for i = #s.runs, 1, -1 do
+		if s.runs[i].id == id then
+			return s.runs[i]
+		end
+	end
+	return nil
+end
 
 local function digest_md(h: Host, b: Book, run: Run, ids: { string }, w: model.Workflows, logs: { [string]: { string } }): string
 	local t = h.now()
 	local health = stats.health(h.store.runs, t, 7)
 	local out: { string } = { `# 运行摘要(生成于 {util.clock(t)})`, "" }
 	if run.evolve_target then
-		table.insert(out, `触发:{run.evolve_target} 的运行 {run.evolve_run or "?"} 失败`)
+		local src = if run.evolve_run then find_run(h.store, run.evolve_run) else nil
+		local how = if src and src.state == "success" then "抽查:成功" else "失败:" .. (if src then STATE_TEXT[src.state] or src.state else "失败")
+		table.insert(out, `触发:{how} · {run.evolve_target} 的运行 {run.evolve_run or "?"}`)
 	else
-		table.insert(out, `触发:{run.trigger.kind} · {run.trigger.detail}`)
+		table.insert(out, `触发:巡检 · {run.trigger.kind} · {run.trigger.detail}`)
 	end
 	for _, id in ids do
 		local wf = w.by_id[id]
@@ -499,7 +523,7 @@ local function digest_md(h: Host, b: Book, run: Run, ids: { string }, w: model.W
 			for _, rid in lg do
 				table.insert(names, `logs/{rid}.txt`)
 			end
-			table.insert(out, `- 失败日志:{table.concat(names, "、")}`)
+			table.insert(out, `- 日志:{table.concat(names, "、")}`)
 		end
 		local past: { string } = {}
 		for i = #b.revs, 1, -1 do
@@ -560,6 +584,163 @@ local function digest_json(h: Host, run: Run, ids: { string }, libs: { string },
 		libraries = tern.json.array(table.move(libs, 1, #libs, 1, {})),
 		targets = tern.json.array(targets),
 	})
+end
+
+-- What an evolver's run may leave for people: improvements its edit/ can't make.
+M.SUGGESTIONS = "suggestions.md"
+local MAX_SUGGESTIONS = 256 * 1024
+local SUGGESTION_CHARS = 8000
+local PAST_SUGGESTIONS = 10
+
+-- Keys whose values never leave roost.toml: credentials, and `env` tables (they carry tokens).
+local function secret_key(key: string): boolean
+	local k = string.lower(key)
+	for _, word in { "token", "secret", "password", "passwd", "credential", "key", "auth", "env" } do
+		if string.find(k, word, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- The closer a value opened on its key line still waits for, if any (a multi-line string or array).
+local function open_value(value: string): string?
+	for _, q in { '"""', "'''" } do
+		local at = string.find(value, q, 1, true)
+		if at == 1 then
+			return if string.find(value, q, 4, true) then nil else q
+		end
+	end
+	local first = string.sub(value, 1, 1)
+	if first == "[" and not string.find(value, "]", 1, true) then
+		return "]"
+	elseif first == "{" and not string.find(value, "}", 1, true) then
+		return "}"
+	end
+	return nil
+end
+
+-- roost.toml with every secret value (commented-out ones too, multi-line ones whole, all of an
+-- `env` section) replaced, line by line, and credentials in URLs (`scheme://user:pw@`) masked.
+function M.redact(text: string): string
+	local out: { string } = {}
+	local in_env = false
+	local closer: string? = nil
+	for line in string.gmatch(text .. "\n", "([^\n]*)\n") do
+		if closer then
+			if string.find(line, closer, 1, true) then
+				closer = nil
+			end
+			continue
+		end
+		local header = string.match(line, "^%s*%[+%s*([^%]]+)%]")
+		if header then
+			in_env = secret_key(header)
+			table.insert(out, line)
+			continue
+		end
+		local lead, key, value = string.match(line, "^(%s*#?%s*)([%w_%-\"'%.]+)%s*=%s*(.*)$")
+		if key and (in_env or secret_key(key)) then
+			table.insert(out, `{lead}{key} = "<已隐藏>"`)
+			closer = open_value(value or "")
+		else
+			table.insert(out, (string.gsub(line, "(%a[%w+.-]*://)[^/%s\"'@]+@", "%1<已隐藏>@")))
+		end
+	end
+	if out[#out] == "" then
+		table.remove(out)
+	end
+	return table.concat(out, "\n") .. "\n"
+end
+
+local function repos_md(w: model.Workflows): string
+	local out: { string } = { "# 仓库与本机检出", "", "| 仓库 | 本机路径 | 分支 | worktree |", "|---|---|---|---|" }
+	for _, name in util.keys(w.repos) do
+		local r = w.repos[name]
+		table.insert(out, `| {name} | {r.path or "(临时目录)"} | {r.branch or "默认"} | {if r.worktree then "是" else "否"} |`)
+	end
+	if #out == 4 then
+		table.insert(out, "| (没有声明仓库) | | | |")
+	end
+	return table.concat(out, "\n") .. "\n"
+end
+
+-- The suggestions file of finished run `id`, trimmed (and clipped), or nil when there is none (or it
+-- is empty); one too big to read says so instead of vanishing.
+function M.suggestions(s: store.Store, id: string): string?
+	local path = `{M.dir(store.run_dir(s, id))}/{M.SUGGESTIONS}`
+	local ok, text = pcall(tern.fs.read, path, MAX_SUGGESTIONS)
+	if not ok or type(text) ~= "string" then
+		local ok2, there = pcall(tern.fs.exists, path)
+		return if ok2 and there then `{M.SUGGESTIONS} 超过 {MAX_SUGGESTIONS // 1024} KiB,没有读取:{path}` else nil
+	end
+	local t = util.trim(text)
+	if t == "" or utf8.len(t) == nil then
+		return nil
+	end
+	return util.clip(t, SUGGESTION_CHARS)
+end
+
+local function evolved(r: Run): boolean
+	for _, s in r.steps do
+		if s.kind == "evolve" then
+			return true
+		end
+	end
+	return false
+end
+
+-- Suggestions earlier evolver runs (successful ones: those were reported) made, newest first.
+local function past_suggestions(h: Host, run: Run): string
+	local out: { string } = { "# 近期已提出的建议", "" }
+	local n, scanned = 0, 0
+	for i = #h.store.runs, 1, -1 do
+		local r = h.store.runs[i]
+		if n >= PAST_SUGGESTIONS or scanned >= 200 then
+			break
+		end
+		if r.id ~= run.id and r.state == "success" and evolved(r) then
+			scanned += 1
+			local text = M.suggestions(h.store, r.id)
+			if text then
+				n += 1
+				table.insert(out, `## 运行 {r.id}({util.clock(r.started_at or r.created_at)})`)
+				table.insert(out, "")
+				table.insert(out, util.clip(text, 3000))
+				table.insert(out, "")
+			end
+		end
+	end
+	if n == 0 then
+		table.insert(out, "(无)")
+	end
+	return table.concat(out, "\n") .. "\n"
+end
+
+-- Reads roost.toml (at most 256 KiB); nil when absent or unreadable.
+local function roost_toml(data: string): string?
+	local ok, text = pcall(tern.fs.read, `{data}/roost.toml`, 256 * 1024)
+	return if ok and type(text) == "string" then text else nil
+end
+
+-- An evolver's successful run left suggestions: they go into its log and a notice.
+function M.report(h: Host, run: Run, name: string)
+	local text = M.suggestions(h.store, run.id)
+	if text == nil then
+		return
+	end
+	local lines: { string } = { "[roost] 改进建议(需要人处理):" }
+	local count = 0
+	for line in string.gmatch(text .. "\n", "([^\n]*)\n") do
+		if count >= 200 then
+			table.insert(lines, "[roost] ……(其余见 evolve/suggestions.md)")
+			break
+		end
+		table.insert(lines, "  " .. line)
+		count += 1
+	end
+	h.log(run.id, lines)
+	h.notice("info", `{name} 提出了改进建议:{util.clip(util.first_line(text), 80)}(运行 {run.id})`)
 end
 
 -- Writes run `run`'s material (for evolver `wf`) and returns the log tails still to copy, as
@@ -648,6 +829,7 @@ function M.prepare(h: Host, b: Book, run: Run, wf: Workflow): ({ string }, strin
 	end
 	local ok, ferr = pcall(function(): string?
 		tern.fs.mkdir(`{dir}/logs`)
+		tern.fs.mkdir(`{dir}/context`)
 		local list = table.concat(lines, "\n")
 		local readme = string.gsub(README, "<目标>", function(): string
 			return list
@@ -655,6 +837,10 @@ function M.prepare(h: Host, b: Book, run: Run, wf: Workflow): ({ string }, strin
 		tern.fs.write(`{dir}/README.md`, readme)
 		tern.fs.write(`{dir}/digest.md`, digest_md(h, b, run, ids, w, logs))
 		tern.fs.write(`{dir}/digest.json`, digest_json(h, run, ids, libs, logs))
+		local rt = roost_toml(h.data)
+		tern.fs.write(`{dir}/context/roost.toml`, if rt then M.redact(rt) else "# 没有 roost.toml\n")
+		tern.fs.write(`{dir}/context/repos.md`, repos_md(w))
+		tern.fs.write(`{dir}/context/suggestions.md`, past_suggestions(h, run))
 		tern.fs.write(
 			`{dir}/scope.json`,
 			tern.json.encode({
@@ -1123,12 +1309,37 @@ end
 
 export type Fire = { workflow: Workflow, target: string, run: string, detail: string }
 
--- The evolvers a failed run of a target starts, honouring each `roost` trigger's streak, the
--- cooldown and the daily cap (recorded in the book as fired).
+-- Whether run `id` falls in a `sample` percent spot check: the same run always answers the same.
+function M.sampled(id: string, sample: number): boolean
+	if sample >= 100 then
+		return true
+	end
+	local h = 5381
+	for i = 1, #id do
+		h = (h * 33 + string.byte(id, i)) % 2147483647
+	end
+	return h % 100 < sample
+end
+
+-- Whether workflow `id` has a run queued or running.
+local function busy(s: store.Store, id: string): boolean
+	for _, r in s.runs do
+		if r.workflow == id and (r.state == "queued" or r.state == "running") then
+			return true
+		end
+	end
+	return false
+end
+
+-- The evolvers a finished run of a target starts: a bad run through `run_failed` triggers (their
+-- streak), a successful one through `run_succeeded` (sampled, and only while that evolver is idle:
+-- a spot check is never worth a queued or skipped run). Both honour the cooldown and the daily cap
+-- (recorded in the book as fired).
 function M.fire(h: Host, b: Book, run: Run): { Fire }
 	local out: { Fire } = {}
 	local w = h.workflows()
-	if not M.BAD[run.state] or w == nil then
+	local bad = M.BAD[run.state] == true
+	if not bad and run.state ~= "success" or w == nil then
 		return out
 	end
 	local target = w.by_id[run.workflow]
@@ -1136,14 +1347,17 @@ function M.fire(h: Host, b: Book, run: Run): { Fire }
 		return out
 	end
 	local streak = 0
-	for _, r in recent(h.store, target.id, 20, nil) do
-		if not M.BAD[r.state] then
-			break
+	if bad then
+		for _, r in recent(h.store, target.id, 20, nil) do
+			if not M.BAD[r.state] then
+				break
+			end
+			streak += 1
 		end
-		streak += 1
 	end
 	local t = h.now()
 	local today = day_start(t)
+	local dirty = false
 	for _, wf in w.list do
 		if not wf.enabled or wf.evolve == nil or table.find(model.evolve_targets(w, wf), target.id) == nil then
 			continue
@@ -1153,34 +1367,51 @@ function M.fire(h: Host, b: Book, run: Run): { Fire }
 				continue
 			end
 			local rt = tr :: model.RoostTrigger
-			if (#rt.workflows > 0 and table.find(rt.workflows, target.id) == nil) or streak < rt.streak then
+			if #rt.workflows > 0 and table.find(rt.workflows, target.id) == nil then
 				continue
 			end
-			local key = `{wf.id}/{target.id}`
-			local d = b.day[wf.id]
+			if bad then
+				if rt.on ~= "run_failed" or streak < rt.streak then
+					continue
+				end
+			elseif rt.on ~= "run_succeeded" or not M.sampled(run.id, rt.sample) or busy(h.store, wf.id) then
+				continue
+			end
+			-- Spot checks keep their own cooldown and cap: they never hold a failure's repair back.
+			local key = if bad then `{wf.id}/{target.id}` else `{wf.id}/{target.id}/check`
+			local day = if bad then wf.id else `{wf.id}/check`
+			local d = b.day[day]
 			if d == nil or d.start ~= today then
 				d = { start = today, n = 0 }
-				b.day[wf.id] = d
+				b.day[day] = d
 			end
 			local dd = d :: { start: number, n: number }
 			if t - (b.last[key] or -math.huge) < M.COOLDOWN then
-				h.log(run.id, { `[roost] {wf.name} 在冷却中({M.COOLDOWN // 60} 分钟内已为 {target.id} 触发过),这次不触发` })
+				if bad then
+					h.log(run.id, { `[roost] {wf.name} 在冷却中({M.COOLDOWN // 60} 分钟内已为 {target.id} 触发过),这次不触发` })
+				end
 			elseif dd.n >= M.DAILY_FIRES then
-				h.log(run.id, { `[roost] {wf.name} 今天已触发 {dd.n} 次,达到上限,这次不触发` })
+				if bad then
+					h.log(run.id, { `[roost] {wf.name} 今天已触发 {dd.n} 次,达到上限,这次不触发` })
+				end
 			else
 				b.last[key] = t
 				dd.n += 1
+				dirty = true
 				table.insert(out, {
 					workflow = wf,
 					target = target.id,
 					run = run.id,
-					detail = if streak > 1 then `{target.id} 连续 {streak} 次失败` else `{target.id} 失败`,
+					detail = if not bad
+						then `抽查 {target.id} 的成功运行`
+						elseif streak > 1 then `{target.id} 连续 {streak} 次失败`
+						else `{target.id} 失败`,
 				})
 			end
 			break
 		end
 	end
-	if #out > 0 then
+	if dirty then
 		M.save(b)
 	end
 	return out

@@ -902,4 +902,21 @@ do -- an API trigger: a generated token shows once, only its SHA-256 goes into t
 	eq(w.cx.copied[#w.cx.copied], TOK)
 end
 
+do -- a spot-check trigger edits its sample percent (100 is the default and is left out)
+	local w = world({})
+	click(w, "editor-new")
+	view(w)
+	click(w, "roost:run_succeeded")
+	local layer = view(w)
+	truthy(find(layer.layer, function(x)
+		return x.k == "select" and x.p and x.p.value == "100"
+	end), "sample select shows every success by default")
+	local tr = w.st.editor.raw.trigger
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.triggers.t1.card.sample.sel", value = "30" })
+	eq(tr[1].sample, 30)
+	eq(tr[1].streak, nil, "no streak on a spot check")
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.triggers.t1.card.sample.sel", value = "100" })
+	eq(tr[1].sample, nil)
+end
+
 print("ok")

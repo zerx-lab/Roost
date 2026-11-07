@@ -9,7 +9,7 @@ local M = {}
 -- material directory, and the workflow and run that triggered it (empty for scheduled or manual runs).
 M.VARS = {
 	"repo", "event", "action", "number", "title", "body", "url", "ref", "sha", "branch",
-	"sender", "comment", "request", "label", "workflow", "run_id", "trigger", "evolve_dir", "evolve_target", "evolve_run",
+	"sender", "comment", "request", "label", "workflow", "run_id", "tmp", "trigger", "evolve_dir", "evolve_target", "evolve_run",
 }
 
 local KNOWN: { [string]: boolean } = {}

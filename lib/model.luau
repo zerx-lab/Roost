@@ -58,9 +58,17 @@ export type CronTrigger = {
 	ref: string?,
 	line: number?,
 }
--- Fires when a run of a workflow this one evolves (`evolve`) ends badly: `streak` such runs in a
--- row (failed or timed out), optionally only for the listed workflows.
-export type RoostTrigger = { kind: "roost", on: "run_failed", workflows: { string }, streak: number, line: number? }
+-- Fires when a run of a workflow this one evolves (`evolve`) ends: `run_failed`, after `streak`
+-- bad runs in a row (failed or timed out); `run_succeeded`, a spot check of a successful run, taken
+-- for `sample` percent of them. Optionally only for the listed workflows.
+export type RoostTrigger = {
+	kind: "roost",
+	on: "run_failed" | "run_succeeded",
+	workflows: { string },
+	streak: number,
+	sample: number,
+	line: number?,
+}
 -- Started from outside: `POST /hooks/dispatch/<workflow id>` on the relay with the bearer token
 -- whose SHA-256 is `token_sha256` (the token itself is shown once and never stored).
 export type ApiTrigger = { kind: "api", token_sha256: string, line: number? }
@@ -591,20 +599,24 @@ M.TEMPLATES = {
 	{
 		id = "workflow-doctor",
 		name = "工作流自迭代",
-		description = "其他工作流失败时(以及每天凌晨巡检),读运行日志找根因,直接改脚本或提示词;之后的运行变差会自动回滚。",
+		description = "其他工作流失败时找根因、成功时按比例抽查可改进之处(以及每天凌晨巡检),直接改脚本或提示词,需要人处理的写成建议;之后的运行变差会自动回滚。",
 		icon = "repeat",
 		group = "自迭代",
 		raw = {
 			name = "工作流自迭代",
 			icon = "repeat",
 			workspace = "temp",
-			concurrency = "skip",
+			concurrency = "queue",
 			evolve = { "*" },
-			trigger = { { roost = "run_failed" }, { schedule = "daily", time = "04:00" } } :: { any },
+			trigger = {
+				{ roost = "run_failed" },
+				{ roost = "run_succeeded", sample = 30 },
+				{ schedule = "daily", time = "04:00" },
+			} :: { any },
 			step = {
 				{
-					name = "诊断与修复",
-					omp = "你负责让 Roost 的工作流越跑越好。迭代材料在 {{evolve_dir}}:先读 README.md 与 digest.md,失败日志在 logs/。\n\n本次触发的工作流:{{evolve_target}}(运行 {{evolve_run}};为空表示定时巡检,检查所有工作流)。\n\n找出失败或表现差的根因。只有确定原因在工作流的脚本、提示词或 workflow.toml 里时,才在 edit/ 下做最小修改;不要改 base/,不要改 id,不要加 evolve。最后用几句话说明看到了什么、改了什么(或为什么没改)。",
+					name = "诊断与改进",
+					omp = "你负责让 Roost 的工作流越跑越好。迭代材料在 {{evolve_dir}}:先读 README.md 与 digest.md(第一行说明是失败、抽查还是巡检),日志在 logs/,背景在 context/。\n\n本次触发的工作流:{{evolve_target}}(运行 {{evolve_run}};为空表示定时巡检,检查所有工作流)。\n\n失败就找根因;抽查就逐项看这次运行的结论、步骤、耗时、费用、日志与临时数据、调试后的清理,以及能自动化的人工环节。确定改进点在工作流的脚本、提示词或 workflow.toml 里时,才在 edit/ 下做最小修改;系统配置、新的自动化等改不了的写进 {{evolve_dir}}/suggestions.md。不要改 base/,不要改 id,不要加 evolve,不要放宽安全约束。最后用几句话说明看到了什么、改了什么(或为什么没改)。",
 				},
 			},
 		},
@@ -1361,22 +1373,35 @@ end
 
 M.ROOST_KINDS = {
 	{ id = "run_failed", label = "被迭代的工作流运行失败", detail = "当本工作流迭代的工作流连续失败或超时达到次数时触发。" },
+	{
+		id = "run_succeeded",
+		label = "抽查被迭代的工作流",
+		detail = "被迭代的工作流运行成功后按比例抽查,找配置、流程、代码与自动化上可改进的地方;本工作流已有运行在跑或排队时跳过。",
+	},
 }
 
 local function compile_roost(c: Ctx, t: { [string]: any }, path: string, line: number?): RoostTrigger?
-	check_keys(c, t, path, { "roost", "workflows", "streak" })
 	local on = get_string(c, t, "roost", path) or ""
-	if on ~= "run_failed" then
-		issue(c, `{path}.roost`, `未知的 Roost 触发器 "{on}"(可用:run_failed)`, line_of(c, t, "roost") or line)
+	if on ~= "run_failed" and on ~= "run_succeeded" then
+		check_keys(c, t, path, { "roost", "workflows", "streak", "sample" })
+		issue(c, `{path}.roost`, `未知的 Roost 触发器 "{on}"(可用:run_failed、run_succeeded)`, line_of(c, t, "roost") or line)
 		return nil
 	end
+	check_keys(c, t, path, if on == "run_failed" then { "roost", "workflows", "streak" } else { "roost", "workflows", "sample" })
 	local wfs = get_strings(c, t, "workflows", path)
 	for _, id in wfs do
 		if not valid_id(id) then
 			issue(c, `{path}.workflows`, `工作流 id "{id}" 无效`, line_of(c, t, "workflows") or line)
 		end
 	end
-	return { kind = "roost", on = "run_failed", workflows = wfs, streak = get_int(c, t, "streak", path, 1, 1, 20), line = line }
+	return {
+		kind = "roost",
+		on = on :: any,
+		workflows = wfs,
+		streak = if on == "run_failed" then get_int(c, t, "streak", path, 1, 1, 20) else 1,
+		sample = if on == "run_succeeded" then get_int(c, t, "sample", path, 100, 1, 100) else 100,
+		line = line,
+	}
 end
 
 local function compile_api(c: Ctx, t: { [string]: any }, path: string, line: number?): ApiTrigger?
@@ -1901,7 +1926,10 @@ function M.describe_trigger(t: Trigger, omit_repos: boolean?): string
 	end
 	if t.kind == "roost" then
 		local rt = t :: RoostTrigger
-		local s = if rt.streak > 1 then `被迭代的工作流连续 {rt.streak} 次失败` else "被迭代的工作流运行失败"
+		local s = if rt.on == "run_succeeded"
+			then (if rt.sample < 100 then `抽查被迭代的工作流 {rt.sample}% 的成功运行` else "抽查被迭代的工作流的成功运行")
+			elseif rt.streak > 1 then `被迭代的工作流连续 {rt.streak} 次失败`
+			else "被迭代的工作流运行失败"
 		if #rt.workflows > 0 then
 			s ..= ` · {table.concat(rt.workflows, "、")}`
 		end
@@ -2059,7 +2087,7 @@ local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify =
 local SUB_ORDER: { [string]: { string } } = {
 	input = { "name", "description", "default", "required" },
 	trigger = {
-		"roost", "streak",
+		"roost", "streak", "sample",
 		"schedule", "at", "days", "between", "day", "date", "time", "cron", "tz", "repo", "ref",
 		"github", "event", "repos", "authors", "assignees", "actions", "branches", "labels", "label_actions",
 		"conclusions", "workflows", "review_states", "thread_actions", "comment", "handle",

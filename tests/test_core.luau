@@ -2840,6 +2840,71 @@ do -- the material's scope.json is only a hint: a workflow outside `evolve` is n
 	eq(s.env.files[DATA .. "/x"], nil, "no path built from a bogus library name")
 end
 
+local WF_CHECK = (string.gsub(WF_EVOLVE, 'roost = "run_failed"\n', 'roost = "run_failed"\n[[workflow.trigger]]\nroost = "run_succeeded"\n'))
+
+do -- a success is spot-checked (never while the evolver is busy); suggestions are reported and passed on
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_CHECK,
+		[DATA .. "/roost.toml"] = LOCAL .. '# token = "hunter2-commented"\n[runner]\nenv = { X = "hunter2-env" }\n',
+		[DATA .. "/workflows/target/files/run.sh"] = "exit 0\n",
+	})
+	local held: any = nil
+	s.behave = function(p)
+		for _, a in p.cmd do
+			if string.sub(a, -#"/files/run.sh") == "/files/run.sh" then
+				return if s.env.files[a] == "exit 0\n" then "exit:0" else "exit:1"
+			end
+		end
+		if table.concat(p.cmd, " ") == "/bin/sh -c fix" and held == nil then
+			held = p
+			s.env.files[`{DATA}/runs/{p.run}/evolve/suggestions.md`] = "\n把 retention 调短\n证据:运行 x\n"
+			return "running"
+		end
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0, "run_succeeded parses")
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 6)
+	local runs = s.c.store.runs
+	local first, doc = runs[1], runs[2]
+	eq(first.state, "success")
+	truthy(doc and doc.workflow == "doctor", "the success was spot-checked")
+	eq(doc.evolve_run, first.id)
+	eq(doc.trigger.detail, "抽查 target 的成功运行")
+	local dir = `{DATA}/runs/{doc.id}/evolve`
+	truthy(string.find(s.env.files[dir .. "/digest.md"], "触发:抽查", 1, true), "the digest says it is a spot check")
+	truthy(string.find(s.env.files[dir .. "/digest.md"], `logs/{first.id}.txt`, 1, true), "the checked run's log is in the material")
+	local rt = s.env.files[dir .. "/context/roost.toml"]
+	truthy(rt and string.find(rt, 'identity = "local"', 1, true), "roost.toml is context")
+	eq(string.find(rt, "hunter2", 1, true), nil, "no secret leaves roost.toml: " .. rt)
+	truthy(s.env.files[dir .. "/context/repos.md"], "repos are context")
+	truthy(string.find(s.env.files[dir .. "/context/suggestions.md"], "(无)", 1, true), "no earlier suggestions yet")
+
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 6)
+	eq(#s.c.store.runs, 3, "no spot check (not even a skipped run) while the evolver is busy")
+	s.env.files[held.argv[7]] = "0\n"
+	step(s, 4)
+	eq(doc.state, "success")
+	truthy(string.find(s.env.files[`{DATA}/runs/{doc.id}/log.txt`], "把 retention 调短", 1, true), "suggestions logged")
+	local noticed = false
+	for _, n in s.c.notices do
+		noticed = noticed or string.find(n.text, "提出了改进建议:把 retention 调短", 1, true) ~= nil
+	end
+	truthy(noticed, "suggestions noticed")
+
+	s.env.files[DATA .. "/workflows/target/files/run.sh"] = "exit 1\n"
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 8)
+	local fix = last_run(s)
+	eq(fix.workflow, "doctor", "a spot check's cooldown never holds a repair back")
+	eq(fix.trigger.detail, "target 失败")
+	truthy(string.find(s.env.files[`{DATA}/runs/{fix.id}/evolve/digest.md`], "触发:失败", 1, true), "the digest says it failed")
+	local past = s.env.files[`{DATA}/runs/{fix.id}/evolve/context/suggestions.md`]
+	truthy(string.find(past, "把 retention 调短", 1, true) and string.find(past, doc.id, 1, true), "earlier suggestions are passed on")
+end
+
 do -- a revision cut off while it was being applied (half its files written) is undone at the next start
 	local s = scenario({
 		[DATA .. "/workflows.toml"] = WF_EVOLVE,

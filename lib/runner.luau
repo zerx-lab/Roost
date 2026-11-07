@@ -977,6 +977,7 @@ local function template_ctx(r: Runner, run: Run, wf: Workflow, needs_payload: bo
 		label = e.label,
 		workflow = wf.id,
 		run_id = run.id,
+		tmp = `{dir_of(r, run.id)}/tmp`,
 		trigger = run.trigger.kind,
 		input = run.inputs,
 		out = run.outputs or {},

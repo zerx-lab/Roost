@@ -3740,6 +3740,7 @@ function on_finished(c: Core, run: store.Run)
 		if #lines > 0 then
 			runner.log(c.runner, run.id, lines)
 		end
+		evolve.report(h, run, wf.name)
 	end
 	for _, s in run.steps do
 		if s.kind == "upgrade" and s.state == "success" then

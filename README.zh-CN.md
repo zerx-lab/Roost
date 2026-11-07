@@ -122,7 +122,7 @@ omp = """
 - 「作者」的含义:评论、审查事件里是写评论或审查的人,PR、议题事件里是 PR 或议题的作者,push 事件里是推送者。
 - 开关项及默认值:`skip_drafts` 默认开,`include_closed` 默认关,`ignore_bots` 默认开,`ignore_self` 默认开。`ignore_self` 忽略你自己的活动,前提是 `roost.toml` 设了 `[github] login`,或者 App 归你个人所有;把自己(`@me`)写进 `authors` 就会放行你自己的活动。
 - **安全默认值**:议题、评论、PR 这类「用户可写内容」事件,默认只接受 `OWNER`/`MEMBER`/`COLLABORATOR` 作者;设 `associations = ["*"]`(表单「高级」里的「允许外部贡献者」)才对所有人开放。`check_completed`/`workflow_run` 默认拒绝代码来自 fork(或无法确认来源)的事件,设 `forks = true` 才接受。omp 以 yolo 模式运行,放开前请想清楚提示词注入与执行外部代码的风险。
-- **模板**只用于 omp 提示词:`{{repo}} {{event}} {{action}} {{number}} {{title}} {{body}} {{url}} {{ref}} {{sha}} {{branch}} {{sender}} {{comment}} {{label}} {{workflow}} {{run_id}} {{trigger}} {{input.<名>}} {{payload.<路径>}}`(数组下标从 0 开始)。shell 步骤不做模板替换,改读环境变量 `ROOST_*`:`ROOST_REPO`、`ROOST_NUMBER`、`ROOST_SHA`、`ROOST_BRANCH`、`ROOST_SENDER`、`ROOST_URL`、`ROOST_EVENT_PATH`(完整 payload)、`ROOST_INFO_PATH`(归一化事件)、`ROOST_WORKSPACE`、`ROOST_INPUT_<名>` 等,事件文本不会被拼进命令行。
+- **模板**只用于 omp 提示词:`{{repo}} {{event}} {{action}} {{number}} {{title}} {{body}} {{url}} {{ref}} {{sha}} {{branch}} {{sender}} {{comment}} {{label}} {{workflow}} {{run_id}} {{tmp}} {{trigger}} {{input.<名>}} {{payload.<路径>}}`(数组下标从 0 开始;`{{tmp}}` 是本次运行的临时目录,即 shell 步骤的 `$ROOST_TMP`,运行结束即删)。shell 步骤不做模板替换,改读环境变量 `ROOST_*`:`ROOST_REPO`、`ROOST_NUMBER`、`ROOST_SHA`、`ROOST_BRANCH`、`ROOST_SENDER`、`ROOST_URL`、`ROOST_EVENT_PATH`(完整 payload)、`ROOST_INFO_PATH`(归一化事件)、`ROOST_WORKSPACE`、`ROOST_INPUT_<名>` 等,事件文本不会被拼进命令行。
 - **环境变量继承**:shell 步骤以及插件调用的本机工具(`gh`、`omp`)继承你登录 shell 的环境变量,不只是 Tern daemon 的精简环境。插件启动时和之后每 10 分钟,用账户的登录 shell(macOS 取目录服务记录,否则 `$SHELL`,fish 也支持)以 `-l -i -c` 运行一次,读取两个标记之间的 `env -0` 输出,启动文件打印的内容会被忽略;去掉 PWD/OLDPWD/SHLVL/_。结果只保存在内存里。优先级:登录环境 < `[runner] env` < 工作流 `env` < `ROOST_*`;PATH 为 `[runner] extra_path` 加上登录 shell 的 PATH(`env` 里显式设了 PATH 时以它为准)。第一次读取结束前(最多 10 秒),运行不会启动,也不会推进;读取失败会弹出通知,并沿用上一次读到的环境(一次都没读到时用 daemon 的环境)。以 App 身份运行的 shell 步骤不带登录 shell 里的 `GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`(你在 `env` 里显式设的保留);omp 步骤在 Tern 的 agent block 里运行,用的是 Tern 的登录环境,以 App 身份运行时会先 unset 后三个,再换上本次运行的 `GH_TOKEN`。
 - **步骤输出与条件**:shell 步骤可以向 `$ROOST_OUTPUT` 追加 `键=值` 行(键为字母、数字、下划线,值一行),之后的步骤在提示词里用 `{{out.<键>}}`、在 shell 里用 `ROOST_OUT_<键大写>` 读取。步骤加 `when = "out.<键>"` 或 `when = "input.<名>"`(前面加 `!` 取反)时,只有该值为真(非空,且不是 `0`/`false`/`no`)才运行,否则记为「已跳过」并继续下一步。输出 `stop=<原因>` 会在该步骤成功后结束整个运行,运行记为「已跳过」(不弹通知),适合「没有要处理的东西」。`$ROOST_OUTPUT` 只接受普通文件,只在 shell 步骤里提供。
 - **费用与预算**:omp 步骤结束后,插件汇总它会话目录里所有 JSONL(包括子代理)中的 `usage.cost.total` 与 `totalTokens`,记到步骤上,运行详情、步骤表与工作流卡片显示估算费用(按 omp 的标价估算,订阅类 provider 记为 0)。工作流设 `daily_budget = 5`(美元)后,当天(本机时区)该工作流 omp 步骤的累计费用达到预算时,后续 omp 步骤不再启动,运行记为「已跳过」并写明原因。
@@ -259,12 +259,16 @@ key = "logs"
 [[workflow]]
 id = "doctor"
 evolve = ["*"]                     # 或具体 id;不能包括自己,被迭代的工作流不能再有 evolve
-concurrency = "skip"
+concurrency = "queue"              # 失败排队处理;抽查只在迭代者空闲时触发
 
 [[workflow.trigger]]
 roost = "run_failed"               # 被迭代的工作流失败或超时时触发(中断、取消不算)
 streak = 1                         # 连续这么多次才触发
 # workflows = ["triage"]           # 可选:只对这些工作流
+
+[[workflow.trigger]]
+roost = "run_succeeded"            # 抽查:被迭代的工作流运行成功时触发
+sample = 100                       # 抽查比例(1–100,默认 100;同一运行的结果固定)
 
 [[workflow.trigger]]               # 也可以定时巡检
 schedule = "daily"
@@ -274,15 +278,17 @@ time = "04:00"
 omp = "迭代材料在 {{evolve_dir}},先读 README.md……触发的工作流 {{evolve_target}},运行 {{evolve_run}}"
 ```
 
-- 迭代者的每次运行先有一步「准备迭代材料」,写进 `runs/<id>/evolve/`:`digest.md`/`digest.json`(最近 10 次运行、近 7 天健康度、以往修订)、`logs/`(失败日志末尾各 48 KiB)、`base/` 与可编辑的 `edit/`(`workflows/<id>/workflow.toml` + `files/`,以及只被这些工作流使用的文件库)。
+- 迭代者的每次运行先有一步「准备迭代材料」,写进 `runs/<id>/evolve/`:`digest.md`/`digest.json`(第一行写明是失败、抽查还是巡检;最近 10 次运行、近 7 天健康度、以往修订)、`logs/`(触发本次的运行与近期失败运行的日志末尾,各 48 KiB)、`context/`(只读背景:令牌、密钥与 env 值已隐藏的 `roost.toml`,仓库与本机路径,近期迭代运行已提出的建议)、`base/` 与可编辑的 `edit/`(`workflows/<id>/workflow.toml` + `files/`,以及只被这些工作流使用的文件库)。
+- **抽查**:`run_succeeded` 让迭代者复查成功的运行:结论是否正确、步骤是否多余、耗时与费用、日志与临时数据是否冗余、调试后是否清理干净、哪些人工环节能自动化。迭代者已有运行在跑或排队时不触发(连「已跳过」的运行记录都不留),冷却与每日上限与失败修复分开计,不会挡住失败的修复。
 - 运行**成功**结束后,Roost 比较 `edit/` 与 `base/`,和编辑器保存走同一套校验后自动应用;期间被别处改过的工作流跳过,改 id、加 `evolve` 的改动丢弃。每次应用记为一个修订,修订前后的快照在 `revisions/<n>/`。
+- **改进建议**:`edit/` 改不了、需要人处理的(系统配置、新的自动化、Roost 本身的代码等),迭代者写进 `runs/<id>/evolve/suggestions.md`;运行成功后 Roost 把它写进运行日志并弹通知,之后的迭代材料把最近 10 份建议放进 `context/suggestions.md`,避免重复提出。
 - **自动回滚**:之后被改动工作流(和用到被改文件库的工作流)的运行会被观察:至少 2 次失败且失败率比修订前高 25% 以上就恢复修订前的快照(修订后又被别处改过的不自动恢复);观察 5 次运行或 7 天后保留。总览页「自迭代」卡片列出修订,可手动回滚。
-- 防止空转:同一迭代者对同一工作流 30 分钟内只触发一次,每天最多 20 次;迭代者自己的失败不触发;刚被自动回滚的那次失败也不触发。费用用工作流的 `daily_budget` 限制。
-- 模板库「自迭代」组里有现成的「工作流自迭代」。
+- 防止空转:同一迭代者对同一工作流 30 分钟内只触发一次,每天最多 20 次(失败与抽查分开计);迭代者自己的运行不触发;刚被自动回滚的那次失败也不触发。费用用工作流的 `daily_budget` 限制。
+- 模板库「自迭代」组里有现成的「工作流自迭代」(失败修复 + 30% 抽查 + 每日巡检)。迭代者也可以在 Roost 源码的 worktree 里运行并以 `upgrade = true` 结尾,同时改进 Roost 自己的代码(见下)。
 
 **Roost 自升级**:`upgrade = true` 步骤把本次运行 worktree 里的新提交应用到 Roost 自己的插件目录,这是插件唯一会写插件目录的地方,而且只在插件进程外进行。
 
-1. 先克隆插件目录作为源码仓库,并在 `workflows.toml` 声明:`git clone <插件目录> ~/Library/Application\ Support/Tern/plugin-data/roost/repos/roost`,`[repos."local/roost"] path = "<上面的目录>"`、`branch = "main"`。
+1. 先克隆插件目录作为源码仓库,并在 `workflows.toml` 声明:`git clone <插件目录> <plugin-data>/roost/repos/roost`(macOS 是 `~/Library/Application Support/Tern/plugin-data`,Linux 是 `~/.local/state/tern/plugin-data`),`[repos."local/roost"] path = "<上面的目录>"`、`branch = "main"`。
 2. 工作流在这个仓库的 worktree 里运行(`workspace = "worktree"`,`identity = "local"`):omp 步骤改代码、跑 `scripts/check.sh`、`git commit`,最后一步 `upgrade = true`。模板「Roost 自升级」就是这样。
 3. `upgrade` 步骤检查:`tern` 在 PATH 上,提交必须是插件目录当前 HEAD 的后续、插件目录没有未提交的修改且在分支上,然后在一个干净的 worktree 里用**插件当前版本**的 `scripts/check.sh` 检查这个提交(提交改不了评判自己的检查)。通过后交给后台脚本(`upgrade/<运行>.apply.sh`,结束时自删)。
 4. 后台脚本 fast-forward 插件目录,执行 `tern plugin reload roost`,等新版本 host 加载完写出 `boot.txt`;重载失败或 90 秒内没有新的 boot,就 `git reset --keep` 回到旧提交并再重载。结果写进 `upgrades/<运行>.json`,下次启动时以通知报告,总览页「自迭代」卡片也列出最近的升级。
