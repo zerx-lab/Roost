@@ -586,9 +586,10 @@ do -- run_succeeded: sample percent, its own keys, wording, encoding; sampling a
 			.. "'api_key' = 'quoted-k3y'\n"
 			.. 'mirror = "https://bob:pw9xyz@git.example/x"\n'
 			.. 'secret = """\nmulti-line-s3cret\n"""\nafter = 1\n'
+			.. 'tokens = [\n  ["nested-aaa1"],\n  ["nested-bbb2"],\n]\nafter_array = 2\n'
 			.. "[runner]\nenv = { GH_TOKEN = \"t0k\" }\nmax_concurrent = 2\n[runner.env]\nX = \"plain-but-env\"\n[github]\nidentity = \"app\"\n"
 	)
-	for _, leak in { "abc123secret", "old-one", "t0k", "plain-but-env", "quoted-k3y", "pw9xyz", "multi-line-s3cret" } do
+	for _, leak in { "abc123secret", "old-one", "t0k", "plain-but-env", "quoted-k3y", "pw9xyz", "multi-line-s3cret", "nested-aaa1", "nested-bbb2" } do
 		eq(string.find(red, leak, 1, true), nil, `{leak} hidden: {red}`)
 	end
 	for _, keep in {
@@ -598,6 +599,7 @@ do -- run_succeeded: sample percent, its own keys, wording, encoding; sampling a
 		'identity = "app"',
 		'# token = "<已隐藏>"',
 		"after = 1",
+		"after_array = 2",
 		"https://<已隐藏>@git.example/x",
 	} do
 		assert(string.find(red, keep, 1, true), `{keep} kept: {red}`)

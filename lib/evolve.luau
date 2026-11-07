@@ -603,21 +603,37 @@ local function secret_key(key: string): boolean
 	return false
 end
 
--- The closer a value opened on its key line still waits for, if any (a multi-line string or array).
-local function open_value(value: string): string?
-	for _, q in { '"""', "'''" } do
-		local at = string.find(value, q, 1, true)
-		if at == 1 then
-			return if string.find(value, q, 4, true) then nil else q
+-- Bracket depth after `s`, starting from `depth`: `[`/`{` open, `]`/`}` close; brackets inside
+-- one-line strings and after a `#` comment don't count.
+local function bracket_depth(s: string, depth: number): number
+	local i, n = 1, #s
+	while i <= n do
+		local c = string.byte(s, i)
+		if c == 34 or c == 39 then -- " '
+			local j = i + 1
+			while j <= n do
+				local d = string.byte(s, j)
+				if d == 92 and c == 34 then -- \ escapes inside "…"
+					j += 2
+				elseif d == c then
+					break
+				else
+					j += 1
+				end
+			end
+			i = j + 1
+		elseif c == 35 then -- #
+			break
+		else
+			if c == 91 or c == 123 then
+				depth += 1
+			elseif c == 93 or c == 125 then
+				depth -= 1
+			end
+			i += 1
 		end
 	end
-	local first = string.sub(value, 1, 1)
-	if first == "[" and not string.find(value, "]", 1, true) then
-		return "]"
-	elseif first == "{" and not string.find(value, "}", 1, true) then
-		return "}"
-	end
-	return nil
+	return depth
 end
 
 -- roost.toml with every secret value (commented-out ones too, multi-line ones whole, all of an
@@ -625,12 +641,16 @@ end
 function M.redact(text: string): string
 	local out: { string } = {}
 	local in_env = false
-	local closer: string? = nil
+	local quote: string? = nil -- a hidden multi-line string still open
+	local depth = 0 -- a hidden multi-line array or table still open
 	for line in string.gmatch(text .. "\n", "([^\n]*)\n") do
-		if closer then
-			if string.find(line, closer, 1, true) then
-				closer = nil
+		if quote then
+			if string.find(line, quote, 1, true) then
+				quote = nil
 			end
+			continue
+		elseif depth > 0 then
+			depth = bracket_depth(line, depth)
 			continue
 		end
 		local header = string.match(line, "^%s*%[+%s*([^%]]+)%]")
@@ -642,7 +662,13 @@ function M.redact(text: string): string
 		local lead, key, value = string.match(line, "^(%s*#?%s*)([%w_%-\"'%.]+)%s*=%s*(.*)$")
 		if key and (in_env or secret_key(key)) then
 			table.insert(out, `{lead}{key} = "<已隐藏>"`)
-			closer = open_value(value or "")
+			local v = value or ""
+			local q = string.sub(v, 1, 3)
+			if (q == '"""' or q == "'''") and not string.find(v, q, 4, true) then
+				quote = q
+			else
+				depth = math.max(bracket_depth(v, 0), 0)
+			end
 		else
 			table.insert(out, (string.gsub(line, "(%a[%w+.-]*://)[^/%s\"'@]+@", "%1<已隐藏>@")))
 		end
@@ -674,8 +700,22 @@ function M.suggestions(s: store.Store, id: string): string?
 		local ok2, there = pcall(tern.fs.exists, path)
 		return if ok2 and there then `{M.SUGGESTIONS} 超过 {MAX_SUGGESTIONS // 1024} KiB,没有读取:{path}` else nil
 	end
-	local t = util.trim(text)
-	if t == "" or utf8.len(t) == nil then
+	-- Trimmed by scanning, not by a `%s*$` pattern: that is quadratic on long blank runs, and the
+	-- agent that writes this file reads untrusted text.
+	local first = string.find(text, "%S")
+	if first == nil then
+		return nil
+	end
+	local last = #text
+	while last > first do
+		local b = string.byte(text, last)
+		if b ~= 32 and (b < 9 or b > 13) then
+			break
+		end
+		last -= 1
+	end
+	local t = string.sub(text, first, last)
+	if utf8.len(t) == nil then
 		return nil
 	end
 	return util.clip(t, SUGGESTION_CHARS)
