@@ -418,11 +418,69 @@ local function recent(s: store.Store, id: string, n: number, before: number?): {
 	return out
 end
 
+-- A patrol (an evolver run no target's run started) covers what finished since the previous
+-- successful patrol of the same evolver and trigger kind was due (for the 04:00 schedule: from the
+-- last 04:00 to this one), or the day before when there was none; never more than PATROL_SPAN back.
+M.PATROL_SPAN = 7 * 86400
+M.WINDOW_RUNS = 50
+function M.patrol_window(s: store.Store, run: Run): (number?, number?)
+	if run.evolve_target then
+		return nil, nil
+	end
+	local to = run.created_at
+	local from = to - 86400
+	for i = #s.runs, 1, -1 do
+		local r = s.runs[i]
+		if
+			r.id ~= run.id
+			and r.workflow == run.workflow
+			and r.evolve_target == nil
+			and r.state == "success"
+			and r.trigger.kind == run.trigger.kind
+			and r.created_at < to
+		then
+			from = r.created_at
+			break
+		end
+	end
+	return math.max(from, to - M.PATROL_SPAN), to
+end
+
+-- Finished runs of `id` (any outcome, skipped and cancelled too) that ended in [from, to), newest
+-- first, at most `n`; and how many there were in all, by state.
+local function in_window(s: store.Store, id: string, from: number, to: number, n: number): ({ Run }, { [string]: number })
+	local out: { Run } = {}
+	local by: { [string]: number } = {}
+	for i = #s.runs, 1, -1 do
+		local r = s.runs[i]
+		local at = r.finished_at or r.started_at or r.created_at
+		if r.workflow == id and store.TERMINAL[r.state] and at >= from and at < to then
+			by[r.state] = (by[r.state] or 0) + 1
+			if #out < n then
+				table.insert(out, r)
+			end
+		end
+	end
+	return out, by
+end
+
+-- The runs a digest lists for `id`: a patrol's window (with its counts by state), or the latest
+-- counted runs.
+local function listed(s: store.Store, run: Run, id: string): ({ Run }, { [string]: number }?)
+	local from, to = M.patrol_window(s, run)
+	if from and to then
+		return in_window(s, id, from, to, M.WINDOW_RUNS)
+	end
+	return recent(s, id, M.RECENT, nil), nil
+end
+
 local STATE_TEXT: { [string]: string } = {
 	success = "成功",
 	failed = "失败",
 	timed_out = "超时",
 	interrupted = "中断",
+	skipped = "跳过",
+	cancelled = "取消",
 }
 
 local function md_cell(s: string): string
@@ -442,7 +500,7 @@ local README = [==[
 
 - **失败**:被迭代的工作流运行失败或超时。找根因,能在下面的文件里修就修。
 - **抽查**:被迭代的工作流运行成功,抽出来复查。逐项看这次运行的结果与过程是否有可改进的地方:结论是否正确、有没有多余或重复的步骤与费用、耗时、日志与临时数据是否冗余、调试后是否清理干净、哪些人工环节可以自动化。没有值得改的就什么都不改。
-- **巡检**:定时运行,没有指定运行,看所有工作流近期的整体表现。
+- **巡检**:定时运行,没有指定运行。范围是上一次巡检到这一次之间结束的**全部**运行(包括成功、跳过、取消的;每天 04:00 的巡检就是上一个 04:00 到这一个 04:00),`digest.md` 第一行写明起止时间,各工作流下列出范围内的运行与按结果的计数,`logs/` 是范围内失败运行的日志。逐个看这些运行的结论与过程,再看整体的成功率、耗时与费用、反复出现的问题、可以合并或删掉的步骤;近 7 天的数字只作趋势参考。
 
 ## 目录
 
@@ -486,7 +544,12 @@ local function digest_md(h: Host, b: Book, run: Run, ids: { string }, w: model.W
 		local how = if src and src.state == "success" then "抽查:成功" else "失败:" .. (if src then STATE_TEXT[src.state] or src.state else "失败")
 		table.insert(out, `触发:{how} · {run.evolve_target} 的运行 {run.evolve_run or "?"}`)
 	else
-		table.insert(out, `触发:巡检 · {run.trigger.kind} · {run.trigger.detail}`)
+		local from, to = M.patrol_window(h.store, run)
+		table.insert(
+			out,
+			`触发:巡检 · {run.trigger.kind} · {run.trigger.detail} · 范围:{util.clock(from :: number)} 至 {util.clock(to :: number)}(上一次巡检到这一次之间结束的运行)`
+		)
+		table.insert(out, `完整日志:{store.run_dir(h.store, "<运行 id>")}/log.txt(只读)`)
 	end
 	for _, id in ids do
 		local wf = w.by_id[id]
@@ -504,7 +567,20 @@ local function digest_md(h: Host, b: Book, run: Run, ids: { string }, w: model.W
 		else
 			table.insert(out, "- 近 7 天没有运行")
 		end
-		local list = recent(h.store, id, M.RECENT, nil)
+		local list, by = listed(h.store, run, id)
+		if by then
+			local total = 0
+			local parts: { string } = {}
+			for st, n in by do
+				total += n
+				table.insert(parts, `{STATE_TEXT[st] or st} {n}`)
+			end
+			table.sort(parts)
+			table.insert(
+				out,
+				`- 巡检范围内结束 {total} 次{if #parts > 0 then ":" .. table.concat(parts, ",") else ""}{if total > #list then `(下表只列最近 {#list} 次)` else ""}`
+			)
+		end
 		if #list > 0 then
 			table.insert(out, "")
 			table.insert(out, "| 运行 | 结果 | 原因 | 触发 | 开始 | 用时 |")
@@ -513,7 +589,7 @@ local function digest_md(h: Host, b: Book, run: Run, ids: { string }, w: model.W
 				local took = stats.took(r)
 				table.insert(
 					out,
-					`| {r.id} | {STATE_TEXT[r.state] or r.state} | {md_cell(r.reason or "")} | {r.trigger.kind} | {util.clock(r.started_at)} | {if took then util.fmt_duration(took) else "—"} |`
+					`| {r.id} | {STATE_TEXT[r.state] or r.state} | {md_cell(r.reason or "")} | {r.trigger.kind} | {util.clock(r.started_at or r.created_at)} | {if took then util.fmt_duration(took) else "—"} |`
 				)
 			end
 		end
@@ -549,9 +625,10 @@ local function digest_json(h: Host, run: Run, ids: { string }, libs: { string },
 	local t = h.now()
 	local health = stats.health(h.store.runs, t, 7)
 	local targets: { any } = {}
+	local from, to = M.patrol_window(h.store, run)
 	for _, id in ids do
 		local runs: { any } = {}
-		for _, r in recent(h.store, id, M.RECENT, nil) do
+		for _, r in (listed(h.store, run, id)) do
 			local steps: { any } = {}
 			for _, s in r.steps do
 				table.insert(steps, { name = s.name, kind = s.kind, state = s.state, exit_code = s.exit_code })
@@ -580,6 +657,7 @@ local function digest_json(h: Host, run: Run, ids: { string }, libs: { string },
 		run = run.id,
 		target = run.evolve_target,
 		target_run = run.evolve_run,
+		window = if from then { from = from, to = to } else nil,
 		workflows = tern.json.array(table.move(ids, 1, #ids, 1, {})),
 		libraries = tern.json.array(table.move(libs, 1, #libs, 1, {})),
 		targets = tern.json.array(targets),
@@ -853,7 +931,7 @@ function M.prepare(h: Host, b: Book, run: Run, wf: Workflow): ({ string }, strin
 	end
 	for _, id in ids do
 		local n = 0
-		for _, r in recent(h.store, id, M.RECENT, nil) do
+		for _, r in (listed(h.store, run, id)) do
 			if n >= M.LOGS_PER_TARGET then
 				break
 			end

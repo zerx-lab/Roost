@@ -2937,6 +2937,37 @@ do -- a roost trigger's `daily` caps how often it starts the evolver in a day
 	truthy(string.find(s.env.files[`{DATA}/runs/{second.id}/log.txt`], "达到上限 1", 1, true), "the cap was logged")
 end
 
+do -- a patrol covers what finished since the previous successful patrol, nothing before it
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = WF_EVOLVE,
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/target/files/run.sh"] = "exit 0\n",
+	})
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 3)
+	local before = last_run(s)
+	eq(s.core.dispatch(s.c, "doctor"), nil)
+	step(s, 4)
+	local p1 = last_run(s)
+	eq(p1.workflow, "doctor")
+	eq(p1.state, "success")
+	truthy(string.find(s.env.files[`{DATA}/runs/{p1.id}/evolve/digest.md`], before.id, 1, true), "the first patrol (no previous one) covers the day before")
+	s.now += 3600
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 3)
+	local after = last_run(s)
+	s.now += 3600
+	eq(s.core.dispatch(s.c, "doctor"), nil)
+	step(s, 4)
+	local p2 = last_run(s)
+	local digest = s.env.files[`{DATA}/runs/{p2.id}/evolve/digest.md`]
+	truthy(string.find(digest, "触发:巡检", 1, true) and string.find(digest, "范围:", 1, true), "the window is stated")
+	truthy(string.find(digest, after.id, 1, true), "a run since the previous patrol is listed")
+	eq(string.find(digest, before.id, 1, true), nil, "a run the previous patrol covered is not")
+	truthy(string.find(digest, "巡检范围内结束 1 次:成功 1", 1, true), "counted by outcome: " .. digest)
+end
+
 do -- a revision cut off while it was being applied (half its files written) is undone at the next start
 	local s = scenario({
 		[DATA .. "/workflows.toml"] = WF_EVOLVE,

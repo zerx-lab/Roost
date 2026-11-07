@@ -557,6 +557,30 @@ do -- run_succeeded: sample percent, its own keys, wording, encoding; sampling a
 	eq(model.describe_trigger(rt), "抽查被迭代的工作流 30% 的成功运行")
 	local all = model.parse_workflows(base .. '[[workflow.step]]\nrun = "true"\n') :: model.Workflows
 	eq((all.by_id.d.triggers[1] :: model.RoostTrigger).sample, 100, "every success by default")
+	do
+		local T = 1793880000
+		local function r(id: string, wf: string, state: string, kind: string, at: number, target: string?): any
+			return { id = id, workflow = wf, state = state, trigger = { kind = kind }, created_at = at, evolve_target = target, steps = {} }
+		end
+		local now = r("p3", "d", "running", "cron", T)
+		local s: any = { runs = { now } }
+		local from, to = evolve.patrol_window(s, now)
+		eq(to, T)
+		eq(from, T - 86400, "no earlier patrol: the day before")
+		s.runs = {
+			r("p0", "d", "success", "cron", T - 3 * 86400),
+			r("p1", "d", "failed", "cron", T - 2 * 86400), -- failed: its window rolls into this one
+			r("m", "d", "success", "manual", T - 3600), -- a manual patrol is not the last 04:00
+			r("c", "d", "success", "cron", T - 1800, "a"), -- a failure repair is no patrol
+			now,
+		}
+		from = evolve.patrol_window(s, now)
+		eq(from, T - 3 * 86400, "from the last successful scheduled patrol")
+		s.runs[1].created_at = T - 30 * 86400
+		from = evolve.patrol_window(s, now)
+		eq(from, T - evolve.PATROL_SPAN, "at most PATROL_SPAN back")
+		eq((evolve.patrol_window(s, r("x", "d", "running", "cron", T, "a"))), nil, "not a patrol")
+	end
 	eq((all.by_id.d.triggers[1] :: model.RoostTrigger).daily, model.ROOST_DAILY, "default daily cap")
 	local capped = model.parse_workflows(base .. 'daily = 1\n[[workflow.step]]\nrun = "true"\n') :: model.Workflows
 	eq(model.describe_trigger(capped.by_id.d.triggers[1]), "抽查被迭代的工作流的成功运行 · 每天最多 1 次")
