@@ -351,7 +351,7 @@ do -- a queued run cancelled from the row menu; j/k move the selection
 	eq(w.st.closed, true)
 end
 
-do -- an agent step row opens its session; the link shows the live agent, then resumes the saved one
+do -- an agent step opens its session beside the console or where it lives; live agent, then the saved one
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	local win = w.env.window()
 	w.env.wcx = win.cx
@@ -380,34 +380,61 @@ do -- an agent step row opens its session; the link shows the live agent, then r
 	eq(steps_rows(plain.id)[1].menu, nil, "a shell step has no session")
 	w.ui.event(w.st, { ev = "activate", id = "main.body.runs.detail.steps", item = "s1" })
 	eq(#w.cx.opened, 0, "double-clicking a shell step opens nothing")
-	eq(steps_rows(run.id)[1].menu[1], "open-session")
+	eq(table.concat(steps_rows(run.id)[1].menu, "|"), "分屏打开|在 Roost 会话中打开", "a working step offers both ways")
 	w.ui.event(w.st, { ev = "activate", id = "main.body.runs.detail.steps", item = "s1" })
 	local url = w.cx.opened[1]
-	eq(url, `roost://session/{run.id}/1`)
-	w.ui.event(w.st, { ev = "action", id = "main.body.runs.detail.steps", act = "open-session", item = "s1" })
-	eq(w.cx.opened[2], url, "the row menu opens the same session")
+	eq(url, `roost://session/{run.id}/1/split`, "double-click opens it beside the console")
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.detail.steps", act = "在 Roost 会话中打开", item = "s1" })
+	local home = w.cx.opened[2]
+	eq(home, `roost://session/{run.id}/1/tab`, "the row menu can open it where it lives")
+	local menu = find(view(w).main, function(x)
+		return x.k == "menu" and x.p and x.p.key == "how"
+	end)
+	eq(menu.p.items[1].id, `sess-split:{run.id}:1`)
+	w.ui.event(w.st, { ev = "action", id = "main.body.runs.detail.tools.session.how", act = menu.p.items[2].id })
+	eq(w.cx.opened[3], home, "the detail's menu names the same ways")
 
 	local pane = win.started[1].pane
 	win.focused = 1
 	local function link(u: string): any
 		return { url = u, pane = 1, mods = { cmd = false, alt = false, shift = false, ctrl = false } }
 	end
+	local sdir = `{DATA}/runs/{run.id}/s1.session`
+	local agent_tab = win.panes[pane].tab
 	eq(launcher.route(L, win.cx, link(url)), true)
-	eq(win.focused, pane, "a running session jumps to its agent")
+	eq(win.toasts[#win.toasts].text, "还不能只读查看", "no session file yet: nothing to follow")
+	eq(win.focused, pane, "so the agent is shown where it lives")
 	eq(win.shown, win.sessions[2].id, "in the Roost session")
 	eq(win.sessions[2].name, "Roost")
+	local live = `{sdir}/2026-11-05T00-00-00-000Z_01a1-live.jsonl`
+	w.env.files[live] = "{}\n"
+	win.focused = 1
+	launcher.route(L, win.cx, link(url))
+	local viewer = win.opened[#win.opened]
+	truthy(string.find(viewer.command, "collab list --json", 1, true), viewer.command)
+	truthy(string.find(viewer.command, "roost 01a1-live omp", 1, true), "it follows this step's session: " .. viewer.command)
+	local vpane = win.focused
+	eq(win.panes[vpane].split.target, 1, "split: a viewer beside the console")
+	eq(win.panes[pane].tab, agent_tab, "the agent itself stays in its tab")
+	win.cx.layout:close(vpane)
+	tick(1)
+	eq(run.state, "running", "closing the viewer leaves the step running")
+	launcher.route(L, win.cx, link(home))
+	eq(win.focused, pane, "tab: the agent itself")
+	w.env.files[live] = nil
 
 	win.reply(pane, "ok")
 	tick(3)
 	eq(run.state, "success")
 	launcher.route(L, win.cx, link(url))
-	eq(win.toasts[1].text, "这一步没有保存的 omp 会话", "nothing to resume yet")
-	local sdir = `{DATA}/runs/{run.id}/s1.session`
+	eq(win.toasts[#win.toasts].text, "这一步没有保存的 omp 会话", "nothing to resume yet")
 	w.env.files[`{sdir}/2026-11-06T01-00-00-000Z_b.jsonl`] = "{}\n"
 	w.env.files[`{sdir}/2026-11-06T00-00-00-000Z_a.jsonl`] = "{}\n"
 	w.env.files[`{sdir}/.2026-11-06T01-00-00-000Z_b.jsonl.lock.os`] = ""
+	win.focused = 1
+	local before = #win.opened
 	launcher.route(L, win.cx, link(url))
-	local opened = win.opened[1]
+	local opened = win.opened[before + 1]
 	eq(opened.command, `omp --session-dir {sdir} --resume {sdir}/2026-11-06T01-00-00-000Z_b.jsonl`, "newest session resumed")
 	eq(opened.cwd, "/home/test", "the temp workspace is gone: home instead")
 	local resumed = win.focused
@@ -415,6 +442,17 @@ do -- an agent step row opens its session; the link shows the live agent, then r
 	eq(win.panes[resumed].tab, win.panes[1].tab, "in the console's tab")
 	eq(win.panes[resumed].split.target, 1, "split beside the console the link came from")
 	eq(win.panes[resumed].split.dir, "right")
+	eq(table.concat(steps_rows(run.id)[1].menu, "|"), "分屏打开|在新标签页打开", "an ended step resumes in a split or a tab")
+	launcher.route(L, win.cx, link(home))
+	local tabbed = win.opened[before + 2]
+	eq(tabbed.command, opened.command, "tab: the same session resumed")
+	for p, x in win.panes do
+		if x.launch == tabbed then
+			eq(x.split, nil, "in a tab of its own")
+			eq(win.panes[p].tab ~= win.panes[1].tab, true)
+		end
+	end
+	eq(#win.opened, before + 2)
 
 	-- The log opens as a glimpse; a run without one says so.
 	eq(launcher.route(L, win.cx, link(`roost://log/{run.id}`)), true)

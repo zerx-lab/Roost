@@ -346,10 +346,12 @@ do -- agent command lines survive spaces and quotes; roost:// links round-trip
 	local dir = "/Users/me/Library/Application Support/Tern/plugin-data/roost/runs/ab12/s1.session"
 	eq(agent.command("omp", dir, { "--model", "it's" }), `omp --session-dir '{dir}' --model 'it'\\''s'`)
 	eq(agent.quote(""), "''", "an empty argument stays an argument")
-	local r = agent.parse_url(agent.session_url("ab12", 3)) :: any
+	local r = agent.parse_url(agent.session_url("ab12", 3, "tab")) :: any
 	eq(r.run, "ab12")
 	eq(r.step, 3)
-	eq(agent.parse_url("roost://session/../../x/1"), nil, "only hex run ids")
+	eq(r.how, "tab", "the way to open it travels with the link")
+	eq(agent.parse_url("roost://session/ab12/3/float"), nil, "only known ways")
+	eq(agent.parse_url("roost://session/../../x/1/split"), nil, "only hex run ids")
 	local lr = agent.parse_url(agent.log_url("ab12")) :: any
 	eq(lr.run, "ab12")
 	eq(lr.step, nil, "a log link names no step")

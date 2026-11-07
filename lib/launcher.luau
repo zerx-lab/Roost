@@ -623,41 +623,72 @@ local function session_of(cx: WindowCx, pane: number): number?
 	return nil
 end
 
--- Shows step `step` of run `run`: its agent while it runs (in its own tab: moving it out would
--- tie the step to a pane the user closes at will), else its saved conversation resumed in a
--- split beside `over` (the console the link came from).
-local function show_session(L: Launcher, cx: WindowCx, run: string, step: number, over: number?)
+-- Shows working agent `pane` in its tab of the Roost session, moving it back there first when it
+-- was moved out (into a split beside the console, say).
+local function at_home(cx: WindowCx, pane: number, job: agent.Job?)
+	local sid = session_of(cx, pane)
+	local home = if job then roost_session(cx, job.session, job.cwd) else nil
+	if home and sid ~= home then
+		local ok, tab = pcall(function(): number?
+			return (cx.layout:move_to_new_tab(pane, home, { focus = false }))
+		end)
+		if ok and tab then
+			cx.layout:name_tab(tab :: number, (job :: agent.Job).title)
+			sid = home
+		end
+	end
+	if sid then
+		cx.sessions:switch(sid)
+	end
+	cx.layout:focus(pane)
+end
+
+-- Opens `launch` beside `over` (the console the link came from) for "split", else (or with
+-- nothing to split) in a tab of its own named `title`.
+local function open_beside(cx: WindowCx, launch: Launch, how: agent.How, over: number?, title: string)
+	local target = if how == "split" then over or cx.session:focused() else nil
+	local opened = if target then cx.layout:split(target, "right", launch, { focus = true }) else nil
+	if opened == nil then
+		local tabbed = cx.layout:new_tab(launch)
+		if tabbed then
+			name_tab(cx, tabbed, title)
+		end
+	end
+end
+
+-- Shows step `step` of run `run`. While it works: for "split", a view-only collab viewer of its
+-- agent beside `over` (the console the link came from), which closes without touching the step;
+-- for "tab", the agent itself in its tab of the Roost session. Once it ended: its saved
+-- conversation resumed beside `over`, or in a new tab.
+local function show_session(L: Launcher, cx: WindowCx, run: string, step: number, how: agent.How, over: number?)
 	local files = files_of(L, run, step)
+	local job = agent.read_job(files.job)
+	local file = agent.session_file(files.session)
 	local pane = agent.read_number(files.pane)
 	if pane and not tern.fs.exists(files.exit) then
 		local agents = agent_map(cx)
 		if agents and agents[pane] then
-			local sid = session_of(cx, pane)
-			if sid then
-				cx.sessions:switch(sid)
+			local sid = if file then agent.session_id(file :: string) else nil
+			if how == "split" and job and sid then
+				local j = job :: agent.Job
+				local cwd = if tern.fs.exists(j.cwd) then j.cwd else (tern.getenv("HOME") or "/")
+				open_beside(cx, { cwd = cwd, command = agent.view_command(j.omp, sid :: string) }, how, over, `只读 · {j.title}`)
+				return
 			end
-			cx.layout:focus(pane)
+			if how == "split" then
+				cx:toast("info", "还不能只读查看", "omp 还没写出会话文件,已改为跳到它在 Roost 会话里的标签页")
+			end
+			at_home(cx, pane, job)
 			return
 		end
 	end
-	local file = agent.session_file(files.session)
-	local job = agent.read_job(files.job)
 	if file == nil or job == nil then
 		cx:toast("info", "这一步没有保存的 omp 会话", "可能还没开始,或 omp 没有写入会话文件")
 		return
 	end
 	local j = job :: agent.Job
 	local cwd = if tern.fs.exists(j.cwd) then j.cwd else (tern.getenv("HOME") or "/")
-	local launch = { cwd = cwd, command = agent.resume_command(j.omp, files.session, file :: string) }
-	local target = over or cx.session:focused()
-	local opened = if target then cx.layout:split(target, "right", launch, { focus = true }) else nil
-	if opened == nil then
-		-- Nothing to split: a tab of its own.
-		local tabbed = cx.layout:new_tab(launch)
-		if tabbed then
-			name_tab(cx, tabbed, `↺ {j.title}`)
-		end
-	end
+	open_beside(cx, { cwd = cwd, command = agent.resume_command(j.omp, files.session, file :: string) }, how, over, `↺ {j.title}`)
 end
 
 -- Shows run `run`'s log in a glimpse: over the whole tab until the next click outside it.
@@ -678,7 +709,7 @@ function M.route(L: Launcher, cx: WindowCx, link: LinkRequest): boolean
 	end
 	local ok, err = pcall(function(): string?
 		if r.step then
-			show_session(L, cx, r.run, r.step, link.pane)
+			show_session(L, cx, r.run, r.step, r.how or "split", link.pane)
 		else
 			show_log(L, cx, r.run)
 		end

@@ -953,6 +953,56 @@ local BAR_TOKEN: { [string]: string } = {
 	skipped = "muted",
 }
 
+-- The ways to open an agent step's session: beside the console (a working agent as a view-only
+-- collab viewer, closed at will), or where it lives. A step row's right-click sends these names as
+-- its act; the detail's menu sends `sess-split|sess-tab:<run>:<i>`.
+local OPEN_SPLIT = "分屏打开"
+local OPEN_HOME = "在 Roost 会话中打开"
+local OPEN_TAB = "在新标签页打开"
+
+local function session_items(r: store.Run, i: number): { any }
+	local working = r.steps[i].state == "running"
+	return {
+		{
+			id = `sess-split:{r.id}:{i}`,
+			label = OPEN_SPLIT,
+			icon = "columns",
+			detail = if working
+				then "在控制台右侧只读实时查看;关掉分屏不影响这一步"
+				else "在控制台右侧续开这一步的会话",
+		},
+		{
+			id = `sess-tab:{r.id}:{i}`,
+			label = if working then OPEN_HOME else OPEN_TAB,
+			icon = "tabs-h",
+			detail = if working
+				then "跳到它在 Roost 会话里的标签页(可以操作;关掉会结束这一步)"
+				else "在新标签页续开这一步的会话",
+		},
+	}
+end
+
+-- The detail's session control: a click opens it beside the console, the chevron offers the ways.
+local function session_tools(r: store.Run, i: number): Node
+	local working = r.steps[i].state == "running"
+	return N("row", { key = "session", gap = "xs", align = "center" }, {
+		btn("omp 会话", `session={r.id}:{i}`, {
+			icon = "omp",
+			variant = "quiet",
+			key = "open",
+			title = if working then "在控制台右侧分屏只读查看运行中的 agent" else "在控制台右侧分屏续开会话",
+		}),
+		N("menu", {
+			key = "how",
+			icon = "chev",
+			trigger = "quiet",
+			size = "sm",
+			title = "omp 会话的打开方式",
+			items = session_items(r, i),
+		}),
+	})
+end
+
 -- A run's steps as a waterfall (a trace's spans): each bar starts where its step started within
 -- the run and is as long as the step took.
 local function steps_table(r: store.Run, t: number): Node
@@ -1001,8 +1051,9 @@ local function steps_table(r: store.Run, t: number): Node
 				bar,
 				duration(s.started_at, s.finished_at)
 			),
-			title = if s.agent then "双击打开 omp 会话:运行中的跳到其标签页,已结束的续开会话" else nil,
-			menu = if s.agent then { "open-session" } else nil,
+			title = if s.agent then "双击在控制台右侧分屏打开 omp 会话;右键选择打开方式" else nil,
+			-- Table row menus take plain names (the act, and its label).
+			menu = if s.agent then { OPEN_SPLIT, if s.state == "running" then OPEN_HOME else OPEN_TAB } else nil,
 		})
 	end
 	return keyed(
@@ -1180,7 +1231,7 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 	for i = #r.steps, 1, -1 do
 		local s = r.steps[i]
 		if s.agent then
-			table.insert(tools, btn("omp 会话", `session={r.id}:{i}`, { icon = "omp", variant = "quiet", key = "session" }))
+			table.insert(tools, session_tools(r, i))
 			break
 		end
 	end
@@ -3300,14 +3351,21 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		st.cx:toast("success", `已复制运行 ID {target}`)
 	elseif act == "log-wrap" then
 		st.log_wrap = not st.log_wrap
-	elseif (act == "session" or act == "open-session") and target then
-		-- The detail's button names `<run>:<i>`; a step row's menu names `s<i>` of the shown run.
+	elseif (act == "session" or act == OPEN_SPLIT or act == OPEN_HOME or act == OPEN_TAB) and target then
+		-- The detail's button names `<run>:<i>`; a step row (double-click, right-click) names `s<i>`
+		-- of the shown run.
 		local run, i = string.match(target, "^(%x+):(%d+)$")
 		if run == nil then
 			run, i = st.run_id, string.match(target, "^s(%d+)$")
 		end
 		if run and i then
-			st.cx:open(agent.session_url(run, tonumber(i) :: number))
+			st.cx:open(agent.session_url(run, tonumber(i) :: number, if act == "session" or act == OPEN_SPLIT then "split" else "tab"))
+		end
+	elseif string.match(act, "^sess%-%l+:") then
+		-- The detail's open-mode menu: `sess-split|sess-tab:<run>:<i>`.
+		local how, run, i = string.match(act, "^sess%-(%l+):(%x+):(%d+)$")
+		if (how == "split" or how == "tab") and run and i then
+			st.cx:open(agent.session_url(run, tonumber(i) :: number, how :: agent.How))
 		end
 	elseif act == "open-ws" and target then
 		local r = c.store.by_id[target]

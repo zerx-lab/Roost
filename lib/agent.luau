@@ -110,6 +110,41 @@ function M.resume_command(omp: string, session_dir: string, file: string): strin
 	return join({ omp, "--session-dir", session_dir, "--resume", file })
 end
 
+-- The `--config` overlay an agent step starts with: omp hosts its session for view-only collab
+-- (through `collab.relayUrl`, the link carrying the key), so a viewer can follow it live.
+M.COLLAB_CONFIG = "collab:\n  autoStart: view\n"
+
+-- Finds the collab host of session `$1` (the id in its file name) with `$2 collab list --json`,
+-- waiting up to 15 s for it to connect, and joins it view-only. Leaving the viewer leaves the
+-- host running. On failure it says why and waits for Enter.
+M.VIEW_SCRIPT = [[
+sid=$1 omp=$2 id=
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+	id=$("$omp" collab list --json 2>/dev/null | awk -F'"' -v s="$sid" '$2 == "instanceId" { i = $4 } $2 == "sessionId" && $4 == s { print i; exit }')
+	[ -n "$id" ] && break
+	sleep 1
+done
+url=
+[ -n "$id" ] && url=$("$omp" collab link "$id" --view --json 2>/dev/null | awk -F'"' '$2 == "url" { print $4; exit }')
+if [ -z "$url" ]; then
+	echo "[roost] 找不到这一步的 omp collab 主机:它可能早于只读查看功能启动,或还没连上 collab 中转。"
+	echo "[roost] 可以改用「在 Roost 会话中打开」。按回车关闭。"
+	read -r _
+	exit 1
+fi
+exec "$omp" join "$url"
+]]
+
+-- The command line that follows a working step's agent read-only (M.VIEW_SCRIPT).
+function M.view_command(omp: string, session_id: string): string
+	return join({ "/bin/sh", "-c", M.VIEW_SCRIPT, "roost", session_id, omp })
+end
+
+-- The session id in an omp session file's name (`<time>_<id>.jsonl`).
+function M.session_id(file: string): string?
+	return string.match(file, "_([%w%-]+)%.jsonl$")
+end
+
 -- The step's session file: the newest `*.jsonl` omp wrote straight into its --session-dir (names
 -- start with the start time); nil when it saved none.
 function M.session_file(dir: string): string?
@@ -170,22 +205,26 @@ function M.describe(code: number): string
 	return DESCRIBE[code] or `退出码 {code}`
 end
 
+-- How a step's session opens: beside the console the link came from, or where it lives (a
+-- working agent in its tab of the Roost session, an ended one resumed in a new tab).
+export type How = "split" | "tab"
+
 -- Links the console hands to the window (`cx:open` → `tern.route.link`).
-function M.session_url(run: string, step: number): string
-	return `{M.SCHEME}session/{run}/{step}`
+function M.session_url(run: string, step: number, how: How): string
+	return `{M.SCHEME}session/{run}/{step}/{how}`
 end
 
 function M.log_url(run: string): string
 	return `{M.SCHEME}log/{run}`
 end
 
--- `step` nil: the run's log.
-export type Route = { run: string, step: number? }
+-- `step` nil: the run's log (no `how`).
+export type Route = { run: string, step: number?, how: How? }
 
 function M.parse_url(url: string): Route?
-	local run, step = string.match(url, "^roost://session/([%x]+)/(%d+)$")
-	if run and step then
-		return { run = run, step = tonumber(step) :: number }
+	local run, step, how = string.match(url, "^roost://session/([%x]+)/(%d+)/(%l+)$")
+	if run and step and (how == "split" or how == "tab") then
+		return { run = run, step = tonumber(step) :: number, how = how :: How }
 	end
 	local log = string.match(url, "^roost://log/([%x]+)$")
 	if log then

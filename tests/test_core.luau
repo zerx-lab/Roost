@@ -264,7 +264,8 @@ do -- cron fires once per matching minute; the omp step runs as an agent tab in 
 	eq(#w.started, 1, "the window opened one agent")
 	local started = w.started[1]
 	local dir = `{DATA}/runs/{run.id}`
-	eq(started.opts.command, `omp --session-dir {dir}/s2.session --approval-mode yolo`, "omp keeps its session in the run")
+	eq(started.opts.command, `omp --session-dir {dir}/s2.session --approval-mode yolo --config {dir}/s2.collab.yml`, "omp keeps its session in the run")
+	eq(s.env.files[`{dir}/s2.collab.yml`], "collab:\n  autoStart: view\n", "and hosts it for view-only collab")
 	eq(started.opts.prompt, `Summarize cron run {run.id}`, "prompt rendered")
 	eq(started.opts.cwd, `{dir}/work`)
 	eq(started.opts.how, "tab")

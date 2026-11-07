@@ -1747,6 +1747,13 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 				table.insert(args, "--model")
 				table.insert(args, step.model)
 			end
+			-- A view-only collab host: the console's split joins it (`omp join`) as a viewer, which
+			-- closes without touching the step.
+			local collab = `{d}/s{i}.collab.yml`
+			if pcall(tern.fs.write, collab, agent.COLLAB_CONFIG) then
+				table.insert(args, "--config")
+				table.insert(args, collab)
+			end
 			local command: string? = if app_missing(r, run) then nil else agent.command(cfg.omp, agent.files(d, i).session, args)
 			if command and run.app then
 				-- cx.agents:start passes no environment: the identity goes through a sourced file.
