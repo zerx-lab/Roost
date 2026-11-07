@@ -91,16 +91,35 @@ local RENEW_RETRY = 60
 local TAB_WAIT = 120
 local TAB_END_TTL = 86400
 
--- What an agent step cost: every *.jsonl under its session dir (subagents are files one level
--- down), summing each usage record's `cost.total` and `totalTokens`. Text inside JSON strings has
--- its quotes escaped, so the patterns only meet real usage objects. Prints "COST TOKENS".
+-- What an agent step cost and which models it used: every *.jsonl under its session dir
+-- (subagents are files one level down, named after the agent), summing each usage record's
+-- `cost.total` and `totalTokens`, and listing each distinct (agent, role, provider/model) of its
+-- assistant messages and side calls (`model_usage` records name their role, e.g. judge). Text
+-- inside JSON strings has its quotes escaped, so the patterns only meet real records. The step's
+-- own session files go first, so the cap never drops its turns. Prints "COST TOKENS", then one
+-- "m<TAB>AGENT<TAB>ROLE<TAB>MODEL" line per use (AGENT empty for the step's own agent, ROLE empty
+-- for its turns), at most MAX_USES of them.
 M.TALLY = [[
-find "$1" -type f -name '*.jsonl' -exec cat {} + 2>/dev/null |
-	grep -oE '"cost":\{[^}]*\}|"totalTokens":[0-9]+' |
-	awk '/^"totalTokens"/ { split($0, a, ":"); t += a[2]; next }
-		{ if (match($0, /"total":[-0-9.eE+]+/)) c += substr($0, RSTART + 8, RLENGTH - 8) }
-		END { printf "%.6f %d\n", c, t }'
+p='"cost":\{[^}]*\}|"totalTokens":[0-9]+|("role":"[^"]*",)?"api":"[^"]*","provider":"[^"]*","model":"[^"]*"'
+{ find "$1" -maxdepth 1 -type f -name '*.jsonl' -exec grep -oHE "$p" {} +
+	find "$1" -mindepth 2 -type f -name '*.jsonl' -exec grep -oHE "$p" {} +; } 2>/dev/null |
+	awk -v root="$1" -v max="$2" '
+		{ i = index($0, ":\""); f = substr($0, 1, i - 1); m = substr($0, i + 1) }
+		m ~ /^"totalTokens"/ { t += substr(m, 15); next }
+		m ~ /^"cost"/ { if (match(m, /"total":[-0-9.eE+]+/)) c += substr(m, RSTART + 8, RLENGTH - 8); next }
+		{
+			role = ""
+			if (m ~ /^"role"/) { role = substr(m, 9); role = substr(role, 1, index(role, "\"") - 1) }
+			match(m, /"provider":"[^"]*"/); p = substr(m, RSTART + 12, RLENGTH - 13)
+			match(m, /"model":"[^"]*"/); id = substr(m, RSTART + 9, RLENGTH - 10)
+			who = ""
+			if (index(substr(f, length(root) + 2), "/") > 0) { who = f; sub(/^.*\//, "", who); sub(/\.jsonl$/, "", who) }
+			k = who "\t" role "\t" (p == "" ? id : p "/" id)
+			if (!(k in seen) && n < max + 0) { seen[k] = 1; keys[++n] = k }
+		}
+		END { printf "%.6f %d\n", c, t; for (j = 1; j <= n; j++) print "m\t" keys[j] }'
 ]]
+local MAX_USES = 32
 local TALLY_TIMEOUT_MS = 20000
 -- Most of $ROOST_OUTPUT read after a shell step, and most outputs a run keeps.
 local MAX_OUTPUT_FILE = 64 * 1024
@@ -211,6 +230,8 @@ type Live = {
 	tailing: { [number]: boolean }, -- agent step -> a read or its log append is in flight
 	tail_done: { [number]: boolean }, -- agent step -> read to the end after its exit file appeared
 	tally: { [number]: string }, -- agent step -> "running" | "done": its cost read from the session files
+	peek_at: { [number]: number }, -- agent step -> when the models it uses may be read again
+	peeking: { [number]: boolean }, -- agent step -> that read is in flight
 	note: { [number]: string }, -- step index -> why it failed, for the run's reason (auth steps)
 	renewing: boolean?, -- the run's App token is being renewed
 	renew_at: number?, -- last renewal attempt
@@ -232,6 +253,8 @@ export type Runner = {
 	jobs_json: string?, -- what kv `agent_jobs` was last set to
 	tab_ops: { [string]: TabOp },
 	tabs_json: string?, -- what kv `tab_ops` was last set to
+	filled: { [string]: boolean }, -- ended runs whose missing models were read (fill_models)
+	filled_n: number,
 }
 
 local function now(r: Runner): number
@@ -397,6 +420,8 @@ local function live(r: Runner, id: string): Live
 			tailing = {},
 			tail_done = {},
 			tally = {},
+			peek_at = {},
+			peeking = {},
 			note = {},
 			settling = {},
 			queued_at = {},
@@ -407,7 +432,18 @@ local function live(r: Runner, id: string): Live
 end
 
 function M.new(env: Env): Runner
-	return { env = env, live = {}, seq = 0, timer = nil, save_timer = nil, jobs_json = nil, tab_ops = {}, tabs_json = nil }
+	return {
+		env = env,
+		live = {},
+		seq = 0,
+		timer = nil,
+		save_timer = nil,
+		jobs_json = nil,
+		tab_ops = {},
+		tabs_json = nil,
+		filled = {},
+		filled_n = 0,
+	}
 end
 
 local function new_id(r: Runner): string
@@ -548,7 +584,8 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 		table.insert(steps, { name = "准备迭代材料", kind = "evolve", state = "pending" })
 	end
 	for _, s in wf.steps do
-		table.insert(steps, { name = s.name, kind = s.kind :: string, state = "pending" })
+		local kind = s.kind :: string
+		table.insert(steps, { name = s.name, kind = kind, state = "pending", model = if kind == "omp" then s.model else nil })
 	end
 	if mode == "worktree" then
 		table.insert(steps, { name = "清理 worktree", kind = "cleanup", state = "pending" })
@@ -1134,8 +1171,60 @@ function tail_agent(r: Runner, run: Run, i: number, final: boolean)
 	end)
 end
 
--- Reads what an ended agent step cost (M.TALLY over its session dir) into the step record, then
--- checks the run again. A failed read leaves the step without a cost.
+-- M.TALLY's answer: what the step cost, its tokens and the models it used (cost nil when the
+-- answer isn't one).
+function M.parse_tally(text: string): (number?, number?, { store.ModelUse })
+	local c, t = string.match(text, "^%s*([%d%.]+)%s+(%d+)")
+	local uses: { store.ModelUse } = {}
+	for line in string.gmatch(text, "[^\n]+") do
+		local who, role, m = string.match(line, "^m\t([^\t]*)\t([^\t]*)\t([^\t]+)$")
+		if who and role and m and #uses < MAX_USES then
+			table.insert(uses, {
+				model = util.clip(m, 120),
+				agent = if who ~= "" then util.clip(who, 64) else nil,
+				role = if role ~= "" then util.clip(role, 32) else nil,
+			})
+		end
+	end
+	return tonumber(c), tonumber(t), uses
+end
+
+-- Runs M.TALLY over step `i`'s session dir; `done` hears its answer (cost nil when the read
+-- failed). False when the read couldn't start (`done` is never called then).
+local function read_usage(r: Runner, id: string, i: number, done: (number?, number?, { store.ModelUse }) -> ()): boolean
+	local session = agent.files(dir_of(r, id), i).session
+	local ok, err = pcall(function(): string?
+		local argv = { "/bin/sh", "-c", M.TALLY, "roost", session, tostring(MAX_USES) }
+		tern.process.run(argv, { timeout_ms = TALLY_TIMEOUT_MS }, function(res)
+			if res.status == 0 and not res.timed_out then
+				done(M.parse_tally(res.stdout or ""))
+			else
+				done(nil, nil, {})
+			end
+		end)
+		return nil
+	end)
+	if not ok then
+		tern.log.warn("roost: cannot read agent usage", err)
+	end
+	return ok
+end
+
+local function same_uses(a: { store.ModelUse }?, b: { store.ModelUse }): boolean
+	if a == nil or #a ~= #b then
+		return false
+	end
+	for k, u in b do
+		local o = a[k]
+		if o.model ~= u.model or o.agent ~= u.agent or o.role ~= u.role then
+			return false
+		end
+	end
+	return true
+end
+
+-- Reads what an ended agent step cost and which models it used (M.TALLY over its session dir)
+-- into the step record, then checks the run again. A failed read leaves the step without a cost.
 local function tally_agent(r: Runner, run: Run, i: number)
 	local l = live(r, run.id)
 	if l.tally[i] == "running" then
@@ -1150,23 +1239,82 @@ local function tally_agent(r: Runner, run: Run, i: number)
 			check(r, cur)
 		end
 	end
-	local session = agent.files(dir_of(r, id), i).session
-	local ok, err = pcall(function(): string?
-		tern.process.run({ "/bin/sh", "-c", M.TALLY, "roost", session }, { timeout_ms = TALLY_TIMEOUT_MS }, function(res)
-			local cur = r.env.store.by_id[id]
-			local c, t = string.match(res.stdout or "", "^%s*([%d%.]+)%s+(%d+)")
-			local s = if cur then cur.steps[i] else nil
-			if s and c and t and res.status == 0 and not res.timed_out then
-				s.cost, s.tokens = tonumber(c), tonumber(t)
-				persist(r)
+	local started = read_usage(r, id, i, function(c, t, uses)
+		local cur = r.env.store.by_id[id]
+		local s = if cur then cur.steps[i] else nil
+		if s and c and t then
+			s.cost, s.tokens = c, t
+			if #uses > 0 then
+				s.models = uses
 			end
-			done()
-		end)
-		return nil
-	end)
-	if not ok then
-		tern.log.warn("roost: cannot read agent usage", err)
+			persist(r)
+		end
 		done()
+	end)
+	if not started then
+		done()
+	end
+end
+
+-- How often a working agent step's models are read again at most, and how many times longer than
+-- the last read took the next one waits (a huge session isn't rescanned back to back).
+local PEEK_EVERY = 20
+local PEEK_SPAN = 20
+
+-- Which models a working agent step (its subagents and side calls included) has used so far, for
+-- the run's details; the ended step's tally has the last word.
+local function peek_agent(r: Runner, run: Run, i: number)
+	local l = live(r, run.id)
+	local t = now(r)
+	local due = l.peek_at[i]
+	if l.peeking[i] or l.tally[i] ~= nil or (due and t < due) then
+		return
+	end
+	l.peeking[i] = true
+	local id = run.id
+	local started = read_usage(r, id, i, function(_, _, uses)
+		local done_at = now(r)
+		l.peeking[i] = nil
+		l.peek_at[i] = done_at + math.max(PEEK_EVERY, (done_at - t) * PEEK_SPAN)
+		local cur = r.env.store.by_id[id]
+		local s = if cur then cur.steps[i] else nil
+		if s and l.tally[i] == nil and #uses > 0 and not same_uses(s.models, uses) then
+			s.models = uses
+			persist(r)
+		end
+	end)
+	if not started then
+		l.peeking[i] = nil
+		l.peek_at[i] = t + PEEK_EVERY
+	end
+end
+
+-- Most ended runs fill_models remembers before it starts over.
+local MAX_FILLED = 1000
+
+-- Reads the models of an ended run's agent steps that have none recorded (they ended before
+-- steps kept them, or their tally failed), once per run in this VM.
+function M.fill_models(r: Runner, id: string)
+	local run = r.env.store.by_id[id]
+	if r.filled[id] or run == nil or not store.TERMINAL[run.state] then
+		return
+	end
+	if r.filled_n >= MAX_FILLED then
+		r.filled, r.filled_n = {}, 0
+	end
+	r.filled[id] = true
+	r.filled_n += 1
+	for i, s in run.steps do
+		if s.agent and s.models == nil then
+			read_usage(r, id, i, function(_, _, uses)
+				local cur = r.env.store.by_id[id]
+				local cs = if cur then cur.steps[i] else nil
+				if cs and cs.models == nil and #uses > 0 then
+					cs.models = uses
+					persist(r)
+				end
+			end)
+		end
 	end
 end
 
@@ -1185,6 +1333,7 @@ local function watch_agent(r: Runner, run: Run, i: number)
 	if tern.fs.exists(f.pane) then
 		-- The window that opened it stops it, and records how it ended.
 		l.claim_at[i] = nil
+		peek_agent(r, run, i)
 		tail_agent(r, run, i, false)
 		return
 	end

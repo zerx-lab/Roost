@@ -1047,10 +1047,82 @@ local function pane_head(title: { any }, right: { Node }): Node
 	})
 end
 
+-- Most models the facts list, and most uses one model's row names.
+local MAX_MODEL_ROWS = 8
+local MAX_MODEL_USES = 6
+
+-- omp's roles here (role → model), from `omp config get modelRoles` (cached by core).
+local function role_models(st: State): { [string]: string }
+	local out: { [string]: string } = {}
+	for _, x in core.omp_models(st.core).roles do
+		out[x.name] = x.model
+	end
+	return out
+end
+
+-- The models a run's agent steps use, one kv row each naming what uses it: a step's own turns,
+-- its subagents and side calls (omp's judge, …) as its session files show them; a step that shows
+-- none yet (waiting or just started) by what its `model` setting runs. `roles` looks up omp's
+-- roles here (nil: another device's run, left as written).
+local function model_rows(r: store.Run, roles: (() -> { [string]: string })?): { any }
+	local order: { string } = {}
+	local by: { [string]: { string } } = {}
+	local function add(m: string, label: string)
+		local list = by[m]
+		if list == nil then
+			list = {}
+			by[m] = list
+			table.insert(order, m)
+		end
+		if not table.find(list, label) then
+			table.insert(list, label)
+		end
+	end
+	local known: { [string]: string }? = nil
+	local active = r.state == "queued" or r.state == "running"
+	for _, s in r.steps do
+		if s.models and #s.models > 0 then
+			for _, u in s.models do
+				add(u.model, if u.agent then `{s.name}(子代理 {u.agent})` elseif u.role then `{s.name}({u.role})` else s.name)
+			end
+		elseif active and s.kind == "omp" and (s.state == "pending" or s.state == "running") then
+			local spec = s.model
+			local role = if spec then string.match(spec, "^@(.+)$") else "default"
+			if role and roles and known == nil then
+				known = roles()
+			end
+			local resolved = if role and known then known[role] else nil
+			local notes: { string } = {}
+			if resolved then
+				table.insert(notes, spec or "默认角色")
+			end
+			if s.state == "pending" then
+				table.insert(notes, "待运行")
+			end
+			add(resolved or spec or "omp 默认模型", if #notes > 0 then `{s.name}({table.concat(notes, ",")})` else s.name)
+		end
+	end
+	local rows: { any } = {}
+	for k, m in order do
+		if k > MAX_MODEL_ROWS then
+			table.insert(rows, pair("", { ui.span(`另有 {#order - MAX_MODEL_ROWS} 个模型`, "muted") }))
+			break
+		end
+		local uses = by[m]
+		local text = table.concat(table.move(uses, 1, math.min(#uses, MAX_MODEL_USES), 1, {}), " · ")
+		if #uses > MAX_MODEL_USES then
+			text ..= ` 等 {#uses} 处`
+		end
+		table.insert(rows, pair(if k == 1 then "模型" else "", { ui.span(m, "mono"), ui.span(`  {text}`, "muted") }))
+	end
+	return rows
+end
+
 -- The run's facts as one aligned key/value grid (the design guide's detail facts): why it ended
--- first, then where it came from, who it acts as, what it was given, when and what it cost. Its
--- took is in the head. Returns the node and its row count (the narrow page sizes the log by it).
-local function run_facts(r: store.Run, t: number): (Node, number)
+-- first, then where it came from, who it acts as, what it was given, when, which models it uses and
+-- what it cost. Its took is in the head. Returns the node and its row count (the narrow page sizes
+-- the log by it). `roles` as model_rows.
+local function run_facts(r: store.Run, t: number, roles: (() -> { [string]: string })?): (Node, number)
 	local items: { any } = { pair("ID", { ui.span(r.id, "mono") }) }
 	if r.reason then
 		local calm = r.state == "success" or r.state == "skipped"
@@ -1085,6 +1157,9 @@ local function run_facts(r: store.Run, t: number): (Node, number)
 		table.insert(items, pair("输入", { ui.span(table.concat(inputs, "  "), "mono") }))
 	end
 	table.insert(items, pair("创建", { ui.span(util.clock(r.created_at), "mono"), ui.span(`  {util.ago(r.created_at, t)}`, "muted") }))
+	for _, row in model_rows(r, roles) do
+		table.insert(items, row)
+	end
 	local cost, tokens = stats.run_cost(r)
 	if tokens ~= nil and tokens > 0 then
 		table.insert(items, pair("费用", {
@@ -1109,6 +1184,10 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 			break
 		end
 	end
+	if store.TERMINAL[r.state] then
+		-- Runs that ended before steps kept their models: read them once.
+		core.fill_models(st.core, r.id)
+	end
 	table.insert(tools, btn("日志文件", `open-log={r.id}`, { icon = "file", variant = "quiet", key = "log" }))
 	table.insert(tools, btn("复制 ID", `copy-id={r.id}`, { icon = "copy", variant = "quiet", key = "copy-id", title = `复制运行 ID {r.id}` }))
 	table.insert(tools, btn("自动换行", "log-wrap", {
@@ -1129,7 +1208,9 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 	if r.cwd and r.workspace ~= "temp" then
 		table.insert(tools, btn("工作区", `open-ws={r.id}`, { icon = "folder-open", variant = "quiet", key = "ws" }))
 	end
-	local facts, fact_rows = run_facts(r, t)
+	local facts, fact_rows = run_facts(r, t, function(): { [string]: string }
+		return role_models(st)
+	end)
 	local lg = st.log
 	local log_body: Node
 	if lg.id == r.id and (lg.text ~= "" or lg.eof) then

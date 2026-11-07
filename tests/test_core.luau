@@ -1782,19 +1782,41 @@ do -- an agent step's cost is read from its session files; the daily budget hold
 		s.env.files[p.opts.env.ROOST_OUTPUT] = "n=7\n"
 		return "exit:0"
 	end
-	s.tally = "0.250000 1200\n"
+	s.tally = "0.000000 10\nm\t\t\txai/early\n"
 	s.core.start(s.c)
 	eq(s.core.dispatch(s.c, "spend"), nil)
 	step(s, 3)
 	eq(#w.started, 1)
 	eq(w.started[1].opts.prompt, "处理 7 条", "outputs render in prompts")
+	local live = last_run(s).steps[2]
+	eq(live.model, nil, "no model setting: omp's default role")
+	eq(live.models and live.models[1].model, "xai/early", "models are read while the agent works")
+	s.tally = "0.250000 1200\nm\t\t\txai/composer\nm\tReviewer\t\tanthropic/sonnet\nm\t\tjudge\txai/fast\nbad line\n"
 	w.reply(w.started[1].pane, "完成")
 	step(s, 6)
 	local first = last_run(s)
 	eq(first.state, "success")
 	eq(first.steps[2].cost, 0.25, "cost from the tally")
 	eq(first.steps[2].tokens, 1200)
+	local uses = first.steps[2].models or {}
+	eq(#uses, 3, "the final tally's models replace the early read")
+	eq(uses[1].model, "xai/composer")
+	eq(uses[1].agent, nil)
+	eq(uses[2].agent, "Reviewer", "a subagent's session names it")
+	eq(uses[3].role, "judge", "a side call names its role")
 	truthy(string.find(s.env.files[`{DATA}/runs/{first.id}/log.txt`] or "", "约 $0.2500,1200 tokens", 1, true), "cost logged")
+
+	-- A run that ended before steps kept their models reads them once.
+	first.steps[2].models = nil
+	s.tally = "0.250000 1200\nm\t\t\txai/old\n"
+	s.core.fill_models(s.c, first.id)
+	s.env.drain()
+	eq(first.steps[2].models and first.steps[2].models[1].model, "xai/old", "filled from the session files")
+	first.steps[2].models = nil
+	s.core.fill_models(s.c, first.id)
+	s.env.drain()
+	eq(first.steps[2].models, nil, "once per run")
+	first.steps[2].models = { { model = "xai/old" } }
 
 	eq(s.core.dispatch(s.c, "spend"), nil)
 	step(s, 6)

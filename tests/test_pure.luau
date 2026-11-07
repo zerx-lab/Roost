@@ -606,7 +606,10 @@ do -- device sync: run summaries stay under the relay's limit, tails first, and 
 			state = if i == 1 then "running" else "success",
 			created_at = 1000 + i,
 			inputs = { SECRET = "x" },
-			steps = { { name = "s", kind = "run", state = "success", exit_code = 0 } },
+			steps = {
+				{ name = "s", kind = "run", state = "success", exit_code = 0 },
+				{ name = "a", kind = "omp", state = "success", model = "@smol", models = { { model = "x/m", agent = "Sub" }, { role = "judge" } :: any } } :: any,
+			},
 			step = 1,
 		})
 		tails[id] = string.rep("y", fleet.TAIL_BYTES)
@@ -617,6 +620,10 @@ do -- device sync: run summaries stay under the relay's limit, tails first, and 
 	local back, back_tails = fleet.decode_runs(small)
 	eq(#back, fleet.MAX_RUNS)
 	eq(back[1].steps[1].exit_code, 0)
+	local a = back[1].steps[2]
+	eq(a.model, "@smol", "an agent step's model setting reaches observers")
+	eq(a.models and #a.models, 1, "and the models it used, malformed ones dropped")
+	eq(a.models and a.models[1].agent, "Sub")
 	eq(#back_tails["0001"], fleet.TAIL_BYTES, "the newest carry tails")
 	eq(back_tails[string.format("%04x", fleet.TAILS + 1)], nil, "older ones don't")
 

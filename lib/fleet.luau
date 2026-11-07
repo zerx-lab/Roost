@@ -70,7 +70,17 @@ function M.label(ex: Executor?): string
 	return ex.name or ex.id
 end
 
+-- Most model uses a step summary carries (the runner keeps as many).
+local MAX_USES = 32
+
 local function step_summary(s: store.StepRec): { [string]: any }
+	local uses: { any }? = nil
+	if s.models then
+		uses = {}
+		for _, u in s.models do
+			table.insert(uses :: { any }, { model = u.model, agent = u.agent, role = u.role })
+		end
+	end
 	return {
 		name = s.name,
 		kind = s.kind,
@@ -81,6 +91,8 @@ local function step_summary(s: store.StepRec): { [string]: any }
 		agent = s.agent,
 		cost = s.cost,
 		tokens = s.tokens,
+		model = s.model,
+		models = if uses then tern.json.array(uses) else nil,
 	}
 end
 
@@ -156,6 +168,28 @@ local function num(v: any): number?
 	return if type(v) == "number" then v else nil
 end
 
+-- A string no longer than `n` bytes, else nil.
+local function short(v: any, n: number): string?
+	return if type(v) == "string" and #v <= n then v else nil
+end
+
+local function uses_of(v: any): { store.ModelUse }?
+	if type(v) ~= "table" then
+		return nil
+	end
+	local out: { store.ModelUse } = {}
+	for _, u in v do
+		if #out >= MAX_USES then
+			break
+		end
+		local m = if type(u) == "table" then short(u.model, 200) else nil
+		if m then
+			table.insert(out, { model = m, agent = short(u.agent, 100), role = short(u.role, 64) })
+		end
+	end
+	return if #out > 0 then out else nil
+end
+
 -- An uploaded run list back into run records (only what the runs page shows), and each run's log
 -- tail. Malformed entries are dropped.
 function M.decode_runs(body: any): ({ store.Run }, { [string]: string })
@@ -187,6 +221,8 @@ function M.decode_runs(body: any): ({ store.Run }, { [string]: string })
 						agent = if s.agent == true then true else nil,
 						cost = num(s.cost),
 						tokens = num(s.tokens),
+						model = short(s.model, 200),
+						models = uses_of(s.models),
 					})
 				end
 			end

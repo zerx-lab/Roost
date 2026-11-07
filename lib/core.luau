@@ -1285,6 +1285,12 @@ function M.cancel(c: Core, id: string): string?
 	return "该运行已结束"
 end
 
+-- An ended run's agent steps without recorded models get them from their session files (runs
+-- from before steps kept them), once per run; the run's details show them when they land.
+function M.fill_models(c: Core, id: string)
+	runner.fill_models(c.runner, id)
+end
+
 function M.rerun(c: Core, id: string): string?
 	local run = c.store.by_id[id]
 	local w = c.workflows

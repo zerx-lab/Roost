@@ -15,6 +15,10 @@ local agent = require("./agent")
 
 local M = {}
 
+-- A model an agent step used: by its own turns (no agent, no role), by a subagent (`agent`, the
+-- name of its session file) or by a side call such as omp's judge (`role`).
+export type ModelUse = { model: string, agent: string?, role: string? }
+
 export type StepRec = {
 	name: string,
 	kind: string, -- auth | prepare | evolve | omp | run | file | tab | upgrade | cleanup
@@ -29,6 +33,10 @@ export type StepRec = {
 	replied: boolean?, -- agent step: the log already holds the final answer
 	cost: number?, -- agent step: estimated USD from its session files (subagents included), once it ended
 	tokens: number?, -- agent step: total tokens from the same files
+	-- omp step: its `model` setting (`provider/id` or `@role`); nil runs omp's default role
+	model: string?,
+	-- agent step: the models its session files show (read while it works, final once it ended)
+	models: { ModelUse }?,
 	tab_op: string?, -- tab step: its queued operation (lib/tabs.luau)
 	-- tab step: the key whose tab the run's end may close (nil once no window ever took the
 	-- operation), and whether it outlives the run (close steps: always)

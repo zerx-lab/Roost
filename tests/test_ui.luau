@@ -502,6 +502,70 @@ do -- the cost pair appears only when tokens are above zero
 	eq(list_cost(), "", "blank without a tally")
 end
 
+do -- the facts list the models a run's agent steps use: seen in their sessions, else their setting
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	w.core.dispatch(w.c, "plain")
+	local r = w.c.store.runs[1]
+	r.state = "running"
+	local s = r.steps[1]
+	s.kind, s.state = "omp", "running"
+	table.insert(r.steps, { name = "复核", kind = "omp", state = "pending", model = "@smol" })
+	table.insert(r.steps, { name = "执行", kind = "omp", state = "pending", model = "@unknown" })
+	w.c.omp_models = {
+		roles = { { name = "default", model = "anthropic/opus" }, { name = "smol", model = "xai/fast" } },
+		models = {},
+		loading = true,
+	}
+	w.st.tab = "runs"
+	w.st.run_id = r.id
+	local function models(): { string }
+		local facts = find(view(w).main, function(x)
+			return x.k == "kv" and x.p and x.p.key == "facts"
+		end)
+		local out = {}
+		local inside = false
+		for _, item in facts.p.items do
+			inside = item[1] == "模型" or (inside and item[1] == "")
+			if inside then
+				local text = ""
+				for _, sp in item[2] do
+					text ..= sp.t
+				end
+				table.insert(out, text)
+			end
+		end
+		return out
+	end
+	local name = s.name
+	eq(table.concat(models(), "\n"), table.concat({
+		`anthropic/opus  {name}(默认角色)`,
+		"xai/fast  复核(@smol,待运行)",
+		"@unknown  执行(待运行)",
+	}, "\n"), "before any session: what each setting runs, roles looked up here")
+
+	s.models = {
+		{ model = "xai/composer" },
+		{ model = "anthropic/sonnet", agent = "Reviewer" },
+		{ model = "xai/fast", role = "judge" },
+	}
+	eq(table.concat(models(), "\n"), table.concat({
+		`xai/composer  {name}`,
+		`anthropic/sonnet  {name}(子代理 Reviewer)`,
+		`xai/fast  {name}(judge) · 复核(@smol,待运行)`,
+		"@unknown  执行(待运行)",
+	}, "\n"), "what the session shows wins; one row per model, naming every use")
+
+	r.state = "cancelled"
+	s.state = "success"
+	eq(table.concat(models(), "\n"), table.concat({
+		`xai/composer  {name}`,
+		`anthropic/sonnet  {name}(子代理 Reviewer)`,
+		`xai/fast  {name}(judge)`,
+	}, "\n"), "an ended run lists only what ran")
+	s.models = nil
+	eq(#models(), 0, "nothing known, nothing listed")
+end
+
 do -- today's spend and a step condition show on the workflow card
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	w.st.tab = "workflows"
