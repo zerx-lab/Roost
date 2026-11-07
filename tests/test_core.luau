@@ -2905,6 +2905,38 @@ do -- a success is spot-checked (never while the evolver is busy); suggestions a
 	truthy(string.find(past, "把 retention 调短", 1, true) and string.find(past, doc.id, 1, true), "earlier suggestions are passed on")
 end
 
+do -- a roost trigger's `daily` caps how often it starts the evolver in a day
+	local s = scenario({
+		[DATA .. "/workflows.toml"] = (string.gsub(WF_EVOLVE, 'roost = "run_failed"\n', 'roost = "run_failed"\ndaily = 1\n')),
+		[DATA .. "/roost.toml"] = LOCAL,
+		[DATA .. "/workflows/target/files/run.sh"] = "exit 1\n",
+	})
+	s.behave = function(p)
+		for _, a in p.cmd do
+			if string.sub(a, -#"/files/run.sh") == "/files/run.sh" then
+				return "exit:1"
+			end
+		end
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0, "daily parses")
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 8)
+	eq(s.c.store.runs[2].workflow, "doctor", "the first failure starts the evolver")
+	s.now += 3600 -- past the cooldown, same day
+	eq(s.core.dispatch(s.c, "target"), nil)
+	step(s, 8)
+	local doctors = 0
+	for _, r in s.c.store.runs do
+		doctors += if r.workflow == "doctor" then 1 else 0
+	end
+	eq(doctors, 1, "the second failure that day is over the cap")
+	local second = last_run(s)
+	eq(second.workflow, "target")
+	truthy(string.find(s.env.files[`{DATA}/runs/{second.id}/log.txt`], "达到上限 1", 1, true), "the cap was logged")
+end
+
 do -- a revision cut off while it was being applied (half its files written) is undone at the next start
 	local s = scenario({
 		[DATA .. "/workflows.toml"] = WF_EVOLVE,

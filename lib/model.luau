@@ -60,13 +60,15 @@ export type CronTrigger = {
 }
 -- Fires when a run of a workflow this one evolves (`evolve`) ends: `run_failed`, after `streak`
 -- bad runs in a row (failed or timed out); `run_succeeded`, a spot check of a successful run, taken
--- for `sample` percent of them. Optionally only for the listed workflows.
+-- for `sample` percent of them. Optionally only for the listed workflows; at most `daily` times a
+-- local day (each kind counted on its own).
 export type RoostTrigger = {
 	kind: "roost",
 	on: "run_failed" | "run_succeeded",
 	workflows: { string },
 	streak: number,
 	sample: number,
+	daily: number,
 	line: number?,
 }
 -- Started from outside: `POST /hooks/dispatch/<workflow id>` on the relay with the bearer token
@@ -1371,6 +1373,9 @@ local function compile_github(c: Ctx, t: { [string]: any }, path: string, line: 
 	return trig
 end
 
+-- The most times a day one `roost` trigger may start its evolver (`daily`, and its default).
+M.ROOST_DAILY = 20
+
 M.ROOST_KINDS = {
 	{ id = "run_failed", label = "被迭代的工作流运行失败", detail = "当本工作流迭代的工作流连续失败或超时达到次数时触发。" },
 	{
@@ -1383,11 +1388,16 @@ M.ROOST_KINDS = {
 local function compile_roost(c: Ctx, t: { [string]: any }, path: string, line: number?): RoostTrigger?
 	local on = get_string(c, t, "roost", path) or ""
 	if on ~= "run_failed" and on ~= "run_succeeded" then
-		check_keys(c, t, path, { "roost", "workflows", "streak", "sample" })
+		check_keys(c, t, path, { "roost", "workflows", "streak", "sample", "daily" })
 		issue(c, `{path}.roost`, `未知的 Roost 触发器 "{on}"(可用:run_failed、run_succeeded)`, line_of(c, t, "roost") or line)
 		return nil
 	end
-	check_keys(c, t, path, if on == "run_failed" then { "roost", "workflows", "streak" } else { "roost", "workflows", "sample" })
+	check_keys(
+		c,
+		t,
+		path,
+		if on == "run_failed" then { "roost", "workflows", "streak", "daily" } else { "roost", "workflows", "sample", "daily" }
+	)
 	local wfs = get_strings(c, t, "workflows", path)
 	for _, id in wfs do
 		if not valid_id(id) then
@@ -1400,6 +1410,7 @@ local function compile_roost(c: Ctx, t: { [string]: any }, path: string, line: n
 		workflows = wfs,
 		streak = if on == "run_failed" then get_int(c, t, "streak", path, 1, 1, 20) else 1,
 		sample = if on == "run_succeeded" then get_int(c, t, "sample", path, 100, 1, 100) else 100,
+		daily = get_int(c, t, "daily", path, M.ROOST_DAILY, 1, M.ROOST_DAILY),
 		line = line,
 	}
 end
@@ -1933,6 +1944,9 @@ function M.describe_trigger(t: Trigger, omit_repos: boolean?): string
 		if #rt.workflows > 0 then
 			s ..= ` · {table.concat(rt.workflows, "、")}`
 		end
+		if rt.daily < M.ROOST_DAILY then
+			s ..= ` · 每天最多 {rt.daily} 次`
+		end
 		return s
 	end
 	if t.kind == "api" then
@@ -2087,7 +2101,7 @@ local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify =
 local SUB_ORDER: { [string]: { string } } = {
 	input = { "name", "description", "default", "required" },
 	trigger = {
-		"roost", "streak", "sample",
+		"roost", "streak", "sample", "daily",
 		"schedule", "at", "days", "between", "day", "date", "time", "cron", "tz", "repo", "ref",
 		"github", "event", "repos", "authors", "assignees", "actions", "branches", "labels", "label_actions",
 		"conclusions", "workflows", "review_states", "thread_actions", "comment", "handle",

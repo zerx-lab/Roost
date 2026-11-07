@@ -29,9 +29,9 @@ M.MAX_MATERIAL = 8 * 1024 * 1024
 M.RECENT = 10
 M.LOGS_PER_TARGET = 3
 M.LOG_TAIL = 48 * 1024
--- An evolver fires for the same target at most once per COOLDOWN, and DAILY_FIRES times a day.
+-- An evolver fires for the same target at most once per COOLDOWN, and each `roost` trigger kind at
+-- most its `daily` times a day (model.ROOST_DAILY by default).
 M.COOLDOWN = 1800
-M.DAILY_FIRES = 20
 -- A watched revision is kept after WATCH_RUNS runs of each workflow it touched, or WATCH_AGE.
 M.WATCH_RUNS = 5
 M.WATCH_AGE = 7 * 86400
@@ -1430,9 +1430,9 @@ function M.fire(h: Host, b: Book, run: Run): { Fire }
 				if bad then
 					h.log(run.id, { `[roost] {wf.name} 在冷却中({M.COOLDOWN // 60} 分钟内已为 {target.id} 触发过),这次不触发` })
 				end
-			elseif dd.n >= M.DAILY_FIRES then
+			elseif dd.n >= rt.daily then
 				if bad then
-					h.log(run.id, { `[roost] {wf.name} 今天已触发 {dd.n} 次,达到上限,这次不触发` })
+					h.log(run.id, { `[roost] {wf.name} 今天已为失败触发 {dd.n} 次,达到上限 {rt.daily},这次不触发` })
 				end
 			else
 				b.last[key] = t

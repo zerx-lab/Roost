@@ -557,6 +557,9 @@ do -- run_succeeded: sample percent, its own keys, wording, encoding; sampling a
 	eq(model.describe_trigger(rt), "抽查被迭代的工作流 30% 的成功运行")
 	local all = model.parse_workflows(base .. '[[workflow.step]]\nrun = "true"\n') :: model.Workflows
 	eq((all.by_id.d.triggers[1] :: model.RoostTrigger).sample, 100, "every success by default")
+	eq((all.by_id.d.triggers[1] :: model.RoostTrigger).daily, model.ROOST_DAILY, "default daily cap")
+	local capped = model.parse_workflows(base .. 'daily = 1\n[[workflow.step]]\nrun = "true"\n') :: model.Workflows
+	eq(model.describe_trigger(capped.by_id.d.triggers[1]), "抽查被迭代的工作流的成功运行 · 每天最多 1 次")
 	local function first(text: string): string?
 		local _, issues = model.parse_workflows(text)
 		return if issues[1] then `{issues[1].path}: {issues[1].message}` else nil

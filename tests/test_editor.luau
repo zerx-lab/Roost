@@ -917,6 +917,10 @@ do -- a spot-check trigger edits its sample percent (100 is the default and is l
 	eq(tr[1].streak, nil, "no streak on a spot check")
 	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.triggers.t1.card.sample.sel", value = "100" })
 	eq(tr[1].sample, nil)
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.triggers.t1.card.cap.sel", value = "1" })
+	eq(tr[1].daily, 1, "per-day cap set")
+	w.ui.event(w.st, { ev = "change", id = "layer.editor.body.triggers.t1.card.cap.sel", value = "20" })
+	eq(tr[1].daily, nil, "the default cap is left out")
 end
 
 print("ok")

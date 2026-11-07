@@ -1616,6 +1616,11 @@ local function roost_card(st: any, ed: Editor, i: number, tr: any): any
 		local v = tostring(if sampled then n * 10 else n)
 		table.insert(opts, { value = v, label = if sampled then `{v}%` else v })
 	end
+	local cap = if type(tr.daily) == "number" then tostring(tr.daily) else tostring(model.ROOST_DAILY)
+	local cap_opts: { any } = {}
+	for _, n in { 1, 2, 3, 5, 10, model.ROOST_DAILY } do
+		table.insert(cap_opts, { value = tostring(n), label = `{n} 次` })
+	end
 	local body: { any } = {
 		N("row", { key = "h", gap = "sm", align = "center" }, {
 			N("button", { key = "ic", icon = "activity", text = "", title = label, size = "sm", variant = "quiet" }),
@@ -1638,6 +1643,14 @@ local function roost_card(st: any, ed: Editor, i: number, tr: any): any
 				value = value,
 				options = with_current(opts, value, if sampled then `{value}%` else value),
 				open = ed.opens[tid(i, "card", key, "sel")] == true,
+			}),
+		}),
+		N("field", { key = "cap", label = "每天最多触发", variant = "row" }, {
+			N("select", {
+				key = "sel",
+				value = cap,
+				options = with_current(cap_opts, cap, `{cap} 次`),
+				open = ed.opens[tid(i, "card", "cap", "sel")] == true,
 			}),
 		}),
 	}
@@ -2674,6 +2687,12 @@ local function on_select(st: any, ed: Editor, id: string, value: string)
 		local n = tonumber(value)
 		if n and n >= 1 and n <= 100 then
 			tr.sample = if n == 100 then nil else n
+		end
+		touch(ed)
+	elseif tr and string.find(id, ".cap.sel", 1, true) then
+		local n = tonumber(value)
+		if n and n >= 1 and n <= model.ROOST_DAILY then
+			tr.daily = if n == model.ROOST_DAILY then nil else n
 		end
 		touch(ed)
 	elseif string.find(id, ".file.sel", 1, true) then
