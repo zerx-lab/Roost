@@ -39,6 +39,7 @@ export type Files = {
 	claim: string,
 	pane: string,
 	reply: string,
+	answer: string, -- the last final answer read from the session file (host-written; reply is the window's)
 	exit: string,
 	session: string,
 }
@@ -69,6 +70,7 @@ function M.files(dir: string, i: number): Files
 		claim = `{base}.claim`,
 		pane = `{base}.pane`,
 		reply = `{base}.reply.txt`,
+		answer = `{base}.answer.md`,
 		exit = `{base}.exit`,
 		session = `{base}.session`,
 	}

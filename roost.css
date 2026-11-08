@@ -7,6 +7,9 @@
  *   [data-role='roost.header']               title row with live badges and tools
  *   [data-role='roost.tabs']                 page tabs
  *   [data-role='roost.home']                 home page (what needs attention, what runs, what is due)
+ *   [data-role='roost.composer']             home page: the task box (text, repository, model, start)
+ *   [data-role='roost.inbox']                home page: what workflows reported; each row is [data-role='roost.inboxitem']
+ *   [data-role='roost.diff']                 a run's diff overlay
  *   [data-role='roost.runs']                 runs page (split: list | detail)
  *   [data-role='roost.fill']                 every page's body: fills the block below the tabs; the page scrolls inside it
  *   [data-role='roost.runlist']              runs list pane (filter bar, then the scrolling table)
@@ -61,6 +64,15 @@
 }
 [data-surface='plugin.roost.console'] [data-role='roost.phead'] > :first-child {
 	flex: 1 1 auto;
+}
+
+/* An inbox row: its text takes the room and wraps; its buttons keep their width at the right. */
+[data-surface='plugin.roost.console'] [data-role='roost.inboxitem'] > :first-child {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+[data-surface='plugin.roost.console'] [data-role='roost.inboxitem'] > :last-child {
+	flex: none;
 }
 
 /* Only the page scrolls, never the head and tabs above it: the page body fills the block below

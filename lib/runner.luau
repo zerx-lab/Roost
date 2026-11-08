@@ -21,6 +21,9 @@ local loginenv = require("./loginenv")
 local files = require("./files")
 local tabs = require("./tabs")
 local upgrade = require("./upgrade")
+local tasks = require("./tasks")
+local reply = require("./reply")
+local inbox = require("./inbox")
 
 local M = {}
 
@@ -30,8 +33,8 @@ type Workflow = model.Workflow
 -- The wrapper: `sh -c WRAPPER roost LOG PIDFILE EXITFILE CWD PROG ARGS...`. `set -m` gives the
 -- command its own process group, so cancel can signal everything it started. The wrapper's own
 -- pid goes to PIDFILE.w so a later VM can tell whether anyone is left to write the exit file.
--- Anything but a regular file at $ROOST_OUTPUT is removed before the exit file appears, so the
--- host's read of it can't block on a FIFO or device.
+-- Anything but a regular file at $ROOST_OUTPUT or $ROOST_INBOX is removed before the exit file
+-- appears, so the host's read of them can't block on a FIFO or device.
 M.WRAPPER = [[
 log=$1; pidf=$2; exitf=$3; cwd=$4; shift 4
 echo "$$" >"$pidf.w"
@@ -43,26 +46,140 @@ child=$!
 echo "$child" >"$pidf"
 wait "$child"
 code=$?
-if [ -n "$ROOST_OUTPUT" ] && { [ -e "$ROOST_OUTPUT" ] || [ -L "$ROOST_OUTPUT" ]; } && { [ -L "$ROOST_OUTPUT" ] || [ ! -f "$ROOST_OUTPUT" ]; }; then
-	rm -rf -- "$ROOST_OUTPUT"
-	echo "[roost] \$ROOST_OUTPUT is not a regular file: ignored" >>"$log"
-fi
+for f in "$ROOST_OUTPUT" "$ROOST_INBOX"; do
+	if [ -n "$f" ] && { [ -e "$f" ] || [ -L "$f" ]; } && { [ -L "$f" ] || [ ! -f "$f" ]; }; then
+		rm -rf -- "$f"
+		echo "[roost] $f is not a regular file: ignored" >>"$log"
+	fi
+done
 echo "$code" >"$exitf.tmp" && mv "$exitf.tmp" "$exitf"
 exit "$code"
 ]]
 
+-- A follow-up starts at its parent's base commit (already in the repository; fetched when not)
+-- with the parent's changes applied. Every worktree run records the commit it started at.
 M.PREPARE_WORKTREE = [[
 set -e
-echo "[roost] fetch origin $ROOST_FETCH_REF in $ROOST_REPO_PATH"
-git -C "$ROOST_REPO_PATH" fetch --quiet origin "$ROOST_FETCH_REF"
-git -C "$ROOST_REPO_PATH" worktree add --quiet --detach "$ROOST_WORKSPACE" FETCH_HEAD
+if [ -n "$ROOST_BASE_SHA" ]; then
+	git -C "$ROOST_REPO_PATH" cat-file -e "$ROOST_BASE_SHA^{commit}" 2>/dev/null || git -C "$ROOST_REPO_PATH" fetch --quiet origin "$ROOST_BASE_SHA"
+	git -C "$ROOST_REPO_PATH" worktree add --quiet --detach "$ROOST_WORKSPACE" "$ROOST_BASE_SHA"
+else
+	echo "[roost] fetch origin $ROOST_FETCH_REF in $ROOST_REPO_PATH"
+	git -C "$ROOST_REPO_PATH" fetch --quiet origin "$ROOST_FETCH_REF"
+	git -C "$ROOST_REPO_PATH" worktree add --quiet --detach "$ROOST_WORKSPACE" FETCH_HEAD
+fi
+git -C "$ROOST_WORKSPACE" rev-parse HEAD >"$ROOST_RUN_DIR/base.txt"
 echo "[roost] worktree $ROOST_WORKSPACE at $(git -C "$ROOST_WORKSPACE" rev-parse --short HEAD)"
+if [ -n "$ROOST_BASE_PATCH" ] && [ -s "$ROOST_BASE_PATCH" ]; then
+	git -C "$ROOST_WORKSPACE" apply --index "$ROOST_BASE_PATCH"
+	echo "[roost] 已应用上一次运行的改动"
+fi
 ]]
 
-M.CLEANUP_WORKTREE = [[
+-- Before the worktree goes: everything staged and diffed against the commit it started at
+-- (lib/tasks.luau), the patch dropped past tasks.MAX_PATCH. `changes.numstat` keeps at most
+-- tasks.MAX_FILES rows and tasks.MAX_NUMSTAT bytes; `changes.total` has "files add del" of the whole
+-- diff. Both appear only after a complete capture. The worktree is removed whatever happened.
+M.CLEANUP_WORKTREE = string.gsub(
+	string.gsub(
+		string.gsub(
+			[[
+d=$ROOST_RUN_DIR
+if [ -d "$ROOST_WORKSPACE" ] && [ -s "$d/base.txt" ]; then
+	base=$(cat "$d/base.txt")
+	rm -f "$d/changes.patch" "$d/changes.numstat" "$d/changes.total" "$d/changes.too_big"
+	if git -C "$ROOST_WORKSPACE" add -A >/dev/null 2>&1 &&
+		git -C "$ROOST_WORKSPACE" diff --cached --numstat "$base" >"$d/changes.all.tmp" &&
+		: >"$d/changes.numstat.tmp" &&
+		LC_ALL=C awk -F '\t' -v rows="$d/changes.numstat.tmp" -v maxr=@MAX_FILES@ -v maxb=@MAX_NUMSTAT@ '
+			{ f++; if ($1 != "-") a += $1; if ($2 != "-") x += $2
+			  if (f <= maxr && n + length($0) + 1 <= maxb) { print > rows; n += length($0) + 1 } }
+			END { printf "%d %d %d\n", f, a, x }' "$d/changes.all.tmp" >"$d/changes.total.tmp" &&
+		git -C "$ROOST_WORKSPACE" diff --cached --binary "$base" >"$d/changes.patch.tmp"; then
+		if [ "$(wc -c <"$d/changes.patch.tmp")" -gt @MAX_PATCH@ ]; then
+			rm -f "$d/changes.patch.tmp"
+			: >"$d/changes.too_big"
+		elif [ -s "$d/changes.patch.tmp" ]; then
+			mv -f "$d/changes.patch.tmp" "$d/changes.patch"
+		else
+			rm -f "$d/changes.patch.tmp"
+		fi
+		mv -f "$d/changes.numstat.tmp" "$d/changes.numstat"
+		mv -f "$d/changes.total.tmp" "$d/changes.total"
+		echo "[roost] 改动:$(cut -d ' ' -f 1 <"$d/changes.total") 个文件"
+	else
+		rm -f "$d/changes.patch.tmp" "$d/changes.numstat.tmp" "$d/changes.total.tmp"
+		echo "[roost] 无法收集 worktree 的改动"
+	fi
+	rm -f "$d/changes.all.tmp"
+fi
 git -C "$ROOST_REPO_PATH" worktree remove --force "$ROOST_WORKSPACE" 2>/dev/null || rm -rf "$ROOST_WORKSPACE"
 git -C "$ROOST_REPO_PATH" worktree prune
 echo "[roost] worktree removed"
+]],
+			"@MAX_PATCH@",
+			tostring(tasks.MAX_PATCH)
+		),
+		"@MAX_FILES@",
+		tostring(tasks.MAX_FILES)
+	),
+	"@MAX_NUMSTAT@",
+	tostring(tasks.MAX_NUMSTAT)
+)
+
+-- A run's environment (roost.toml [environments.<name>], runner.environment_of), before its other
+-- steps: `sh -c ENV_SCRIPT roost NAME...` writes the named variables (already in this step's
+-- environment) and the PATH prefix ($ROOST_ENV_PATH) to runs/<id>/environment.sh, owner-only, for
+-- omp steps to source, then runs the environment's setup ($ROOST_ENV_SETUP) in the workspace with
+-- the default umask. Names are validated identifiers.
+M.ENV_SCRIPT = [[
+f="$ROOST_RUN_DIR/environment.sh"
+(umask 077 && : >"$f") || exit 1
+for _roost_n in "$@"; do
+	eval "_roost_v=\${$_roost_n-}"
+	_roost_q=$(printf '%s' "$_roost_v" | sed "s/'/'\\\\''/g")
+	printf "export %s='%s'\n" "$_roost_n" "$_roost_q" >>"$f" || exit 1
+done
+if [ -n "$ROOST_ENV_PATH" ]; then
+	_roost_q=$(printf '%s' "$ROOST_ENV_PATH" | sed "s/'/'\\\\''/g")
+	printf "export PATH='%s':\"\$PATH\"\n" "$_roost_q" >>"$f" || exit 1
+fi
+echo "[roost] 环境「${ROOST_ENV_NAME}」:$# 个变量"
+if [ -n "$ROOST_ENV_SETUP" ]; then
+	echo "[roost] 运行环境的 setup"
+	/bin/sh -c "$ROOST_ENV_SETUP" || exit $?
+fi
+]]
+
+-- A follow-up's first step (`resume`), before its worktree is prepared: `sh -c RESUME_SESSION roost
+-- SRC DST NOTE TALLY MAX PSRC PDST`. Copies the parent's patch PSRC to PDST (prepare applies it),
+-- and the parent step's session directory SRC into the new step's DST (lock files left behind),
+-- then writes NOTE: the newest session file's name and size (logging starts past them) and what
+-- the copy already cost (M.TALLY, subtracted from the step's own tally). Empty SRC/PSRC: none.
+M.RESUME_SESSION = [[
+src=$1; dst=$2; note=$3; tally=$4; max=$5; psrc=$6; pdst=$7
+if [ -n "$psrc" ]; then
+	if [ ! -f "$psrc" ]; then
+		echo "[roost] 找不到上一次运行的改动($psrc),无法接续" >&2
+		exit 1
+	fi
+	cp "$psrc" "$pdst" || exit 1
+fi
+if [ -n "$src" ]; then
+	if [ ! -d "$src" ]; then
+		echo "[roost] 找不到上一次运行的会话($src),无法接续" >&2
+		exit 1
+	fi
+	mkdir -p "$dst" && cp -R "$src/." "$dst/" || exit 1
+	find "$dst" -name '.*.lock*' -exec rm -f {} + 2>/dev/null
+	f=$(ls "$dst"/*.jsonl 2>/dev/null | sort | tail -n 1)
+	if [ -z "$f" ]; then
+		echo "[roost] 上一次运行没有留下会话记录,无法接续" >&2
+		exit 1
+	fi
+	{ basename "$f"; wc -c <"$f" | tr -d ' '; /bin/sh -c "$tally" roost "$dst" "$max"; } >"$note" 2>/dev/null || exit 1
+fi
+echo "[roost] 已接续上一次运行"
 ]]
 
 local MAX_QUEUE = 100
@@ -171,6 +288,13 @@ export type Request = {
 	rerun_of: string?,
 	-- An evolver started by a target's failure (lib/evolve.luau).
 	evolve: { target: string, run: string }?,
+	task: store.Task?, -- a built-in run (lib/tasks.luau); the workflow passed is tasks.workflow's
+	-- A follow-up (store.Run fields of the same names): the run it continues, the commit its worktree
+	-- starts at, the patch applied on it, and the session directory its omp step resumes.
+	parent: string?,
+	base: string?,
+	patch: string?,
+	resume: string?,
 }
 
 -- Copies the tails of run logs into an evolver's material: `sh -c EVOLVE_LOGS roost DST SRC ...`.
@@ -215,6 +339,9 @@ export type Env = {
 	evolve_prepare: (run: store.Run, wf: model.Workflow) -> ({ string }, string?),
 	-- Told once a run has finished (after its record is final), outside the runner's own call.
 	finished: (run: store.Run) -> (),
+	-- What a step wrote to $ROOST_INBOX (lib/inbox.luau), for core to apply; returns a line for the
+	-- run's log when part or all of it couldn't be used.
+	inbox: (run: store.Run, raw: string) -> string?,
 }
 
 -- Per-run state that isn't persisted.
@@ -480,9 +607,13 @@ function M.active(r: Runner): (number, number)
 	return count(r, "running"), count(r, "queued")
 end
 
--- The run's workflow: the current definition, a stand-in when it was deleted (so cleanup can
--- still run), or nil when no valid workflows.toml has loaded yet (hold everything).
+-- The run's workflow: the current definition (built-in runs: rebuilt from the run record), a
+-- stand-in when it was deleted (so cleanup can still run), or nil when no valid workflows.toml has
+-- loaded yet (hold everything).
 local function resolve(r: Runner, run: Run): (Workflow?, boolean)
+	if run.task then
+		return tasks.workflow(run.workflow, run.task, run.repo), false
+	end
 	local wfs = r.env.workflows()
 	if wfs == nil then
 		return nil, false
@@ -497,6 +628,7 @@ local function resolve(r: Runner, run: Run): (Workflow?, boolean)
 		enabled = false,
 		manual = false,
 		notify = false,
+		reply = false,
 		concurrency = "queue",
 		workspace = "temp",
 		env = {},
@@ -532,7 +664,10 @@ local function workspace(r: Runner, wf: Workflow, req: Request, id: string): (st
 end
 
 local function title_for(wf: Workflow, req: Request): string
-	if req.event then
+	if req.task then
+		local t = tasks.title(req.task.prompt)
+		return if req.task.kind == "pr" then `开 PR:{t}` elseif req.parent then `追问:{t}` else t
+	elseif req.event then
 		return match.summary(req.event)
 	elseif req.trigger.kind == "cron" then
 		return `定时 {req.trigger.detail}`
@@ -550,6 +685,7 @@ local function slim(e: { [string]: any }?): { [string]: any }?
 	local out = table.clone(e)
 	out.body = nil
 	out.comment = nil
+	out.request = nil
 	return out
 end
 
@@ -577,15 +713,30 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 	if as_app then
 		table.insert(steps, { name = "获取 App 令牌", kind = "auth", state = "pending" })
 	end
+	if req.resume or req.patch then
+		table.insert(steps, { name = "接续上一次运行", kind = "resume", state = "pending" })
+	end
 	if mode == "worktree" then
 		table.insert(steps, { name = "准备 worktree", kind = "prepare", state = "pending" })
 	end
 	if wf.evolve then
 		table.insert(steps, { name = "准备迭代材料", kind = "evolve", state = "pending" })
 	end
+	-- The roost.toml environment it names: variables for omp steps, then its setup.
+	if wf.environment then
+		table.insert(steps, { name = "准备环境", kind = "env", state = "pending" })
+	end
+	-- Answering on the issue/PR that started the run (lib/reply.luau).
+	local replying = wf.reply and req.repo ~= nil and req.event ~= nil and tonumber(req.event.number) ~= nil
+	if replying then
+		table.insert(steps, { name = "回复:已收到", kind = "ack", state = "pending" })
+	end
 	for _, s in wf.steps do
 		local kind = s.kind :: string
 		table.insert(steps, { name = s.name, kind = kind, state = "pending", model = if kind == "omp" then s.model else nil })
+	end
+	if replying then
+		table.insert(steps, { name = "回复:结果", kind = "report", state = "pending" })
 	end
 	if mode == "worktree" then
 		table.insert(steps, { name = "清理 worktree", kind = "cleanup", state = "pending" })
@@ -612,6 +763,11 @@ function M.submit(r: Runner, wf: Workflow, req: Request): (Run?, string?)
 		identity = if as_app then "app" else nil,
 		evolve_target = if req.evolve then req.evolve.target else nil,
 		evolve_run = if req.evolve then req.evolve.run else nil,
+		task = req.task,
+		parent = req.parent,
+		base = req.base,
+		patch = req.patch,
+		resume = req.resume,
 	}
 	local others = busy(r, wf.id)
 	if #others > 0 and wf.concurrency == "skip" then
@@ -660,6 +816,11 @@ function M.request_of(r: Runner, run: Run): Request
 		payload = payload,
 		rerun_of = run.id,
 		evolve = if run.evolve_target and run.evolve_run then { target = run.evolve_target, run = run.evolve_run } else nil,
+		task = run.task,
+		parent = run.parent,
+		base = run.base,
+		patch = run.patch,
+		resume = run.resume,
 	}
 end
 
@@ -682,6 +843,8 @@ local function finish(r: Runner, run: Run, state: string, reason: string?)
 	end
 	-- Scratch ($ROOST_TMP) goes out of process; the run's file copies stay with its directory.
 	store.discard(r.env.store, `{dir_of(r, run.id)}/tmp`)
+	-- The environment's values for omp steps (environment.sh) go with the run's end.
+	pcall(tern.fs.remove, `{dir_of(r, run.id)}/environment.sh`)
 	-- Tabs this run opened for itself (`keep` off) close now, unless a later run took the key over.
 	-- Any open step that got as far as queuing its operation: a failed or lost one may still have
 	-- opened its tab, and `only_run` keeps a tab another run took over.
@@ -761,13 +924,14 @@ function M.cancel(r: Runner, id: string, reason: string?): boolean
 		persist(r, true)
 		return true
 	end
-	if run.state ~= "running" or run.stop or run.final then
+	local cur = run.steps[run.step]
+	-- Past the user's steps (cleanup, the reply on how it ended) there is nothing left to cancel.
+	if run.state ~= "running" or run.stop or run.final or (cur and (cur.kind == "cleanup" or cur.kind == "report")) then
 		return false
 	end
 	run.stop = "cancel"
 	run.reason = reason or "已取消"
-	local cur = run.steps[run.step]
-	if cur and cur.kind ~= "cleanup" and not cur.agent and cur.state == "running" then
+	if cur and not cur.agent and cur.state == "running" then
 		signal(r, run, "TERM")
 	end
 	persist(r, true)
@@ -809,6 +973,7 @@ local function template_ctx(r: Runner, run: Run, wf: Workflow, needs_payload: bo
 		branch = e.branch,
 		sender = e.sender,
 		comment = e.comment,
+		request = e.request,
 		label = e.label,
 		workflow = wf.id,
 		run_id = run.id,
@@ -825,16 +990,34 @@ end
 -- GitHub tokens a login shell may export: they would act as you in a run acting as the App.
 local GITHUB_TOKENS = { "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN" }
 
+-- The roost.toml environment `wf` names, or why it can't be had.
+local function environment_of(r: Runner, wf: Workflow): (model.Environment?, string?)
+	local name = wf.environment
+	if name == nil then
+		return nil, nil
+	end
+	local e = r.env.config().environments[name]
+	if e == nil then
+		return nil, `roost.toml 中没有环境「{name}」([environments.{name}])`
+	end
+	return e, nil
+end
+
 -- `app`: the step acts as the App, so the login shell's GitHub tokens are left out (tokens you set
--- in `[runner] env` / workflow `env` stay).
+-- in `[runner] env`, the environment or workflow `env` stay).
 local function step_env(r: Runner, run: Run, wf: Workflow, app: boolean): { [string]: string }
 	local cfg = r.env.config().runner
+	local profile = environment_of(r, wf)
 	local paths = {}
+	local extra: { string } = if profile then profile.path else {}
+	for _, p in extra do
+		table.insert(paths, util.expand(p, r.env.home))
+	end
 	for _, p in cfg.extra_path do
 		table.insert(paths, util.expand(p, r.env.home))
 	end
 	local drop = if app then GITHUB_TOKENS else nil
-	local env = loginenv.compose(r.env.login(), { cfg.env, wf.env }, paths, r.env.path, drop)
+	local env = loginenv.compose(r.env.login(), { cfg.env, if profile then profile.vars else {}, wf.env }, paths, r.env.path, drop)
 	local e: { [string]: any } = run.event or {}
 	local function put(k: string, v: any)
 		env[k] = if v == nil then "" else tostring(v)
@@ -848,6 +1031,9 @@ local function step_env(r: Runner, run: Run, wf: Workflow, app: boolean): { [str
 	put("ROOST_REPO_PATH", run.repo_path)
 	put("ROOST_WORKSPACE", run.cwd)
 	put("ROOST_RUN_DIR", dir_of(r, run.id))
+	-- A follow-up's worktree: the parent's start, and the copy of its patch the resume step made.
+	put("ROOST_BASE_SHA", run.base)
+	put("ROOST_BASE_PATCH", if run.patch then `{dir_of(r, run.id)}/parent.patch` else nil)
 	-- Copies taken when the run started (lib/files.luau), the state kept across runs, and scratch.
 	put("ROOST_FILES", `{dir_of(r, run.id)}/files`)
 	put("ROOST_LIB", `{dir_of(r, run.id)}/lib`)
@@ -1042,11 +1228,12 @@ end
 local check: (Runner, Run) -> ()
 local next_step: (Runner, Run, Workflow) -> ()
 
--- The definition of user step `i` (auth/prepare/evolve/cleanup have none), matched by name and kind.
+-- The definition of user step `i` (auth/resume/prepare/evolve/cleanup have none), matched by name and kind.
 local function definition(run: Run, wf: Workflow, i: number): model.Step?
 	local offset = 0
 	local function internal(s: store.StepRec?): boolean
-		return s ~= nil and (s.kind == "auth" or s.kind == "prepare" or s.kind == "evolve")
+		return s ~= nil
+			and (s.kind == "auth" or s.kind == "resume" or s.kind == "prepare" or s.kind == "evolve" or s.kind == "env" or s.kind == "ack")
 	end
 	while internal(run.steps[offset + 1]) do
 		offset += 1
@@ -1058,15 +1245,64 @@ local function definition(run: Run, wf: Workflow, i: number): model.Step?
 	return nil
 end
 
+-- What a follow-up's resume step left for step `i` (M.RESUME_SESSION): the copied conversation's
+-- newest session file and its size, and what the copy already cost.
+type Resumed = { file: string, size: number, cost: number?, tokens: number? }
+local function read_resumed(d: string, i: number): Resumed?
+	local ok, text = pcall(tern.fs.read, `{d}/s{i}.resume`, 16 * 1024)
+	if not ok then
+		return nil
+	end
+	local name, size, rest = string.match(text :: string, "^([^\n]+)\n(%d+)\n?(.*)$")
+	if not name or not size or not string.match(name, "^[^/]+%.jsonl$") then
+		return nil
+	end
+	local c, t = M.parse_tally(rest or "")
+	return { file = name, size = tonumber(size) :: number, cost = c, tokens = t }
+end
+
+-- The final answer of the run's last omp step that gave one (the session file's, else the
+-- window's copy), at most reply.MAX_ANSWER bytes and a little: for the reply comment.
+local function last_answer(r: Runner, run: Run): string?
+	local d = dir_of(r, run.id)
+	for i = #run.steps, 1, -1 do
+		local s = run.steps[i]
+		if s.kind == "omp" and s.agent then
+			local f = agent.files(d, i)
+			for _, p in { f.answer, f.reply } do
+				local ok, text = pcall(tern.fs.read, p, agent.MAX_REPLY)
+				if ok and util.trim(text :: string) ~= "" then
+					return text :: string
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- The first omp step of a run: the one a follow-up's conversation continues in.
+local function first_omp(run: Run): number?
+	for i, s in run.steps do
+		if s.kind == "omp" then
+			return i
+		end
+	end
+	return nil
+end
+
 -- Hands an omp step to the windows: the job file first, then kv `agent_jobs` (through persist).
-local function start_agent(r: Runner, run: Run, i: number, job: agent.Job)
+-- `from`: the conversation it resumes, whose earlier entries are not logged again.
+local function start_agent(r: Runner, run: Run, i: number, job: agent.Job, from: Resumed?)
 	local f = agent.files(dir_of(r, run.id), i)
-	for _, p in { f.claim, f.pane, f.reply, f.job } do
+	for _, p in { f.claim, f.pane, f.reply, f.answer, f.job } do
 		pcall(tern.fs.remove, p)
 	end
 	pcall(tern.fs.mkdir, f.session)
 	run.steps[i].agent = true
 	run.steps[i].opened, run.steps[i].tail_file, run.steps[i].tail, run.steps[i].replied = nil, nil, nil, nil
+	if from then
+		run.steps[i].tail_file, run.steps[i].tail = from.file, from.size
+	end
 	local ok, err = pcall(function(): string?
 		tern.fs.write(f.job, tern.json.encode(job))
 		return nil
@@ -1147,6 +1383,7 @@ function tail_agent(r: Runner, run: Run, i: number, final: boolean)
 		s.tail = (s.tail or 0) + p.used
 		if p.final then
 			s.replied = true
+			pcall(tern.fs.write, f.answer, string.sub(p.final, 1, agent.MAX_REPLY))
 		end
 		for _, line in p.lines do
 			table.insert(head, line)
@@ -1243,7 +1480,8 @@ local function tally_agent(r: Runner, run: Run, i: number)
 		local cur = r.env.store.by_id[id]
 		local s = if cur then cur.steps[i] else nil
 		if s and c and t then
-			s.cost, s.tokens = c, t
+			-- A resumed conversation's copied history is the parent's spend, not this step's.
+			s.cost, s.tokens = math.max(0, c - (s.cost_base or 0)), math.max(0, t - (s.tokens_base or 0))
 			if #uses > 0 then
 				s.models = uses
 			end
@@ -1676,6 +1914,7 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	end
 	local argv: { string } = {}
 	local job: agent.Job? = nil
+	local from: Resumed? = nil
 	local tabstep: model.TabStep? = nil
 	local cwd = run.cwd or d
 	local def: model.Step? = nil
@@ -1688,6 +1927,46 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	elseif s.kind == "cleanup" then
 		argv = { cfg.shell, "-c", M.CLEANUP_WORKTREE }
 		cwd = run.repo_path or d
+	elseif s.kind == "env" then
+		cwd = run.cwd or d
+		local profile, why = environment_of(r, wf)
+		if profile then
+			argv = { cfg.shell, "-c", M.ENV_SCRIPT, "roost" }
+			for _, k in util.keys(profile.vars) do
+				table.insert(argv, k)
+			end
+		else
+			argv = refuse(why or "工作流没有指定环境")
+		end
+	elseif s.kind == "ack" or s.kind == "report" then
+		cwd = d
+		if app_missing(r, run) then
+			-- Never as you: without the App's token the reply isn't sent at all.
+			argv = refuse("没有可用的 App 令牌,不在评论中回复")
+		elseif s.kind == "ack" then
+			argv = { cfg.shell, "-c", reply.ACK, "roost", reply.ack_text(run.id) }
+		else
+			local body = `{d}/reply.md`
+			argv = if pcall(tern.fs.write, body, reply.body(run.final or "success", run.reason, last_answer(r, run), run.id))
+				then { cfg.shell, "-c", reply.REPORT, "roost", body }
+				else refuse("无法写入回复内容")
+		end
+	elseif s.kind == "resume" then
+		cwd = d
+		local j = first_omp(run)
+		argv = {
+			cfg.shell,
+			"-c",
+			M.RESUME_SESSION,
+			"roost",
+			if j then run.resume or "" else "",
+			if j then agent.files(d, j).session else "",
+			if j then `{d}/s{j}.resume` else "",
+			M.TALLY,
+			tostring(MAX_USES),
+			run.patch or "",
+			`{d}/parent.patch`,
+		}
 	elseif s.kind == "evolve" then
 		-- The material is written now; only the log tails are copied by the step's process.
 		cwd = d
@@ -1747,6 +2026,17 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 				table.insert(args, "--model")
 				table.insert(args, step.model)
 			end
+			-- A follow-up continues the conversation its resume step copied in.
+			local resuming = run.resume ~= nil and i == first_omp(run)
+			if resuming then
+				from = read_resumed(d, i)
+				if from then
+					local got = from :: Resumed
+					table.insert(args, "--resume")
+					table.insert(args, `{agent.files(d, i).session}/{got.file}`)
+					s.cost_base, s.tokens_base = got.cost, got.tokens
+				end
+			end
 			-- A view-only collab host: the console's split joins it (`omp join`) as a viewer, which
 			-- closes without touching the step.
 			local collab = `{d}/s{i}.collab.yml`
@@ -1755,11 +2045,31 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 				table.insert(args, collab)
 			end
 			local command: string? = if app_missing(r, run) then nil else agent.command(cfg.omp, agent.files(d, i).session, args)
-			if command and run.app then
-				-- cx.agents:start passes no environment: the identity goes through a sourced file.
-				local envf = `{d}/s{i}.env`
-				local ok = pcall(tern.fs.write, envf, app_script(r, run))
-				command = if ok then agent.with_env(envf, command :: string) else nil
+			if command then
+				-- cx.agents:start passes no environment: the App identity and the environment's
+				-- values go through a sourced file (neither holds a token or a value itself). The
+				-- environment comes first, so the App's gh shim leads PATH and its token handling wins.
+				local parts: { string } = {}
+				-- Keyed on this run's own steps: a queued run whose workflow gained an environment has none.
+				local has_env = false
+				for _, x in run.steps do
+					has_env = has_env or x.kind == "env"
+				end
+				if has_env then
+					local envsh = util.shq(`{d}/environment.sh`)
+					table.insert(parts, `[ ! -f {envsh} ] || . {envsh}\n`)
+				end
+				if run.app then
+					table.insert(parts, app_script(r, run))
+				end
+				if #parts > 0 then
+					local envf = `{d}/s{i}.env`
+					local ok = pcall(tern.fs.write, envf, table.concat(parts))
+					command = if ok then agent.with_env(envf, command :: string) else nil
+				end
+			end
+			if command and resuming and from == nil then
+				command = nil
 			end
 			if command then
 				job = {
@@ -1773,7 +2083,7 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 					session = cfg.session,
 				}
 			else
-				argv = { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌或身份文件,omp 步骤未启动' >&2; exit 1" }
+				argv = refuse(if resuming and from == nil then "没有可接续的会话,omp 步骤未启动" else "没有可用的 App 令牌或身份文件,omp 步骤未启动")
 			end
 		elseif app_missing(r, run) then
 			argv = { "/bin/sh", "-c", "echo '[roost] 没有可用的 App 令牌,步骤未以 App 身份启动' >&2; exit 1" }
@@ -1799,8 +2109,11 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	if def and def.timeout then
 		deadline = math.min(deadline, now(r) + def.timeout)
 	end
-	if s.kind == "cleanup" then
+	if s.kind == "report" then
 		deadline = now(r) + 120
+	elseif s.kind == "cleanup" then
+		-- Never signalled (the worktree must go): this only bounds process.run's own backstop.
+		deadline = now(r) + 600
 	end
 	run.step_deadline = deadline
 	s.state = "running"
@@ -1813,7 +2126,7 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	end
 	pcall(tern.fs.remove, `{d}/s{i}.exit`)
 	if job then
-		start_agent(r, run, i, job)
+		start_agent(r, run, i, job, from)
 		return
 	end
 	if tabstep then
@@ -1823,14 +2136,28 @@ local function start_step(r: Runner, run: Run, wf: Workflow, i: number)
 	pcall(tern.fs.remove, `{d}/s{i}.pid`)
 	pcall(tern.fs.remove, `{d}/s{i}.pid.w`)
 	local log = `{d}/log.txt`
-	local app = run.app ~= nil and s.kind ~= "prepare" and s.kind ~= "cleanup" and s.kind ~= "evolve"
+	local app = run.app ~= nil and s.kind ~= "prepare" and s.kind ~= "cleanup" and s.kind ~= "evolve" and s.kind ~= "resume" and s.kind ~= "env"
 	local env = step_env(r, run, wf, app)
 	if def then
 		env.ROOST_OUTPUT = `{d}/s{i}.out`
+		env.ROOST_INBOX = `{d}/s{i}.inbox.json`
 		pcall(tern.fs.remove, env.ROOST_OUTPUT)
+		pcall(tern.fs.remove, env.ROOST_INBOX)
 	end
 	if app then
 		with_app(r, run, env)
+	end
+	if s.kind == "env" then
+		local profile = environment_of(r, wf)
+		env.ROOST_ENV_NAME = wf.environment or ""
+		env.ROOST_ENV_SETUP = if profile then profile.setup or "" else ""
+		-- Before PATH for omp steps too (shell steps get it through step_env).
+		local paths: { string } = {}
+		local extra: { string } = if profile then profile.path else {}
+		for _, p in extra do
+			table.insert(paths, util.expand(p, r.env.home))
+		end
+		env.ROOST_ENV_PATH = table.concat(paths, ":")
 	end
 	env.ROOST_BANNER = `\27[1;36m▶ {s.name}\27[0m`
 	local full = { cfg.shell, "-c", M.WRAPPER, "roost", log, `{d}/s{i}.pid`, `{d}/s{i}.exit`, cwd }
@@ -1864,8 +2191,8 @@ end
 function next_step(r: Runner, run: Run, wf: Workflow)
 	local i = run.step + 1
 	if run.final then
-		-- Stopped or failed: only the cleanup step still runs.
-		while run.steps[i] and run.steps[i].kind ~= "cleanup" do
+		-- Stopped or failed: only the reply about it and the cleanup step still run.
+		while run.steps[i] and run.steps[i].kind ~= "cleanup" and run.steps[i].kind ~= "report" do
 			run.steps[i].state = "skipped"
 			i += 1
 		end
@@ -1884,18 +2211,40 @@ function next_step(r: Runner, run: Run, wf: Workflow)
 	M.pump(r)
 end
 
+-- What the cleanup step found the worktree changed (M.CLEANUP_WORKTREE): totals from its numstat.
+local function read_changes(r: Runner, run: Run)
+	local d = dir_of(r, run.id)
+	local ok, text = pcall(tern.fs.read, `{d}/changes.total`, 256)
+	if not ok then
+		return
+	end
+	local files, add, del = string.match(text :: string, "^(%d+) (%d+) (%d+)")
+	local n = tonumber(files) or 0
+	if n > 0 then
+		run.changes = {
+			files = n,
+			add = tonumber(add) or 0,
+			del = tonumber(del) or 0,
+			too_big = if tern.fs.exists(`{d}/changes.too_big`) then true else nil,
+		}
+	end
+end
+
 local function step_done(r: Runner, run: Run, wf: Workflow, code: number)
 	local s = run.steps[run.step]
 	s.exit_code = code
 	s.finished_at = now(r)
 	s.state = if code == 0 then "success" else "failed"
 	local def = if s.kind == "prepare" or s.kind == "cleanup" or s.kind == "auth" then nil else definition(run, wf, run.step)
+	if s.kind == "cleanup" then
+		read_changes(r, run)
+	end
 	if run.stop == "cancel" then
 		run.final = run.final or "cancelled"
 	elseif run.stop == "timeout" then
 		run.final = run.final or "timed_out"
 		run.reason = "超时"
-	elseif code ~= 0 and s.kind ~= "cleanup" and not (def and def.continue_on_error) then
+	elseif code ~= 0 and s.kind ~= "cleanup" and s.kind ~= "report" and s.kind ~= "ack" and not (def and def.continue_on_error) then
 		if run.final == nil then
 			run.final = "failed"
 			run.reason = if s.agent
@@ -1911,6 +2260,23 @@ local function step_done(r: Runner, run: Run, wf: Workflow, code: number)
 			run.final = "skipped"
 			run.reason = stop
 			append_log(r, run.id, { `[roost] {s.name} 结束了这次运行:{stop}` })
+		end
+		-- What the step reported for the inbox (the wrapper left only a regular file there).
+		local ib = `{dir_of(r, run.id)}/s{run.step}.inbox.json`
+		if tern.fs.exists(ib) then
+			local ok, raw = pcall(tern.fs.read, ib, inbox.MAX_FILE)
+			pcall(tern.fs.remove, ib)
+			local note: string?
+			if not ok then
+				-- An oversize file is refused by the read itself.
+				note = `$ROOST_INBOX 读不出(超过 {inbox.MAX_FILE // 1024} KiB?),已忽略`
+			else
+				local okh, res = pcall(r.env.inbox, run, raw :: string)
+				note = if okh then res else `收件箱更新失败:{res}`
+			end
+			if note then
+				append_log(r, run.id, { `[roost] 收件箱:{note}` })
+			end
 		end
 	end
 	if s.agent then
@@ -1983,7 +2349,7 @@ function check(r: Runner, run: Run)
 	if deleted and run.final == nil then
 		run.final = "interrupted"
 		run.reason = "工作流已被删除"
-		if cur.kind ~= "cleanup" then
+		if cur.kind ~= "cleanup" and cur.kind ~= "report" then
 			run.stop = "cancel"
 		end
 		persist(r)
@@ -2014,7 +2380,8 @@ function check(r: Runner, run: Run)
 		end
 		return
 	end
-	if run.stop == nil and run.step_deadline and t >= run.step_deadline then
+	-- Cleanup and the reply come after the run's outcome: their deadline never changes it.
+	if run.stop == nil and run.step_deadline and t >= run.step_deadline and cur.kind ~= "cleanup" and cur.kind ~= "report" then
 		run.stop = "timeout"
 		persist(r)
 	end
@@ -2036,7 +2403,10 @@ function check(r: Runner, run: Run)
 		watch_agent(r, run, i)
 		return
 	end
-	if run.stop and cur.kind ~= "cleanup" then
+	-- Cleanup finishes even when the run was stopped; the reply on how it ended too, but only until
+	-- its own deadline.
+	local overdue = cur.kind == "report" and run.step_deadline ~= nil and t >= run.step_deadline
+	if (run.stop and cur.kind ~= "cleanup" and cur.kind ~= "report") or overdue then
 		local sent = l.killed[i]
 		if sent == nil then
 			signal(r, run, "TERM")

@@ -19,6 +19,23 @@ local M = {}
 -- name of its session file) or by a side call such as omp's judge (`role`).
 export type ModelUse = { model: string, agent: string?, role: string? }
 
+-- A built-in run (lib/tasks.luau) that no workflows.toml entry describes: a task typed on the home
+-- page or a follow-up (`kind = "task"`, one omp step), or opening a PR from a run's changes
+-- (`kind = "pr"`, one shell step). The run's workflow id is `task.<hex>`.
+export type Task = {
+	kind: string, -- task | pr
+	prompt: string, -- task: what to do; pr: the PR's title
+	model: string?, -- task: the omp step's model setting
+	workspace: string, -- worktree | repo | temp
+	body: string?, -- pr: the PR's description
+	branch: string?, -- pr: the branch pushed
+	base: string?, -- pr: the branch the PR goes into (nil: the repository's default)
+	environment: string?, -- task: a roost.toml [environments.<name>] it runs with
+}
+
+-- What a worktree run changed against the commit it started at (runs/<id>/changes.*).
+export type Changes = { files: number, add: number, del: number, too_big: boolean? }
+
 export type StepRec = {
 	name: string,
 	kind: string, -- auth | prepare | evolve | omp | run | file | tab | upgrade | cleanup
@@ -33,6 +50,9 @@ export type StepRec = {
 	replied: boolean?, -- agent step: the log already holds the final answer
 	cost: number?, -- agent step: estimated USD from its session files (subagents included), once it ended
 	tokens: number?, -- agent step: total tokens from the same files
+	-- agent step resuming an earlier conversation: what the copied-in history already cost (left out of cost/tokens)
+	cost_base: number?,
+	tokens_base: number?,
 	-- omp step: its `model` setting (`provider/id` or `@role`); nil runs omp's default role
 	model: string?,
 	-- agent step: the models its session files show (read while it works, final once it ended)
@@ -79,6 +99,16 @@ export type Run = {
 	-- A run an evolver started because a target failed (lib/evolve.luau): that workflow and its run.
 	evolve_target: string?,
 	evolve_run: string?,
+	task: Task?, -- a built-in run (lib/tasks.luau)
+	-- A follow-up: the run it continues. Its worktree starts at `base` (the parent's start) with
+	-- `patch` (the parent's changes) applied; its omp step resumes the conversation copied from `resume`.
+	parent: string?,
+	base: string?,
+	patch: string?,
+	resume: string?,
+	changes: Changes?,
+	branch: string?, -- the local branch made from its changes
+	pr: string?, -- the pull request opened from its changes
 }
 
 export type Store = {

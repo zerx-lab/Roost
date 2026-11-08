@@ -243,6 +243,7 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
         started_at,
         shutdown: shutdown_tx.clone(),
         subs_write: tokio::sync::Mutex::new(()),
+        dispatch_hits: Mutex::new(BTreeMap::new()),
     });
 
     let listener = tokio::net::TcpListener::bind(listen).await.map_err(|e| {

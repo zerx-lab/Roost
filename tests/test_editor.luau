@@ -875,5 +875,31 @@ do -- the add-trigger menu item adds a roost trigger
 	eq(tr[1].schedule, nil)
 end
 
+do -- an API trigger: a generated token shows once, only its SHA-256 goes into the workflow
+	local w = world({})
+	local TOK, HASH = string.rep("1f", 32), string.rep("e3", 32)
+	local base = w.env.process
+	w.env.process = function(argv: { string }, opts: any): any
+		if string.find(argv[3] or "", "openssl rand", 1, true) then
+			return { status = 0, stdout = `{TOK}\n{HASH}\n`, stderr = "", timed_out = false }
+		end
+		return base(argv, opts)
+	end
+	click(w, "editor-new")
+	view(w)
+	click(w, "api:new")
+	local tr = w.st.editor.raw.trigger
+	eq(#tr, 1)
+	eq(tr[1].api, "", "no token yet")
+	click(w, "api-gen:1")
+	w.env.drain()
+	eq(tr[1].api, HASH, "the hash is kept")
+	local shown = view(w)
+	local text = F.text(shown.layer)
+	truthy(string.find(text, TOK, 1, true), "the token shows once")
+	truthy(string.find(text, "/hooks/dispatch/", 1, true), "with how to call it")
+	click(w, "api-copy:1")
+	eq(w.cx.copied[#w.cx.copied], TOK)
+end
 
 print("ok")

@@ -470,6 +470,335 @@ do -- cancel while an agent works in a worktree: the window closes it, cleanup s
 	eq(run.steps[3].state, "success", "cleanup ran after cancel")
 end
 
+do -- a task works in a worktree, keeps its changes; a follow-up resumes its conversation on them; a PR and a branch use them
+	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TREE, [DATA .. "/roost.toml"] = LOCAL })
+	local w = window(s)
+	local BASE = "0123456789abcdef0123456789abcdef01234567"
+	s.behave = function(p: Proc): string
+		local script = p.cmd[3] or ""
+		local d = `{DATA}/runs/{p.run}`
+		if string.find(script, "rev-parse HEAD >", 1, true) then
+			s.env.files[d .. "/base.txt"] = BASE .. "\n"
+		elseif string.find(script, "changes.numstat.tmp", 1, true) then
+			s.env.files[d .. "/changes.numstat"] = "3\t1\tsrc/a.lua\n-\t-\timg.png\n"
+			s.env.files[d .. "/changes.total"] = "2 3 1\n"
+			s.env.files[d .. "/changes.patch"] = "diff --git a/src/a.lua b/src/a.lua\n"
+		elseif string.find(script, "已接续上一次运行", 1, true) then
+			-- The resume step: the patch copy, and the note for the omp step (step 3).
+			s.env.files[d .. "/parent.patch"] = "diff\n"
+			if p.cmd[7] ~= "" then
+				s.env.files[p.cmd[7]] = "2026-11-08T00-00-00-000Z_abc.jsonl\n51\n0.500000 100\n"
+			end
+		elseif string.find(script, "gh pr create", 1, true) then
+			s.env.files[p.opts.env.ROOST_OUTPUT] = "pr=https://github.com/acme/web/pull/9\n"
+		end
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	local id, err = s.core.start_task(s.c, { prompt = "修 {{number}} 的崩溃\n细节见 issue", repo = "acme/web" })
+	eq(err, nil)
+	local run = s.c.store.by_id[id]
+	truthy(string.sub(run.workflow, 1, 5) == "task.", "a built-in workflow id: " .. run.workflow)
+	eq(run.title, "修 {{number}} 的崩溃", "titled by its first line")
+	eq(run.workspace, "worktree", "a repository with a checkout: always a worktree")
+	eq(#run.steps, 3)
+	eq(run.steps[1].kind, "prepare")
+	eq(run.steps[3].kind, "cleanup")
+	step(s, 2)
+	eq(#w.started, 1, "the task's agent opened")
+	truthy(string.find(w.started[1].opts.prompt, "修 {{number}} 的崩溃", 1, true), "the text is literal, never a template")
+	local d1 = `{DATA}/runs/{id}`
+	s.env.files[d1 .. "/s2.session/2026-11-08T00-00-00-000Z_abc.jsonl"] = '{"type":"message"}\n'
+	s.tally = "0.500000 100\n"
+	w.reply(w.started[1].pane, "已修复,改了 src/a.lua")
+	step(s, 6)
+	eq(run.state, "success")
+	truthy(run.changes and run.changes.files == 2 and run.changes.add == 3 and run.changes.del == 1, "the changes' totals")
+	local rows = s.core.changes(s.c, id)
+	eq(rows[2].path, "img.png")
+	eq(rows[2].add, nil, "binary files have no counts")
+	truthy(string.find(s.core.answer(s.c, id) or "", "已修复", 1, true), "the final answer")
+	eq(s.core.changes_block(s.c, run), nil, "the changes can become a branch or a PR")
+
+	-- A follow-up: resume step, then the worktree at the parent's base with its patch.
+	local fid, ferr = s.core.followup(s.c, id, "再补一个测试")
+	eq(ferr, nil)
+	local f = s.c.store.by_id[fid]
+	eq(f.parent, id)
+	eq(f.base, BASE)
+	eq(f.patch, d1 .. "/changes.patch")
+	eq(f.resume, d1 .. "/s2.session")
+	eq(f.title, "追问:再补一个测试")
+	eq(f.steps[1].kind, "resume")
+	eq(f.steps[2].kind, "prepare")
+	eq(f.steps[3].kind, "omp")
+	step(s, 3)
+	local prep: Proc? = nil
+	for _, p in s.procs do
+		if p.run == fid and p.step == 2 then
+			prep = p
+		end
+	end
+	truthy(prep, "prepare ran")
+	eq((prep :: Proc).opts.env.ROOST_BASE_SHA, BASE)
+	eq((prep :: Proc).opts.env.ROOST_BASE_PATCH, `{DATA}/runs/{fid}/parent.patch`)
+	eq(#w.started, 2, "the follow-up's agent opened")
+	local cmd = w.started[2].opts.command
+	truthy(string.find(cmd, `--resume {DATA}/runs/{fid}/s3.session/2026-11-08T00-00-00-000Z_abc.jsonl`, 1, true), "omp resumes the copy: " .. cmd)
+	eq(f.steps[3].tail, 51, "the copied history is not logged again")
+	eq(f.steps[3].cost_base, 0.5)
+	s.tally = "0.800000 160\n"
+	w.reply(w.started[2].pane, "测试已加")
+	step(s, 6)
+	eq(f.state, "success")
+	truthy(math.abs((f.steps[3].cost :: number) - 0.3) < 1e-9, "the parent's spend is left out: " .. tostring(f.steps[3].cost))
+	eq(f.steps[3].tokens, 60)
+	eq(s.core.children(s.c, id)[1].id, fid)
+
+	-- A rerun of a task is another task (its own workflow id).
+	eq(s.core.rerun(s.c, id), nil)
+	local again = last_run(s)
+	truthy(again.task and again.workflow ~= run.workflow, "a rerun gets its own id")
+	step(s, 2)
+	s.core.cancel(s.c, again.id)
+	step(s, 4)
+
+	-- A PR from the first run's changes: committed on its base, pushed as roost/<id>.
+	local pid, perr = s.core.open_pr(s.c, id, { title = "修崩溃", body = "说明", base = "" })
+	eq(perr, nil)
+	local pr = s.c.store.by_id[pid]
+	eq(pr.task.kind, "pr")
+	eq(pr.task.branch, `roost/{id}`)
+	eq(pr.steps[1].kind, "resume", "the patch is copied first")
+	step(s, 4)
+	eq(pr.state, "success")
+	step(s, 1)
+	eq(run.pr, "https://github.com/acme/web/pull/9", "the run links its PR")
+	local _, again_err = s.core.open_pr(s.c, id, { title = "x" })
+	truthy(again_err and string.find(again_err, "已经开过", 1, true), "one PR per run")
+
+	-- A local branch: made with the branch script in the run's checkout.
+	local got: string? = nil
+	s.core.make_branch(s.c, id, function(b, berr)
+		got = b or berr
+	end)
+	s.env.drain()
+	eq(got, `roost/{id}`)
+	eq(run.branch, `roost/{id}`)
+	local branch_call: Proc? = nil
+	for _, p in s.procs do
+		if string.find(p.argv[3] or "", "worktree add --quiet -b", 1, true) then
+			branch_call = p
+		end
+	end
+	truthy(branch_call, "the branch script ran")
+	eq((branch_call :: Proc).argv[5], "/home/test/code/web", "in the run's checkout")
+	eq((branch_call :: Proc).argv[7], BASE, "at the commit the run started at")
+	truthy((branch_call :: Proc).opts.timeout_ms, "bounded")
+
+	-- No conversation to continue: refused.
+	s.env.files[d1 .. "/s2.session/2026-11-08T00-00-00-000Z_abc.jsonl"] = nil
+	local _, nerr = s.core.followup(s.c, id, "x")
+	truthy(nerr and string.find(nerr, "没有可接续", 1, true), "no session, no follow-up")
+end
+
+do -- a shell step's $ROOST_INBOX lands in the inbox under its workflow; a bad one is logged, not fatal
+	local wf = '[[workflow]]\nid = "gate"\nworkspace = "temp"\n[[workflow.step]]\nname = "scan"\nrun = "true"\n'
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = LOCAL })
+	local body = '{"replace":true,"items":[{"id":"pr-7","title":"PR #7 等待批准","kind":"approve","run":{"workflow":"gate","pr":"7"}}]}'
+	s.behave = function(p: Proc): string
+		s.env.files[p.opts.env.ROOST_INBOX] = body
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(s.core.dispatch(s.c, "gate"), nil)
+	step(s, 2)
+	local run = last_run(s)
+	eq(run.state, "success")
+	local items = s.core.inbox_items(s.c)
+	eq(#items, 1)
+	eq(items[1].workflow, "gate")
+	eq(items[1].id, "pr-7")
+	eq(s.env.files[`{DATA}/runs/{run.id}/s1.inbox.json`], nil, "the report is consumed")
+	truthy(s.env.files[DATA .. "/inbox.json"], "saved")
+	eq(s.core.inbox_dismiss(s.c, "gate", "pr-7"), nil)
+	eq(#s.core.inbox_items(s.c), 0, "dismissed here")
+	-- Garbage: a log line, the run still succeeds, the inbox stays.
+	body = "not json"
+	eq(s.core.dispatch(s.c, "gate"), nil)
+	step(s, 2)
+	local bad = last_run(s)
+	eq(bad.state, "success")
+	truthy(string.find(s.env.files[`{DATA}/runs/{bad.id}/log.txt`] or "", "收件箱:不是 JSON 对象", 1, true), "the problem is logged")
+	-- A reload reads the book back; deleting the workflow drops its items.
+	local c2 = s.core.new(DATA)
+	eq(#c2.inbox.boxes.gate.items, 1)
+	s.env.files[DATA .. "/workflows.toml"] = '[[workflow]]\nid = "other"\nworkspace = "temp"\n[[workflow.step]]\nrun = "true"\n'
+	step(s, 4)
+	eq(s.c.inbox.boxes.gate, nil, "a deleted workflow's items go")
+end
+
+do -- a mention starts a run that acks on the issue, gets {{request}}, and reports how it ended even when cancelled
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "ask"',
+		"reply = true",
+		'workspace = "temp"',
+		"[[workflow.trigger]]",
+		'github = "mention"',
+		'repos = ["acme/web"]',
+		'handle = "@roost"',
+		"[[workflow.step]]",
+		'name = "做"',
+		'run = "echo {{request}}"',
+		"[[workflow.step]]",
+		'name = "等"',
+		'run = "sleep 100"',
+	}, "\n")
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = LOCAL })
+	s.behave = function(p: Proc): string
+		if (p.cmd[3] or "") == "sleep 100" then
+			return "hang"
+		end
+		return "exit:0"
+	end
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0, "mention + reply parse")
+	local info = { event = "issue_comment", action = "created", repo = "acme/web", number = 12, sender = "alice", author = "alice", association = "MEMBER", comment = "@roost 修一下崩溃" }
+	s.core.on_events(s.c, { { seq = 1, delivery = "m1", info = info } })
+	local run = last_run(s)
+	truthy(run and run.workflow == "ask", "the mention fired")
+	eq(run.steps[1].kind, "ack")
+	eq(run.steps[#run.steps].kind, "report", "the report comes last")
+	truthy(string.find(s.env.files[`{DATA}/runs/{run.id}/info.json`] or "", "修一下崩溃", 1, true), "the request is kept with the event")
+	step(s, 3)
+	local ack: Proc? = nil
+	for _, p in s.procs do
+		if p.run == run.id and p.step == 1 then
+			ack = p
+		end
+	end
+	truthy(ack and string.find(ack.cmd[3], "issues/$ROOST_NUMBER/comments", 1, true), "the ack comments on the issue")
+	eq((ack :: Proc).opts.env.ROOST_NUMBER, "12")
+	eq(run.steps[3].state, "running", "the long step works")
+	s.core.cancel(s.c, run.id)
+	step(s, 4)
+	eq(run.state, "cancelled")
+	eq(run.steps[4].state, "success", "the report still ran")
+	local body = s.env.files[`{DATA}/runs/{run.id}/reply.md`] or ""
+	truthy(string.find(body, "已取消", 1, true), "the report says it was cancelled: " .. body)
+end
+
+do -- an api trigger: its token's hash is pushed with the subscriptions; a dispatch event starts the run with its inputs
+	local HASH = string.rep("ab", 32)
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "nightly"',
+		'workspace = "temp"',
+		"[[workflow.input]]",
+		'name = "focus"',
+		"required = true",
+		"[[workflow.input]]",
+		'name = "depth"',
+		'default = "1"',
+		"[[workflow.trigger]]",
+		`api = "{HASH}"`,
+		"[[workflow.step]]",
+		'run = "true"',
+	}, "\n")
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = '[relay]\nurl = "https://relay.test"\ntoken = "tok-0123456789abcdef"\n[github]\nidentity = "local"\n' })
+	local pushed: any = nil
+	s.http = function(method, path, body)
+		if method == "PUT" and path == "/api/v1/subscriptions" then
+			pushed = body
+			return 200, { revision = "r1", changed = true }
+		elseif string.sub(path, 1, 15) == "/api/v1/events?" then
+			return 200, { store_id = "S", head = 0, oldest = 1, gap = false, events = {} }
+		elseif path == "/api/v1/status" then
+			return 200, { boot_id = "b1", version = "0.1.0" }
+		end
+		return 404, { error = "nope" }
+	end
+	s.core.start(s.c)
+	eq(#s.c.workflow_issues, 0, "an api trigger parses")
+	step(s, 1)
+	truthy(pushed and pushed.dispatch and pushed.dispatch.nightly == HASH, "the hash goes with the subscriptions")
+	local function dispatch(seq: number, payload: any): any
+		return { seq = seq, delivery = `dispatch-{seq}`, info = { event = "roost_dispatch", action = "dispatch", title = "nightly", sender = "api" }, payload = payload }
+	end
+	s.core.on_events(s.c, { dispatch(1, { workflow = "nightly", inputs = { focus = "docs", extra = "ignored" } }) })
+	local run = last_run(s)
+	truthy(run and run.workflow == "nightly", "the dispatch started the workflow")
+	eq(run.trigger.kind, "api")
+	eq(run.inputs.focus, "docs")
+	eq(run.inputs.depth, "1", "defaults fill in")
+	eq(run.inputs.extra, nil, "undeclared inputs are dropped")
+	s.core.on_events(s.c, { dispatch(2, { workflow = "nightly", inputs = {} }) })
+	local row = s.c.events[1]
+	truthy(string.find(row.reasons.nightly or "", "缺少必填输入 focus", 1, true), "required inputs are checked: " .. tostring(row.reasons.nightly))
+	s.core.on_events(s.c, { dispatch(3, { workflow = "other" }) })
+	truthy(s.c.events[1].reasons.other, "an unknown workflow is refused")
+	local runs = #s.c.store.runs
+	local forged = dispatch(4, { workflow = "nightly", inputs = { focus = "x" } })
+	forged.info.repo, forged.info.sender = "acme/web", "mallory"
+	s.core.on_events(s.c, { forged })
+	eq(#s.c.store.runs, runs, "a dispatch-named event from a repository never starts the workflow")
+	eq(s.core.check_workflow(s.c, nil, { name = "x", trigger = { { api = "short" } }, step = { { run = "true" } } })[1] ~= nil, true, "a malformed hash is refused")
+end
+
+do -- an environment: its variables and PATH reach shell steps, omp steps source them, setup runs first
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "deploy"',
+		'workspace = "temp"',
+		'environment = "prod"',
+		"[[workflow.step]]",
+		'name = "sh"',
+		'run = "true"',
+		"[[workflow.step]]",
+		'name = "agent"',
+		'omp = "go"',
+	}, "\n")
+	local cfg = LOCAL .. '[environments.prod]\nvars = { API_KEY = "s3cret", REGION = "eu" }\npath = ["/opt/prod/bin"]\nsetup = "make deps"\n'
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = cfg })
+	local w = window(s)
+	s.core.start(s.c)
+	eq(#s.c.config_issues, 0, "environments parse")
+	eq(s.core.dispatch(s.c, "deploy"), nil)
+	step(s, 3)
+	local run = last_run(s)
+	eq(run.steps[1].kind, "env", "the environment comes first")
+	local envp: Proc?, shp: Proc? = nil, nil
+	for _, p in s.procs do
+		if p.run == run.id and p.step == 1 then
+			envp = p
+		elseif p.run == run.id and p.step == 2 then
+			shp = p
+		end
+	end
+	truthy(envp, "the environment step ran")
+	eq((envp :: Proc).cmd[5], "API_KEY")
+	eq((envp :: Proc).cmd[6], "REGION", "it names the variables, not their values")
+	eq((envp :: Proc).opts.env.ROOST_ENV_SETUP, "make deps")
+	truthy(shp, "the shell step ran")
+	eq((shp :: Proc).opts.env.API_KEY, "s3cret")
+	truthy(string.sub((shp :: Proc).opts.env.PATH, 1, 14) == "/opt/prod/bin:", "PATH starts with the environment's: " .. (shp :: Proc).opts.env.PATH)
+	eq(#w.started, 1, "the agent opened")
+	local envf = s.env.files[`{DATA}/runs/{run.id}/s3.env`] or ""
+	truthy(string.find(envf, "environment.sh", 1, true), "the omp step sources the environment's file")
+	eq(string.find(envf, "s3cret", 1, true), nil, "no value in the sourced script itself")
+	truthy(string.find(w.started[1].opts.command, "s3.env", 1, true), "through agent.with_env")
+
+	-- A workflow naming no such environment fails at that step, and says so beforehand.
+	s.env.files[DATA .. "/workflows.toml"] = (string.gsub(wf, '"prod"', '"nope"'))
+	step(s, 4)
+	local msgs = ""
+	for _, i in s.core.check_workflow(s.c, "deploy", s.core.workflow_raw(s.c, "deploy")) do
+		msgs ..= i.message
+	end
+	truthy(string.find(msgs, "没有环境「nope」", 1, true), "the editor warns: " .. msgs)
+end
+
 do -- a manual run works in the repo the workflow's schedule names, not a temp dir
 	local wf = [==[
 [repos."acme/web"]
@@ -1557,6 +1886,41 @@ local function wrapper_for(s: Scenario, step_no: number): Proc?
 		end
 	end
 	return nil
+end
+
+do -- a reply as the App: without a token the report is refused, never sent with your own gh
+	local wf = table.concat({
+		"[[workflow]]",
+		'id = "ask"',
+		"reply = true",
+		'workspace = "temp"',
+		"[[workflow.trigger]]",
+		'github = "mention"',
+		'repos = ["acme/web"]',
+		'handle = "@roost"',
+		"[[workflow.step]]",
+		'run = "true"',
+	}, "\n")
+	local s = scenario({ [DATA .. "/workflows.toml"] = wf, [DATA .. "/roost.toml"] = ROOST_APP })
+	app_relay(s, function(_b)
+		return 409, { error = "App 未安装到 acme/web" }
+	end)
+	s.core.start(s.c)
+	step(s, 1)
+	local info = { event = "issue_comment", action = "created", repo = "acme/web", number = 12, sender = "alice", author = "alice", association = "MEMBER", comment = "@roost 看看" }
+	s.core.on_events(s.c, { { seq = 1, delivery = "m1", info = info } })
+	local run = last_run(s)
+	truthy(run and run.workflow == "ask", "the mention fired")
+	step(s, 6)
+	eq(run.state, "failed", "no token, no run")
+	eq(run.steps[#run.steps].kind, "report")
+	local refused = false
+	for _, p in s.procs do
+		local cmd = table.concat(p.cmd or {}, " ")
+		truthy(not string.find(cmd, "/comments", 1, true), "nothing comments on the issue: " .. cmd)
+		refused = refused or string.find(cmd, "没有可用的 App 令牌", 1, true) ~= nil
+	end
+	truthy(refused, "the report step is refused")
 end
 
 do -- a run as the App: token first, gh/git as the bot in shell and omp steps, the token gone after

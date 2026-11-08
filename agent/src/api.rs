@@ -2,8 +2,9 @@
 //! bearer-token admin API the plugin uses.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -34,6 +35,12 @@ const MAX_WAIT: Duration = Duration::from_secs(30);
 const ADMIN_BODY_LIMIT: usize = 1024 * 1024;
 /// The configuration upload: up to `fleet::MAX_CONFIG` of text, JSON-escaped.
 const CONFIG_BODY_LIMIT: usize = 4 * fleet::MAX_CONFIG;
+/// `POST /hooks/dispatch/<id>`: the body (`{ "inputs": {…} }`), runs a workflow may start per
+/// minute, and the most inputs and their sizes.
+const DISPATCH_BODY_LIMIT: usize = 64 * 1024;
+const DISPATCH_PER_MINUTE: u32 = 30;
+const MAX_DISPATCH_INPUTS: usize = 32;
+const MAX_INPUT_VALUE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shutdown {
@@ -169,6 +176,9 @@ pub struct AppState {
     pub shutdown: watch::Sender<Option<Shutdown>>,
     /// Serializes writers of `subscriptions.toml`.
     pub subs_write: tokio::sync::Mutex<()>,
+    /// Starts per dispatchable workflow in the current minute (`POST /hooks/dispatch/<id>`);
+    /// only ids in the subscriptions get an entry, so it stays as small as that list.
+    pub dispatch_hits: Mutex<BTreeMap<String, (Instant, u32)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -259,6 +269,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/github/app/callback", get(app_callback))
         .route("/github/app/installed", get(app_installed))
         .route("/healthz", get(healthz))
+        .route(
+            "/hooks/dispatch/{id}",
+            post(dispatch).layer(DefaultBodyLimit::max(DISPATCH_BODY_LIMIT)),
+        )
         .nest("/api/v1", admin)
         .with_state(state)
 }
@@ -277,6 +291,124 @@ async fn auth(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Resp
         return err(StatusCode::UNAUTHORIZED, "missing or wrong bearer token");
     }
     next.run(req).await
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DispatchBody {
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
+}
+
+fn valid_input_name(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 64
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Starts workflow `id` from outside: the bearer token's SHA-256 must be the one the plugin pushed
+/// for it (subscriptions `dispatch`). Unknown ids and wrong tokens get the same answer. The run
+/// reaches the executor as a `roost_dispatch` event; the plugin checks the inputs again.
+async fn dispatch(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<DispatchBody>>,
+) -> Response {
+    let subs = st.subs();
+    let given = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let got = hex::encode(Sha256::digest(given.as_bytes()));
+    let ok = match subs.dispatch.get(&id) {
+        Some(want) => !given.is_empty() && bool::from(got.as_bytes().ct_eq(want.as_bytes())),
+        None => false,
+    };
+    if !ok {
+        return err(StatusCode::UNAUTHORIZED, "unknown workflow or wrong token");
+    }
+    let inputs = body.map(|b| b.0.inputs).unwrap_or_default();
+    if inputs.len() > MAX_DISPATCH_INPUTS
+        || inputs
+            .iter()
+            .any(|(k, v)| !valid_input_name(k) || v.len() > MAX_INPUT_VALUE)
+    {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "at most {MAX_DISPATCH_INPUTS} inputs, names [A-Za-z0-9_-]{{1,64}}, values up to {MAX_INPUT_VALUE} bytes"
+            ),
+        );
+    }
+    {
+        let mut hits = lock(&st.dispatch_hits);
+        hits.retain(|k, _| subs.dispatch.contains_key(k));
+        let now = Instant::now();
+        let slot = hits.entry(id.clone()).or_insert((now, 0));
+        if now.duration_since(slot.0) >= Duration::from_secs(60) {
+            *slot = (now, 0);
+        }
+        if slot.1 >= DISPATCH_PER_MINUTE {
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("at most {DISPATCH_PER_MINUTE} starts a minute"),
+            );
+        }
+        slot.1 += 1;
+    }
+    let payload = match serde_json::to_string(&json!({ "workflow": id, "inputs": inputs }))
+        .ok()
+        .and_then(|s| RawValue::from_string(s).ok())
+    {
+        Some(p) => p,
+        None => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot encode the request",
+            );
+        }
+    };
+    let info = EventInfo {
+        event: "roost_dispatch".into(),
+        action: Some("dispatch".into()),
+        title: Some(id.clone()),
+        sender: Some("api".into()),
+        ..Default::default()
+    };
+    // Unique even for calls in the same millisecond: clients skip a delivery id they have seen.
+    static DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    let delivery = format!(
+        "dispatch-{}-{}-{}",
+        id,
+        Utc::now().timestamp_millis(),
+        DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    match st
+        .store
+        .push(delivery.clone(), info, Some(payload), false)
+        .await
+    {
+        Ok(ev) => {
+            st.record(Delivery {
+                delivery,
+                at: Utc::now(),
+                event: "roost_dispatch".into(),
+                action: Some("dispatch".into()),
+                repo: None,
+                outcome: "relayed",
+                reason: Some(format!("workflow {id}")),
+                seq: Some(ev.seq),
+            });
+            (StatusCode::ACCEPTED, Json(json!({ "seq": ev.seq }))).into_response()
+        }
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot store: {e}"),
+        ),
+    }
 }
 
 async fn healthz(State(st): State<Arc<AppState>>) -> Json<Value> {
@@ -452,6 +584,8 @@ async fn get_subs(State(st): State<Arc<AppState>>) -> Json<Value> {
 struct PutSubs {
     base_revision: Option<String>,
     repos: BTreeMap<String, RepoSub>,
+    #[serde(default)]
+    dispatch: BTreeMap<String, String>,
 }
 
 async fn put_subs(
@@ -496,11 +630,11 @@ async fn put_subs(
         )
             .into_response();
     }
-    let next = match Subscriptions::from_repos(body.repos) {
+    let next = match Subscriptions::from_parts(body.repos, body.dispatch) {
         Ok(s) => s,
         Err(list) => return issues(StatusCode::UNPROCESSABLE_ENTITY, list),
     };
-    if next.repos == cur.repos {
+    if next.repos == cur.repos && next.dispatch == cur.dispatch {
         return Json(json!({ "revision": cur.revision, "changed": false })).into_response();
     }
     let path = &st.cfg.subscriptions_path;
@@ -1098,6 +1232,7 @@ mod tests {
             started_at: Utc::now(),
             shutdown: watch::channel(None).0,
             subs_write: tokio::sync::Mutex::new(()),
+            dispatch_hits: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1257,6 +1392,73 @@ mod tests {
             "bad file keeps the old subscriptions"
         );
         assert!(st.subs().repos.contains_key("acme/api"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_needs_the_workflows_token_is_rate_limited_and_relays() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let app = router(st.clone());
+        let token = "t0ken-for-nightly";
+        let hash = hex::encode(Sha256::digest(token.as_bytes()));
+        let (_, cur) = call(&app, admin("GET", "/api/v1/subscriptions", None)).await;
+        let bad = json!({"base_revision": cur["revision"], "repos": {}, "dispatch": {"nightly": "nothex"}});
+        let (c, _) = call(&app, admin("PUT", "/api/v1/subscriptions", Some(bad))).await;
+        assert_eq!(
+            c,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a hash must be a SHA-256"
+        );
+        let body =
+            json!({"base_revision": cur["revision"], "repos": {}, "dispatch": {"nightly": hash}});
+        let (c, v) = call(&app, admin("PUT", "/api/v1/subscriptions", Some(body))).await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let on_disk = std::fs::read_to_string(&st.cfg.subscriptions_path).unwrap();
+        assert!(
+            on_disk.contains(&hash) && !on_disk.contains(token),
+            "only the hash is kept"
+        );
+
+        let post = |id: &str, tok: Option<&str>, body: &str| {
+            let mut b = Request::post(format!("/hooks/dispatch/{id}"))
+                .header("content-type", "application/json");
+            if let Some(t) = tok {
+                b = b.header("authorization", format!("Bearer {t}"));
+            }
+            b.body(Body::from(body.to_string())).unwrap()
+        };
+        let (c, _) = call(&app, post("nightly", Some("wrong"), "{}")).await;
+        assert_eq!(c, StatusCode::UNAUTHORIZED);
+        let (c, _) = call(&app, post("nightly", None, "{}")).await;
+        assert_eq!(c, StatusCode::UNAUTHORIZED);
+        let (c, _) = call(&app, post("other", Some(token), "{}")).await;
+        assert_eq!(
+            c,
+            StatusCode::UNAUTHORIZED,
+            "unknown ids answer like wrong tokens"
+        );
+        let (c, _) = call(
+            &app,
+            post("nightly", Some(token), r#"{"inputs":{"bad name":"x"}}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::UNPROCESSABLE_ENTITY);
+        let (c, v) = call(
+            &app,
+            post("nightly", Some(token), r#"{"inputs":{"focus":"docs"}}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::ACCEPTED, "{v}");
+        let (_, v) = call(&app, admin("GET", "/api/v1/events?after=0", None)).await;
+        assert_eq!(v["events"][0]["event"], "roost_dispatch");
+        assert_eq!(v["events"][0]["payload"]["workflow"], "nightly");
+        assert_eq!(v["events"][0]["payload"]["inputs"]["focus"], "docs");
+        for _ in 1..DISPATCH_PER_MINUTE {
+            let (c, _) = call(&app, post("nightly", Some(token), "{}")).await;
+            assert_eq!(c, StatusCode::ACCEPTED);
+        }
+        let (c, _) = call(&app, post("nightly", Some(token), "{}")).await;
+        assert_eq!(c, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

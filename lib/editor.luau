@@ -4,7 +4,7 @@
 -- Node ids under layer.editor are the contract the key handler and tests share:
 --   body.triggers.tN.sentence.*, body.triggers.tN.card.*, body.prompt.stack.input,
 --   body.prompt.bar.pmodel, body.steps.sN.*, body.files.*, body.prompt.when.input,
---   body.notify.sw, body.advanced.*, foot.save, foot.del, layer.discard.
+--   body.notify.row.sw, body.notify.row.reply, body.advanced.*, foot.save, foot.del, layer.discard.
 
 local field = require("./field")
 local model = require("./model")
@@ -69,6 +69,8 @@ type Editor = {
 	file_ren_for: string?,
 	-- library name → sorted paths, refreshed when libs change.
 	lib_cache: { [string]: { string } },
+	-- Trigger index → a freshly made API token, shown once (only its SHA-256 goes into the file).
+	api_tokens: { [number]: string },
 }
 
 local function N(kind: string, props: { [string]: any }, children: { any }?): any
@@ -935,7 +937,9 @@ function M.close(st: any)
 	st.editor = nil
 end
 
-function M.open(st: any, mode: string, arg: string?)
+-- `draft`: a workflow table to start a new automation from (mode "draft", e.g. one generated from a
+-- description); it opens like a template.
+function M.open(st: any, mode: string, arg: string?, draft: { [string]: any }?)
 	local prev = ed_of(st)
 	if prev then
 		cancel_timer(prev)
@@ -961,6 +965,10 @@ function M.open(st: any, mode: string, arg: string?)
 			st.cx:toast("error", "没有这个模板")
 			return
 		end
+	elseif mode == "draft" and type(draft) == "table" then
+		raw = deep_copy(draft)
+		raw.id = nil
+		mode = "template"
 	else
 		mode = "new"
 		raw = model.new_raw(os.time())
@@ -992,6 +1000,7 @@ function M.open(st: any, mode: string, arg: string?)
 		file_edit_for = nil,
 		file_ren_for = nil,
 		lib_cache = {},
+		api_tokens = {},
 	}
 	st.editor = ed
 	load_own_files(st, ed)
@@ -1641,12 +1650,66 @@ local function roost_card(st: any, ed: Editor, i: number, tr: any): any
 	return N("col", { key = "card", role = "roost.trigger", gap = "sm" }, body)
 end
 
+-- An API trigger: the token (only its SHA-256 is saved; a new one shows once) and how to call it.
+local function api_card(st: any, ed: Editor, i: number, tr: any): any
+	local set = type(tr.api) == "string" and #tr.api == 64
+	local token = ed.api_tokens[i]
+	local id = if type(ed.raw.id) == "string" and ed.raw.id ~= "" then ed.raw.id else (ed.old_id or "<工作流 id>")
+	local relay = string.gsub(st.core.config.relay.url or "https://<中继地址>", "/+$", "")
+	local body: { any } = {
+		N("row", { key = "h", gap = "sm", align = "center" }, {
+			N("button", { key = "ic", icon = "plug", text = "", title = "API 调用", size = "sm", variant = "quiet" }),
+			txt("API 调用", "lab"),
+			N("button", {
+				key = "del",
+				icon = "trash",
+				text = "",
+				title = "删除触发器",
+				size = "sm",
+				variant = "quiet",
+				actions = { click = `trig-del:{i}` },
+			}),
+		}),
+		txt("外部系统(CI、脚本、其他服务)经中继启动这个工作流;令牌只能启动它,输入只接受声明过的。", "detail", "muted"),
+	}
+	if token then
+		table.insert(body, txt("新令牌只显示这一次,保存工作流后旧令牌失效:", "tokh", "warning"))
+		table.insert(body, N("row", { key = "tok", gap = "sm", align = "center" }, {
+			N("text", { key = "v", spans = { tern.ui.span(token, "mono") } }),
+			N("button", { key = "copy", text = "复制", icon = "copy", size = "sm", actions = { click = `api-copy:{i}` } }),
+		}))
+	end
+	table.insert(body, N("row", { key = "gen", gap = "sm", align = "center" }, {
+		txt(if set then "令牌已设置(文件里只有它的 SHA-256)" else "还没有令牌", "state", if set then "muted" else "warning"),
+		N("button", { key = "go", text = if set then "重新生成" else "生成令牌", icon = "repeat", size = "sm", actions = { click = `api-gen:{i}` } }),
+	}))
+	table.insert(body, N("code", {
+		key = "curl",
+		lang = "sh",
+		text = `curl -X POST {relay}/hooks/dispatch/{id} \\\n  -H "Authorization: Bearer <令牌>" \\\n  -H "Content-Type: application/json" \\\n  -d '\{"inputs":\{\}\}'`,
+	}))
+	local err: string? = nil
+	for _, issue in ed.issues do
+		if string.find(issue.path, `.trigger[{i}]`, 1, true) then
+			err = issue.message
+			break
+		end
+	end
+	if err then
+		table.insert(body, txt(err, "err", "warning"))
+	end
+	return N("col", { key = "card", role = "roost.trigger", gap = "sm" }, body)
+end
+
 local function trigger_node(st: any, ed: Editor, i: number, tr: any): any
 	if type(tr) == "table" and type(tr.github) == "string" then
 		return N("col", { key = `t{i}`, gap = "xs" }, { github_card(st, ed, i, tr) })
 	end
 	if type(tr) == "table" and type(tr.roost) == "string" then
 		return N("col", { key = `t{i}`, gap = "xs" }, { roost_card(st, ed, i, tr) })
+	end
+	if type(tr) == "table" and tr.api ~= nil then
+		return N("col", { key = `t{i}`, gap = "xs" }, { api_card(st, ed, i, tr) })
 	end
 	local row, err = schedule_sentence(ed, i, if type(tr) == "table" then tr else {})
 	local parts: { any } = { row }
@@ -1669,6 +1732,8 @@ local function add_menu(ed: Editor): any
 	for _, kind in model.ROOST_KINDS do
 		table.insert(items, { id = `roost:{kind.id}`, label = kind.label, detail = kind.detail, icon = "activity" })
 	end
+	table.insert(items, { header = "其他" })
+	table.insert(items, { id = "api:new", label = "API 调用", detail = "外部系统用令牌经中继启动", icon = "plug" })
 	return N("menu", { key = "add", text = "添加触发器", icon = "plus", items = items, open = ed.opens[ROOT .. ".body.triggers.add"] == true })
 end
 
@@ -1726,6 +1791,7 @@ local function model_options(st: any, current: string): { any }
 	end
 	return opts
 end
+M.model_options = model_options
 
 local function prompt_section(st: any, ed: Editor): any
 	local step = prompt_step(ed)
@@ -2092,6 +2158,19 @@ local function advanced_section(st: any, ed: Editor): any
 			open = ed.opens[ROOT .. ".body.advanced.who.sel"] == true,
 		}),
 	}))
+	local envname = if type(raw.environment) == "string" then raw.environment else ""
+	local env_opts: { any } = { { value = "", label = "不使用" } }
+	for _, name in util.keys(st.core.config.environments) do
+		table.insert(env_opts, { value = name, label = name })
+	end
+	table.insert(children, N("field", { key = "env", label = "环境", hint = "roost.toml [environments.<名>]:变量(shell 与 omp 步骤都拿得到)、PATH 与 setup" }, {
+		N("select", {
+			key = "sel",
+			value = envname,
+			options = with_current(env_opts, envname, envname),
+			open = ed.opens[ROOT .. ".body.advanced.env.sel"] == true,
+		}),
+	}))
 	local conc = if type(raw.concurrency) == "string" then raw.concurrency else "queue"
 	table.insert(children, N("field", { key = "conc", label = "并发" }, {
 		N("select", {
@@ -2438,7 +2517,16 @@ function M.view(st: any): any?
 		files_section(ed),
 		steps_section(ed),
 		N("field", { key = "notify", label = "通知" }, {
-			N("switch", { key = "sw", variant = "compact", label = "应用通知", on = raw.notify ~= false }),
+			N("row", { key = "row", gap = "md", align = "center", wrap = true }, {
+				N("switch", { key = "sw", variant = "compact", label = "应用通知", on = raw.notify ~= false }),
+				N("switch", {
+					key = "reply",
+					variant = "compact",
+					label = "在评论中回复",
+					on = raw.reply == true,
+					title = "由议题/PR 事件触发的运行:开始时在原处评论,结束后改成结果和最终回复",
+				}),
+			}),
 		}),
 		advanced_section(st, ed),
 		N("text", {
@@ -2588,6 +2676,9 @@ local function on_select(st: any, ed: Editor, id: string, value: string)
 	elseif string.find(id, ".advanced.ws", 1, true) then
 		ed.raw.workspace = value
 		touch(ed)
+	elseif string.find(id, ".advanced.env.sel", 1, true) then
+		ed.raw.environment = if value == "" then nil else value
+		touch(ed)
 	elseif string.find(id, ".advanced.who", 1, true) then
 		ed.raw.identity = if value == "" then nil else value
 		touch(ed)
@@ -2623,6 +2714,9 @@ local function on_menu(st: any, ed: Editor, act: string)
 		add_trigger(ed, sched)
 	elseif gh then
 		add_trigger(ed, gh)
+	elseif act == "api:new" then
+		table.insert(triggers_of(ed.raw), { api = "" })
+		touch(ed)
 	elseif roost then
 		table.insert(triggers_of(ed.raw), { roost = roost })
 		touch(ed)
@@ -2848,7 +2942,39 @@ local function on_action(st: any, ed: Editor, act: string)
 	local trig = string.match(act, "^trig%-del:(%d+)$")
 	if trig then
 		delete_trigger(ed, tonumber(trig) :: number)
+		-- Shown tokens are keyed by position: after a delete they would sit on the wrong card.
+		ed.api_tokens = {}
 		check_now(st)
+		return
+	end
+	local api_i = string.match(act, "^api%-gen:(%d+)$")
+	if api_i then
+		local n = tonumber(api_i) :: number
+		core.new_api_token(st.core, function(token, hash, err)
+			local cur = ed_of(st)
+			local tr = if cur == ed then trig_at(ed, n) else nil
+			if not tr or tr.api == nil then
+				return
+			end
+			if token and hash then
+				tr.api = hash
+				ed.api_tokens[n] = token
+				touch(ed)
+				check_now(st)
+			else
+				st.cx:toast("error", err or "无法生成令牌")
+			end
+			render(st)
+		end)
+		return
+	end
+	local copy_i = string.match(act, "^api%-copy:(%d+)$")
+	if copy_i then
+		local token = ed.api_tokens[tonumber(copy_i) :: number]
+		if token then
+			st.cx:copy(token)
+			st.cx:toast("info", "已复制令牌")
+		end
 		return
 	end
 	local day_i, day_id = string.match(act, "^day:(%d+):([%w_]+)$")
@@ -2969,7 +3095,7 @@ local function on_action(st: any, ed: Editor, act: string)
 		check_now(st)
 		return
 	end
-	if string.sub(act, 1, 5) == "icon:" or string.sub(act, 1, 6) == "sched:" or string.sub(act, 1, 3) == "gh:" or string.sub(act, 1, 6) == "roost:" then
+	if string.sub(act, 1, 5) == "icon:" or string.sub(act, 1, 6) == "sched:" or string.sub(act, 1, 3) == "gh:" or string.sub(act, 1, 6) == "roost:" or act == "api:new" then
 		on_menu(st, ed, act)
 	end
 end
@@ -2984,6 +3110,12 @@ local function on_switch(st: any, ed: Editor, id: string, value: boolean)
 			touch(ed)
 			check_now(st)
 		end
+		return
+	end
+	if string.sub(id, -17) == ".notify.row.reply" then
+		ed.raw.reply = if value then true else nil
+		touch(ed)
+		check_now(st)
 		return
 	end
 	if string.sub(id, -3) == ".sw" then

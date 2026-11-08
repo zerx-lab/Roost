@@ -15,6 +15,7 @@ local model = require("./model")
 local util = require("./util")
 local bundle = require("./bundle")
 local store = require("./store")
+local inbox = require("./inbox")
 
 local M = {}
 
@@ -116,22 +117,29 @@ local function run_summary(r: store.Run, tail: string?): { [string]: any }
 		finished_at = r.finished_at,
 		workspace = r.workspace,
 		rerun_of = r.rerun_of,
+		-- Built-in runs: only the kind (a task's text stays on the executor) and how they relate.
+		task = if r.task then { kind = r.task.kind } else nil,
+		parent = r.parent,
+		changes = r.changes,
+		branch = r.branch,
+		pr = r.pr,
 		steps = tern.json.array(steps),
 		log = tail,
 	}
 end
 
 -- The upload body: `runs` newest first (at most MAX_RUNS), tails from `tails` for the newest
--- TAILS. Over MAX_BODY, tails go first, then older runs. Returns the encoded body; unchanged runs
--- give the same text (the relay records when it arrived).
-function M.summaries(runs: { store.Run }, tails: { [string]: string }): string
+-- TAILS, and the inbox's `boxes`. Over MAX_BODY, tails go first, then the inbox, then older runs.
+-- Returns the encoded body; unchanged runs give the same text (the relay records when it arrived).
+function M.summaries(runs: { store.Run }, tails: { [string]: string }, boxes: { [string]: inbox.Box }?): string
+	local box_data = if boxes and next(boxes) then inbox.encode_boxes(boxes) else nil
 	local function encode(n: number, with_tails: boolean): string
 		local list = {}
 		for i = 1, math.min(n, #runs) do
 			local r = runs[i]
 			table.insert(list, run_summary(r, if with_tails and i <= M.TAILS then tails[r.id] else nil))
 		end
-		return tern.json.encode({ format = M.FORMAT, runs = tern.json.array(list) })
+		return tern.json.encode({ format = M.FORMAT, runs = tern.json.array(list), inbox = box_data })
 	end
 	local n = math.min(M.MAX_RUNS, #runs)
 	local body = encode(n, true)
@@ -139,6 +147,10 @@ function M.summaries(runs: { store.Run }, tails: { [string]: string }): string
 		return body
 	end
 	body = encode(n, false)
+	if #body > M.MAX_BODY and box_data then
+		box_data = nil
+		body = encode(n, false)
+	end
 	while #body > M.MAX_BODY and n > 1 do
 		n = n // 2
 		body = encode(n, false)
@@ -190,13 +202,13 @@ local function uses_of(v: any): { store.ModelUse }?
 	return if #out > 0 then out else nil
 end
 
--- An uploaded run list back into run records (only what the runs page shows), and each run's log
--- tail. Malformed entries are dropped.
-function M.decode_runs(body: any): ({ store.Run }, { [string]: string })
+-- An uploaded run list back into run records (only what the runs page shows), each run's log
+-- tail, and the executor's inbox. Malformed entries are dropped.
+function M.decode_runs(body: any): ({ store.Run }, { [string]: string }, { [string]: inbox.Box })
 	local out: { store.Run } = {}
 	local tails: { [string]: string } = {}
 	if type(body) ~= "table" or type(body.runs) ~= "table" then
-		return out, tails
+		return out, tails, {}
 	end
 	for _, v in body.runs do
 		if #out >= M.MAX_RUNS then
@@ -243,6 +255,15 @@ function M.decode_runs(body: any): ({ store.Run }, { [string]: string })
 			finished_at = num(v.finished_at),
 			workspace = str(v.workspace),
 			rerun_of = str(v.rerun_of),
+			task = if type(v.task) == "table" and (v.task.kind == "task" or v.task.kind == "pr")
+				then { kind = v.task.kind :: string, prompt = "", workspace = "" }
+				else nil,
+			parent = if type(v.parent) == "string" and string.match(v.parent, "^%x+$") then v.parent else nil,
+			changes = if type(v.changes) == "table" and num(v.changes.files) and num(v.changes.add) and num(v.changes.del)
+				then { files = v.changes.files, add = v.changes.add, del = v.changes.del, too_big = if v.changes.too_big == true then true else nil }
+				else nil,
+			branch = short(v.branch, 200),
+			pr = if type(v.pr) == "string" and #v.pr <= 500 and string.match(v.pr, "^https://") then v.pr else nil,
 			inputs = {},
 			steps = steps,
 			step = 0,
@@ -251,7 +272,7 @@ function M.decode_runs(body: any): ({ store.Run }, { [string]: string })
 			tails[v.id] = v.log
 		end
 	end
-	return out, tails
+	return out, tails, inbox.decode_boxes(body.inbox)
 end
 
 -- The repositories and workflows of the local workflows.toml text (unparsable: none).

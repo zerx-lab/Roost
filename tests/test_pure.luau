@@ -645,4 +645,112 @@ do -- device sync: run summaries stay under the relay's limit, tails first, and 
 	eq(fleet.clean_tail("whole\n", true), "whole\n")
 end
 
+do -- inbox: snapshots replace a workflow's items, increments add and resolve, dismissals hold until an item changes
+	local inbox = require("../lib/inbox")
+	local b = inbox.empty()
+	local p, note = inbox.parse(
+		'{"replace":true,"items":['
+			.. '{"id":"pr-1","title":"PR #1 等待批准","kind":"approve","url":"https://github.com/a/b/pull/1","run":{"workflow":"gate","pr":"1"}},'
+			.. '{"id":"bad id!","title":"x"},'
+			.. '{"id":"i-2","title":"' .. string.rep("长", 200) .. '","kind":"weird","url":"http://insecure"},'
+			.. '{"id":"pr-1","title":"dup"}]}',
+		100
+	)
+	assert(p, "parsed")
+	assert(note and string.find(note, "2 个", 1, true), "invalid and duplicate items are counted: " .. tostring(note))
+	eq(#p.items, 2)
+	eq(utf8.len(p.items[2].title), 120, "titles count characters")
+	eq(p.items[2].kind, "info", "unknown kinds read as info")
+	eq(p.items[2].url, nil, "only https links")
+	eq((p.items[1].run :: any).pr, "1")
+	inbox.apply(b, "gate", p, "r1", 100)
+	local list = inbox.list(b)
+	eq(#list, 2)
+	eq(list[1].id, "pr-1", "approve before info")
+	eq(list[1].workflow, "gate")
+	-- An increment: one new, one resolved; the unchanged one keeps when it was first seen.
+	local inc = inbox.parse('{"items":[{"id":"pr-3","title":"PR #3","kind":"failed"}],"resolve":["i-2"]}', 200) :: any
+	inbox.apply(b, "gate", inc, "r2", 200)
+	list = inbox.list(b)
+	eq(#list, 2)
+	eq(list[1].id, "pr-3", "failed first")
+	eq(list[2].at, 100, "an item that didn't change keeps its time")
+	-- Dismissed until it changes.
+	eq(inbox.dismiss(b, "gate", "pr-1"), true)
+	eq(#inbox.list(b), 1)
+	inbox.apply(b, "gate", inbox.parse('{"items":[{"id":"pr-1","title":"PR #1 等待批准","kind":"approve","url":"https://github.com/a/b/pull/1"}]}', 300) :: any, "r3", 300)
+	eq(#inbox.list(b), 1, "the same text stays hidden")
+	inbox.apply(b, "gate", inbox.parse('{"items":[{"id":"pr-1","title":"PR #1 CI 失败","kind":"failed"}]}', 400) :: any, "r4", 400)
+	eq(#inbox.list(b), 2, "a changed item shows again")
+	-- A snapshot with nothing empties the box; a deleted workflow's box goes.
+	inbox.apply(b, "triage", inbox.parse('{"replace":true,"items":[{"id":"x","title":"t"}]}', 500) :: any, "r5", 500)
+	inbox.apply(b, "gate", inbox.parse('{"replace":true,"items":[]}', 600) :: any, "r6", 600)
+	eq(b.boxes.gate, nil)
+	eq(inbox.prune(b, { other = true }), true)
+	eq(b.boxes.triage, nil)
+	local bad, why = inbox.parse("[1,2]", 0)
+	eq(bad, nil)
+	assert(why, "not an object")
+	-- Round trip through what observers get.
+	inbox.apply(b, "gate", inbox.parse('{"items":[{"id":"y","title":"t","kind":"decide"}]}', 700) :: any, "r7", 700)
+	local back = inbox.decode_boxes(F.decode(tern.json.encode(inbox.encode_boxes(b.boxes))))
+	eq(back.gate.items[1].kind, "decide")
+	eq(back.gate.items[1].at, 700)
+end
+
+do -- tasks: titles, numstat totals (binary files counted, not summed)
+	local tasks = require("../lib/tasks")
+	eq(tasks.title("\n\n  修复登录  \n第二行"), "修复登录")
+	eq(tasks.title("   "), "任务")
+	local rows, sum = tasks.parse_numstat("3\t1\ta.lua\n-\t-\tlogo.png\n10\t0\tdir/b c.md\n")
+	eq(sum.files, 3)
+	eq(sum.add, 13)
+	eq(sum.del, 1)
+	eq(rows[3].path, "dir/b c.md", "paths keep their spaces")
+	eq(rows[2].add, nil)
+	assert(tasks.is("task.abc") and not tasks.is("fix"), "task ids")
+	local wf = tasks.workflow("task.1", { kind = "task", prompt = "做 {{x}}", workspace = "worktree" }, "acme/web")
+	eq(wf.steps[1].kind, "omp")
+	assert(string.find(template.render(wf.steps[1].prompt :: any, {}), "做 {{x}}", 1, true), "the text renders as typed")
+	local pr = tasks.workflow("task.2", { kind = "pr", prompt = "标题", workspace = "worktree", branch = "roost/1" })
+	eq(pr.env.ROOST_PR_BRANCH, "roost/1")
+	eq(pr.steps[1].kind, "run")
+end
+
+do -- mention: answers to the App's name and its own handle, alone (not inside e-mails or longer names)
+	local t = gh('github = "mention"\nrepos = ["acme/web"]\nhandle = "@Roost"')
+	local ctx: match.Ctx = { me = "zero", bot = "roost-bot[bot]" }
+	local function ev(text: string, extra: { [string]: any }?): { [string]: any }
+		local e: { [string]: any } = { event = "issue_comment", action = "created", repo = "acme/web", association = "MEMBER", sender = "alice", comment = text }
+		local more: { [string]: any } = extra or {}
+		for k, v in more do
+			e[k] = v
+		end
+		return e
+	end
+	eq(match.mismatch(t, ev("@roost-bot 修一下这个"), ctx), nil, "the App's name")
+	eq(match.mismatch(t, ev("请 @ROOST 看看"), ctx), nil, "the handle, any case")
+	assert(match.mismatch(t, ev("mail me at x@roost.dev"), ctx), "inside an e-mail is not a mention")
+	assert(match.mismatch(t, ev("@roost-botty hi"), ctx), "a longer name is someone else")
+	assert(match.mismatch(t, ev("@roost hi", { action = "edited" }), ctx), "only new comments")
+	eq(match.mismatch(t, { event = "issues", action = "opened", repo = "acme/web", association = "OWNER", sender = "a", body = "hey @roost" }, ctx), nil, "an opened issue's body")
+	assert(match.mismatch(t, ev("@roost go", { sender = "roost-bot[bot]", sender_is_bot = true }), ctx), "never its own comments")
+	eq(match.request(ev("@roost-bot  修一下 @roost 这个"), match.handles(t, ctx)), "修一下  这个", "the request without mentions")
+	local bare = gh('github = "mention"\nrepos = ["acme/web"]')
+	assert(match.mismatch(bare, ev("@anything"), { me = "zero" }), "no App name and no handle: nothing to answer to")
+end
+
+do -- reply: the report defuses mentions and says how the run ended
+	local reply = require("../lib/reply")
+	local body = reply.body("failed", "处理 退出码 1", "联系 @alice", "ab12")
+	assert(string.find(body, "失败", 1, true) and string.find(body, "退出码 1", 1, true), body)
+	eq(string.find(body, "@alice", 1, true), nil, "mentions are defused")
+	assert(not string.find(reply.body("success", "ignored", nil, "x"), "ignored", 1, true), "a success has no reason")
+	-- Defusing adds a character per `@`; the cut comes after it and never splits a character.
+	local long = reply.body("success", nil, string.rep("@", 70000), "x")
+	assert((utf8.len(long) or math.huge) <= 65536, "within GitHub's comment limit")
+	local cjk = reply.body("success", nil, string.rep("中", 30000), "x")
+	assert(utf8.len(cjk) ~= nil, "the cut keeps UTF-8 whole")
+end
+
 print("ok")

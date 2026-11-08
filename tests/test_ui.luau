@@ -1095,4 +1095,117 @@ do -- an unreadable groups.json is reported and never overwritten
 	eq(w.env.files[DATA .. "/groups.json"], "{broken", "the file is untouched")
 end
 
+do -- home: the task box starts a task; a finished run shows its answer and changes; 追问 continues it; the inbox acts
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	local TASK = "main.body.overview.task.input"
+	view(w)
+	w.ui.event(w.st, { ev = "change", id = "main.body.overview.task.bar.opts.repo", value = "acme/web" })
+	eq(w.st.task.repo, "acme/web")
+	w.ui.event(w.st, { ev = "focus", id = TASK })
+	eq(press(w, "1", "1"), true, "digits type while the box has the keys")
+	eq(w.st.tab, "overview", "and don't switch pages")
+	press(w, "enter")
+	press(w, "x", "x")
+	eq(w.st.task.text.text, "1\nx", "Enter is a new line")
+	eq(press(w, "enter", nil, { meta = true }), true, "⌘↵ starts it")
+	eq(w.st.tab, "runs", "the run opens")
+	local run = w.c.store.by_id[w.st.run_id]
+	truthy(run and run.task and run.task.kind == "task", "a task run")
+	eq(run.repo, "acme/web")
+	eq(w.st.task.text.text, "", "the box empties")
+
+	-- Pretend it finished with an answer, changes and a conversation to continue.
+	local d = `{DATA}/runs/{run.id}`
+	for _, s in run.steps do
+		s.state = "success"
+	end
+	run.steps[2].agent = true
+	run.state, run.finished_at = "success", w.now
+	run.changes = { files = 2, add = 3, del = 1 }
+	w.env.files[d .. "/s2.answer.md"] = "## 完成\n改了 a.lua"
+	w.env.files[d .. "/s2.session/2026-11-08T00-00-00-000Z_abc.jsonl"] = "{}\n"
+	w.env.files[d .. "/changes.numstat"] = "3\t1\ta.lua\n-\t-\tlogo.png\n"
+	w.env.files[d .. "/changes.total"] = "2 3 1\n"
+	w.env.files[d .. "/changes.patch"] = "diff --git a/a.lua b/a.lua\n"
+	w.env.files[d .. "/base.txt"] = "0123456789abcdef0123456789abcdef01234567\n"
+	local page = view(w)
+	local text = F.text(page.main)
+	truthy(string.find(text, "完成", 1, true), "the answer shows")
+	truthy(string.find(text, "改动 +3 −1 · 2 个文件", 1, true), "the changes' head")
+	local files = find(page.main, function(x)
+		return x.k == "table" and x.p and x.p.key == "table" and x.p.rows and x.p.rows[1] and x.p.rows[1].cells[1] == "a.lua"
+	end)
+	truthy(files and files.p.rows[2].cells[1] == "logo.png", "the changed files")
+	local follow = find(page.main, function(x)
+		return x.k == "button" and x.p and x.p.key == "followup"
+	end)
+	truthy(follow, "a finished run with a conversation offers 追问")
+	w.ui.event(w.st, { ev = "action", act = "diff", value = run.id })
+	truthy(string.find(F.text(view(w).layer), "diff --git", 1, true), "the diff overlay")
+	eq(press(w, "escape"), true)
+	eq(w.st.diff, nil, "Esc closes it")
+
+	w.ui.event(w.st, { ev = "action", act = "followup-open", value = run.id })
+	truthy(w.st.dlg and w.st.dlg.kind == "followup", "the follow-up dialog")
+	press(w, "y", "y")
+	press(w, "enter")
+	eq(w.st.dlg.fields[1].text, "y\n", "Enter is a new line in the follow-up")
+	press(w, "enter", nil, { meta = true })
+	eq(w.st.dlg, nil, "⌘↵ sends it")
+	local f = w.c.store.by_id[w.st.run_id]
+	eq(f.parent, run.id, "the follow-up continues the run")
+	eq(f.steps[1].kind, "resume")
+
+	w.ui.event(w.st, { ev = "action", act = "pr-open", value = run.id })
+	truthy(w.st.dlg and w.st.dlg.kind == "pr", "the PR dialog")
+	eq(w.st.dlg.fields[3].text, "", "no branch set for the repo: its default")
+	w.ui.event(w.st, { ev = "action", act = "dlg-cancel" })
+	eq(w.st.dlg, nil)
+
+	-- The inbox: a reported item with its actions; dismissing hides it.
+	w.core.inbox_report(w.c, { id = "ab", workflow = "plain", steps = {} } :: any, '{"items":[{"id":"pr.9","title":"PR #9 等待批准","kind":"approve","url":"https://github.com/a/b/pull/9"}]}')
+	w.st.tab = "overview"
+	local home = view(w)
+	truthy(string.find(F.text(home.main), "PR #9 等待批准", 1, true), "the item shows")
+	local dismiss = find(home.main, function(x)
+		return x.k == "button" and x.p and x.p.key == "dismiss"
+	end)
+	truthy(dismiss, "an item can be dismissed")
+	local what, value = string.match(dismiss.p.actions.click, "^([^=]+)=(.*)$")
+	w.ui.event(w.st, { ev = "action", act = what, value = value })
+	eq(string.find(F.text(view(w).main), "PR #9", 1, true), nil, "dismissed")
+end
+
+do -- 用描述生成: omp drafts a workflow; complaints are fed back once; the draft opens in the editor
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	local calls: { { string } } = {}
+	local answers = {
+		"好的:\n```toml\n[[workflow]]\nid = \"daily\"\nname = \"日报\"\n[[workflow.trigger]]\ngithub = \"pr_opened\"\n[[workflow.step]]\nname = \"写\"\nomp = \"总结\"\n```\n",
+		"```toml\n[[workflow]]\nid = \"daily\"\nname = \"日报\"\n[[workflow.trigger]]\nschedule = \"daily\"\ntime = \"09:00\"\n[[workflow.step]]\nname = \"写\"\nomp = \"总结昨天合并的 PR\"\n```",
+	}
+	local base = w.env.process
+	w.env.process = function(argv: { string }, opts: any): any
+		if argv[6] == "-p" then
+			table.insert(calls, argv)
+			return { status = 0, stdout = answers[#calls] or "", stderr = "", timed_out = false }
+		end
+		return base(argv, opts)
+	end
+	w.st.tab = "workflows"
+	w.ui.event(w.st, { ev = "action", act = "gen-open" })
+	truthy(w.st.dlg and w.st.dlg.kind == "generate", "the dialog opens")
+	for _, ch in { "日", "报" } do
+		press(w, ch, ch)
+	end
+	press(w, "enter", nil, { meta = true })
+	w.env.drain()
+	eq(#calls, 2, "the first draft's problems went back to omp once")
+	truthy(string.find(calls[2][9], "至少添加一个筛选器", 1, true), "with what was wrong")
+	truthy(string.find(calls[1][9], "需求:日报", 1, true), "the description is in the prompt")
+	eq(w.st.dlg, nil, "the dialog closed")
+	truthy(w.st.editor, "the editor opened")
+	eq(w.st.editor.raw.name, "日报")
+	eq(w.st.editor.raw.id, nil, "a new workflow: the id is the editor's to make")
+end
+
 print("ok")

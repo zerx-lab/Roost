@@ -19,6 +19,9 @@ local upgrade = require("./upgrade")
 local tabs = require("./tabs")
 local groups = require("./groups")
 local fleet = require("./fleet")
+local tasks = require("./tasks")
+local inbox = require("./inbox")
+local agent = require("./agent")
 
 local M = {}
 
@@ -102,6 +105,7 @@ export type Dev = {
 	mirror_missing: { string }, -- mirrored repos without a local path (runs there use a temp dir)
 	remote: { store.Run },
 	remote_tails: { [string]: string },
+	remote_inbox: { [string]: inbox.Box }, -- the executor's inbox, uploaded with its runs
 	remote_rev: string?,
 	remote_at: number?, -- when the executor uploaded them
 	remote_from: string?, -- the client that uploaded them
@@ -148,6 +152,7 @@ export type Core = {
 	book: evolve.Book, -- evolvers' revisions and firing record (lib/evolve.luau)
 	groups: groups.Groups, -- the workflows page's groups (groups.json, lib/groups.luau)
 	groups_err: string?, -- groups.json exists but can't be read: kept as is, never overwritten
+	inbox: inbox.Book, -- what workflows reported needs a person, and what was dismissed here (lib/inbox.luau)
 	dev: Dev,
 }
 
@@ -283,8 +288,8 @@ local function publish_status(c: Core)
 			next_cron = row.next
 		end
 	end
-	-- Finished runs of workflows with notify on, for the window's toasts (recent ones only); a
-	-- skipped run (nothing to do, or over budget) stays quiet.
+	-- Finished runs of workflows with notify on (and built-in runs), for the window's toasts (recent
+	-- ones only); a skipped run (nothing to do, or over budget) stays quiet.
 	local done: { { [string]: any } } = {}
 	local w = c.workflows
 	-- Newest first (runs append), so a burst of more than ten still announces the latest.
@@ -292,7 +297,7 @@ local function publish_status(c: Core)
 		local r = c.store.runs[i]
 		local wf = if w then w.by_id[r.workflow] else nil
 		local recent = r.finished_at and now() - r.finished_at < NOTIFY_WINDOW and r.state ~= "skipped"
-		if recent and wf and wf.notify and #done < 10 then
+		if recent and (r.task ~= nil or (wf and wf.notify)) and #done < 10 then
 			table.insert(done, { id = r.id, name = r.workflow_name, title = r.title, state = r.state })
 		end
 	end
@@ -456,6 +461,10 @@ function M.reload_files(c: Core)
 			c.workflows = w
 			c.loaded_at = now()
 			refresh_crons(c)
+			-- A deleted workflow's inbox items go with it.
+			if inbox.prune(c.inbox, w.by_id) then
+				inbox.save(c.data, c.inbox)
+			end
 			sync_subscriptions(c)
 		else
 			M.notice(
@@ -530,6 +539,50 @@ local function event_row(e: { [string]: any }, info: { [string]: any }, delivery
 	}
 end
 
+-- Defined with manual runs below.
+local default_repo: (w: model.Workflows, wf: model.Workflow) -> string?
+
+-- A `roost_dispatch` event (the relay's POST /hooks/dispatch/<id>): starts that workflow when it
+-- is enabled and has an api trigger, with the inputs it declares (defaults filled, required
+-- ones checked; anything else ignored). Returns the run's id, or why not.
+local function dispatch_event(c: Core, w: model.Workflows, payload: any, summary: string, delivery: string): (string?, string?)
+	local id = if type(payload) == "table" then payload.workflow else nil
+	local wf = if type(id) == "string" then w.by_id[id] else nil
+	if not wf then
+		return nil, "没有这个工作流"
+	elseif not wf.enabled then
+		return nil, "工作流已停用"
+	end
+	local api = false
+	for _, t in wf.triggers do
+		api = api or t.kind == "api"
+	end
+	if not api then
+		return nil, "工作流没有 API 调用触发器"
+	end
+	local given = if type(payload.inputs) == "table" then payload.inputs else {}
+	local inputs: { [string]: string } = {}
+	for _, i in wf.inputs do
+		local v = given[i.name]
+		if type(v) == "string" then
+			inputs[i.name] = v
+		elseif i.default then
+			inputs[i.name] = i.default
+		elseif i.required then
+			return nil, `缺少必填输入 {i.name}`
+		end
+	end
+	local repo = default_repo(w, wf)
+	local r = if repo then w.repos[repo] else nil
+	local run, err = runner.submit(c.runner, wf, {
+		trigger = { kind = "api", detail = summary, delivery = delivery },
+		repo = repo,
+		ref = if r then r.branch else nil,
+		inputs = inputs,
+	})
+	return if run then run.id else nil, err
+end
+
 -- Relayed events: match every enabled workflow's GitHub triggers; a workflow fires once per event.
 -- Repos declared in [repos] run in their checkout; any other repo runs in a temporary directory.
 function M.on_events(c: Core, list: { { [string]: any } })
@@ -546,6 +599,15 @@ function M.on_events(c: Core, list: { { [string]: any } })
 		if row.event == "roost_test" then
 			c.relay.state.last_test = now()
 			M.notice(c, "success", "中继测试事件已送达本机")
+		elseif row.event == "roost_dispatch" and w and info.sender == "api" and info.repo == nil then
+			-- Only the relay's own /hooks/dispatch makes these (no repository, sender "api").
+			local id, err = dispatch_event(c, w, e.payload, row.summary, delivery)
+			if id then
+				table.insert(row.runs, id)
+			else
+				local p = e.payload
+				row.reasons[if type(p) == "table" and type(p.workflow) == "string" then p.workflow else "?"] = err or "未能排队"
+			end
 		elseif w and info.repo then
 			local key = util.ifind(w.repos, info.repo) or info.repo
 			for _, wf in w.list do
@@ -553,12 +615,12 @@ function M.on_events(c: Core, list: { { [string]: any } })
 					continue
 				end
 				local why: string? = nil
-				local fired = false
+				local fired: model.GithubTrigger? = nil
 				for _, tr in wf.triggers do
 					if tr.kind == "github" then
 						local miss = match.mismatch(tr :: model.GithubTrigger, info, ctx)
 						if miss == nil then
-							fired = true
+							fired = tr :: model.GithubTrigger
 							break
 						end
 						why = why or miss
@@ -566,12 +628,23 @@ function M.on_events(c: Core, list: { { [string]: any } })
 				end
 				if fired then
 					local payload = if e.payload ~= nil then tern.json.encode(e.payload) else nil
+					local ev = info
+					if fired.on == "mention" then
+						-- What was asked, without the mentions ({{request}}).
+						-- A field-by-field copy: tern.json tables refuse table.clone.
+						local copy: { [string]: any } = {}
+						for k, v in info do
+							copy[k] = v
+						end
+						ev = copy
+						ev.request = match.request(info, match.handles(fired, ctx))
+					end
 					local run, err = runner.submit(c.runner, wf, {
 						trigger = { kind = "github", detail = row.summary, delivery = delivery },
 						repo = key,
 						ref = info.fetch_ref,
 						inputs = defaults(wf),
-						event = info,
+						event = ev,
 						payload = payload,
 					})
 					if run then
@@ -873,6 +946,7 @@ function M.new(data: string): Core
 		book = evolve.load(data),
 		groups = groups.empty(),
 		groups_err = nil,
+		inbox = inbox.load(data),
 		dev = {
 			role = "solo",
 			cfg_dirty = true,
@@ -885,6 +959,7 @@ function M.new(data: string): Core
 			mirror_missing = {},
 			remote = {},
 			remote_tails = {},
+			remote_inbox = {},
 			remote_busy = false,
 		},
 	}
@@ -933,6 +1008,9 @@ function M.new(data: string): Core
 				end
 			end)
 		end,
+		inbox = function(run, raw)
+			return M.inbox_report(c, run, raw)
+		end,
 	})
 	local client_id = (function(): string
 		local ok, v = pcall(tern.kv.get, "client_id")
@@ -969,6 +1047,10 @@ function M.new(data: string): Core
 		subs = function()
 			local w = c.workflows
 			return if w then model.subscriptions(w) else nil
+		end,
+		dispatch = function()
+			local w = c.workflows
+			return if w then model.dispatch(w) else {}
 		end,
 	})
 	return c
@@ -1043,7 +1125,7 @@ end
 
 -- The repo a run started without one works in: the only declared repo the workflow's triggers
 -- name (a schedule's `repo`, a GitHub trigger's literal `repos`), else the only declared repo.
-local function default_repo(w: model.Workflows, wf: model.Workflow): string?
+function default_repo(w: model.Workflows, wf: model.Workflow): string?
 	local found: { [string]: boolean } = {}
 	local open = false
 	for _, t in wf.triggers do
@@ -1282,7 +1364,12 @@ function M.cancel(c: Core, id: string): string?
 	if runner.cancel(c.runner, id) then
 		return nil
 	end
-	return "该运行已结束"
+	local run = c.store.by_id[id]
+	local cur = if run and run.state == "running" then run.steps[run.step] else nil
+	if cur and (cur.kind == "cleanup" or cur.kind == "report") then
+		return "运行已在收尾(清理或回复),不能再取消"
+	end
+	return if run and run.state == "running" then "该运行正在停止" else "该运行已结束"
 end
 
 -- An ended run's agent steps without recorded models get them from their session files (runs
@@ -1294,7 +1381,9 @@ end
 function M.rerun(c: Core, id: string): string?
 	local run = c.store.by_id[id]
 	local w = c.workflows
-	local wf = run and w and w.by_id[run.workflow]
+	local wf = if run and run.task
+		then tasks.workflow(tasks.new_id(), run.task, run.repo)
+		else run and w and w.by_id[run.workflow]
 	if not run or not wf then
 		return "找不到该运行或其工作流"
 	end
@@ -1304,6 +1393,555 @@ function M.rerun(c: Core, id: string): string?
 	end
 	local _, err = runner.submit(c.runner, wf, runner.request_of(c.runner, run))
 	return err
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Built-in runs (lib/tasks.luau): tasks, follow-ups, a run's changes as a branch or a PR
+
+export type TaskSpec = { prompt: string, repo: string?, model: string?, environment: string? }
+
+local function submit_task(c: Core, task: store.Task, req: runner.Request): (string?, string?)
+	local blocked = M.run_block(c)
+	if blocked then
+		return nil, blocked
+	end
+	req.task = task
+	local run, err = runner.submit(c.runner, tasks.workflow(tasks.new_id(), task, req.repo), req)
+	return if run then run.id else nil, err
+end
+
+local function task_text(text: string): (string?, string?)
+	local t = util.trim(text)
+	if t == "" then
+		return nil, "先写下要做的事"
+	elseif #t > tasks.MAX_PROMPT then
+		return nil, `内容太长(上限 {tasks.MAX_PROMPT // 1024} KiB)`
+	end
+	return t, nil
+end
+
+-- Starts a task: one omp step, in a worktree of `repo` when it has a checkout (never in the
+-- checkout itself), else in an empty directory. Returns the run's id, or why not.
+function M.start_task(c: Core, spec: TaskSpec): (string?, string?)
+	local text, why = task_text(spec.prompt)
+	if not text then
+		return nil, why
+	end
+	local repo = spec.repo
+	local r: model.Repo? = nil
+	if repo then
+		local w = c.workflows
+		r = if w then w.repos[repo] else nil
+		if r == nil then
+			return nil, `workflows.toml 里没有仓库 {repo}`
+		end
+	end
+	local model_ = if spec.model and spec.model ~= "" then spec.model else nil
+	local env = if spec.environment and spec.environment ~= "" then spec.environment else nil
+	if env and c.config.environments[env] == nil then
+		return nil, `roost.toml 中没有环境「{env}」`
+	end
+	return submit_task(c, {
+		kind = "task",
+		prompt = text :: string,
+		model = model_,
+		workspace = if r and r.path then "worktree" else "temp",
+		environment = env,
+	}, {
+		trigger = { kind = "task", detail = "首页" },
+		repo = repo,
+		ref = if r then r.branch else nil,
+		inputs = {},
+	})
+end
+
+-- The omp step a follow-up of `run` continues: its last one that ran as an agent and left a session.
+function M.followup_step(c: Core, run: store.Run): number?
+	local d = store.run_dir(c.store, run.id)
+	for i = #run.steps, 1, -1 do
+		local s = run.steps[i]
+		if s.kind == "omp" and s.agent and agent.session_file(agent.files(d, i).session) then
+			return i
+		end
+	end
+	return nil
+end
+
+-- The commit a worktree run started at (its prepare step's base.txt).
+local function run_base(c: Core, run: store.Run): string?
+	local ok, text = pcall(tern.fs.read, `{store.run_dir(c.store, run.id)}/base.txt`, 256)
+	local sha = if ok then string.match(text :: string, "^(%x+)") else nil
+	return if sha and #sha >= 7 then sha else nil
+end
+
+-- What a follow-up or a PR of `run` would start from: its base and patch (worktree runs).
+local function continuation(c: Core, run: store.Run): (string?, string?, string?)
+	if run.workspace ~= "worktree" then
+		return nil, nil, nil
+	end
+	if run.changes and run.changes.too_big then
+		return nil, nil, "改动太大(补丁超过 8 MiB 未保存),无法在其上接续"
+	end
+	local base = run_base(c, run)
+	if not base then
+		return nil, nil, "找不到这次运行开始时的提交(base.txt)"
+	end
+	local d = store.run_dir(c.store, run.id)
+	-- Written only after a complete capture: without it the patch may be missing, not empty.
+	if not tern.fs.exists(`{d}/changes.total`) then
+		return nil, nil, "没能收集这次运行的改动(见日志里的「清理 worktree」),无法在其上接续"
+	end
+	local patch = `{d}/changes.patch`
+	return base, if tern.fs.exists(patch) then patch else nil, nil
+end
+
+-- Continues finished run `id` with `text`: a task that resumes the conversation of its last omp
+-- step, in the same kind of workspace (a worktree starts where the parent's did, with its changes).
+function M.followup(c: Core, id: string, text: string): (string?, string?)
+	local run = c.store.by_id[id]
+	if not run then
+		return nil, "找不到该运行"
+	elseif not store.TERMINAL[run.state] then
+		return nil, "运行结束后才能追问"
+	end
+	local t, why = task_text(text)
+	if not t then
+		return nil, why
+	end
+	local i = M.followup_step(c, run)
+	if not i then
+		return nil, "这次运行没有可接续的 omp 会话"
+	end
+	local base, patch, err = continuation(c, run)
+	if err then
+		return nil, err
+	end
+	local workspace = run.workspace or "temp"
+	if workspace == "worktree" or workspace == "repo" then
+		local w = c.workflows
+		local r = if w and run.repo then w.repos[run.repo] else nil
+		if not (r and r.path) then
+			return nil, `仓库 {run.repo or "?"} 已不在 workflows.toml 中或没有本机检出`
+		end
+	end
+	return submit_task(c, {
+		kind = "task",
+		prompt = t :: string,
+		model = run.steps[i].model,
+		-- The same environment: the task's own, else the workflow's.
+		environment = if run.task then run.task.environment
+			else (function(): string?
+				local w = c.workflows
+				local wf = if w then w.by_id[run.workflow] else nil
+				return if wf then wf.environment else nil
+			end)(),
+		workspace = workspace,
+	}, {
+		trigger = { kind = "followup", detail = run.id },
+		repo = run.repo,
+		ref = run.ref,
+		inputs = {},
+		parent = run.id,
+		base = base,
+		patch = patch,
+		resume = agent.files(store.run_dir(c.store, run.id), i).session,
+	})
+end
+
+-- Why `run`'s changes can't become a branch or a PR (nil: they can).
+function M.changes_block(c: Core, run: store.Run): string?
+	if not store.TERMINAL[run.state] then
+		return "运行结束后才能使用改动"
+	elseif not run.changes then
+		return "这次运行没有改动"
+	elseif run.changes.too_big then
+		return "补丁超过 8 MiB,没有保存"
+	elseif not tern.fs.exists(`{store.run_dir(c.store, run.id)}/changes.patch`) then
+		return "补丁文件已不存在"
+	elseif not run.repo_path or not run_base(c, run) then
+		return "找不到仓库检出或开始时的提交"
+	end
+	return nil
+end
+
+export type PrSpec = { title: string, body: string?, base: string? }
+
+-- Opens a PR from finished run `id`'s changes: a built-in run that commits them on the commit the
+-- run started at, pushes `roost/<id>` and runs `gh pr create` (as the App when that is the identity).
+function M.open_pr(c: Core, id: string, spec: PrSpec): (string?, string?)
+	local run = c.store.by_id[id]
+	if not run then
+		return nil, "找不到该运行"
+	end
+	local blocked = M.changes_block(c, run)
+	if blocked then
+		return nil, blocked
+	elseif run.pr then
+		return nil, `已经开过 PR:{run.pr}`
+	end
+	local title = util.trim(spec.title)
+	if title == "" then
+		return nil, "PR 标题不能为空"
+	end
+	local base, patch = continuation(c, run)
+	local w = c.workflows
+	local r = if w and run.repo then w.repos[run.repo] else nil
+	if not (r and r.path) then
+		return nil, `仓库 {run.repo or "?"} 已不在 workflows.toml 中或没有本机检出`
+	end
+	local branch_ = util.trim(spec.base or "")
+	return submit_task(c, {
+		kind = "pr",
+		prompt = util.clip(title, 200),
+		body = spec.body,
+		branch = `roost/{run.id}`,
+		base = if branch_ ~= "" then branch_ else nil,
+		workspace = "worktree",
+	}, {
+		trigger = { kind = "pr", detail = run.id },
+		repo = run.repo,
+		ref = run.ref,
+		inputs = {},
+		parent = run.id,
+		base = base,
+		patch = patch,
+	})
+end
+
+local BRANCH_MS = 60000
+
+-- Makes local branch `roost/<id>` from finished run `id`'s changes in the checkout the run used,
+-- without touching that checkout's own branch or files; `cb` gets the branch or why not.
+function M.make_branch(c: Core, id: string, cb: (string?, string?) -> ())
+	local run = c.store.by_id[id]
+	if not run then
+		cb(nil, "找不到该运行")
+		return
+	end
+	local blocked = M.changes_block(c, run) or (if run.branch then `已经建过分支 {run.branch}` else nil)
+	if blocked then
+		cb(nil, blocked)
+		return
+	end
+	local branch = `roost/{run.id}`
+	local d = store.run_dir(c.store, run.id)
+	local message = `Roost:{run.title}\n\n运行 {run.id}({run.workflow_name})`
+	local ok, err = pcall(function(): string?
+		tern.process.run({
+			"/bin/sh",
+			"-c",
+			tasks.BRANCH_SCRIPT,
+			"roost",
+			run.repo_path :: string,
+			branch,
+			run_base(c, run) :: string,
+			`{d}/changes.patch`,
+			message,
+		}, { env = local_env(c), timeout_ms = BRANCH_MS }, function(res)
+			if res.status == 0 then
+				local cur = c.store.by_id[id]
+				if cur then
+					cur.branch = branch
+					runner.save(c.runner)
+				end
+				M.changed(c)
+				cb(branch, nil)
+			else
+				local why = util.trim(res.stderr or "")
+				cb(nil, if res.timed_out then "建分支超时" elseif why ~= "" then util.clip(why, 300) else `建分支失败(退出码 {res.status})`)
+			end
+		end)
+		return nil
+	end)
+	if not ok then
+		cb(nil, `无法启动 git:{err}`)
+	end
+end
+
+-- The files run `id` changed (the first of its numstat), the totals, and its patch's path when
+-- kept. The last run read is cached: the detail asks on every render.
+local changes_cache: { key: string?, rows: { tasks.FileChange }, sum: store.Changes? } = { key = nil, rows = {}, sum = nil }
+function M.changes(c: Core, id: string): ({ tasks.FileChange }, store.Changes?, string?)
+	local d = store.run_dir(c.store, id)
+	local patch = `{d}/changes.patch`
+	local run = c.store.by_id[id]
+	local ch = run and run.changes
+	local key = if ch then `{id}:{ch.files}:{ch.add}:{ch.del}` else id
+	if changes_cache.key ~= key then
+		local ok, text = pcall(tern.fs.read, `{d}/changes.numstat`, tasks.MAX_NUMSTAT)
+		local rows, sum = tasks.parse_numstat(if ok then text :: string else "")
+		-- The run's record has the whole diff's totals; the numstat only its first files.
+		changes_cache = { key = key, rows = rows, sum = ch or (if sum.files > 0 then sum else nil) }
+	end
+	return changes_cache.rows, changes_cache.sum, if tern.fs.exists(patch) then patch else nil
+end
+
+-- Up to `limit` bytes of run `id`'s patch, and whether there is more. The patch never changes once
+-- written, so the last one read is kept (the diff overlay asks on every render).
+local patch_cache: { key: string?, text: string?, more: boolean } = { key = nil, text = nil, more = false }
+function M.patch_text(c: Core, id: string, limit: number): (string?, boolean)
+	local key = `{id}:{limit}`
+	if patch_cache.key ~= key then
+		local ok, text = pcall(tern.fs.read, `{store.run_dir(c.store, id)}/changes.patch`, tasks.MAX_PATCH)
+		local t = if ok then text :: string else nil
+		patch_cache = { key = key, text = if t then string.sub(t, 1, limit) else nil, more = t ~= nil and #t > limit }
+	end
+	return patch_cache.text, patch_cache.more
+end
+
+local MAX_ANSWER = 16 * 1024
+
+-- The final answer of run `id`'s last omp step that gave one (the session file's, else the
+-- window's copy), at most MAX_ANSWER bytes, and whether it was cut. Read again only when that
+-- run's agent steps moved on (the detail asks on every render).
+local answer_cache: { key: string?, text: string?, cut: boolean } = { key = nil, text = nil, cut = false }
+function M.answer(c: Core, id: string): (string?, boolean)
+	local run = c.store.by_id[id]
+	if not run then
+		return nil, false
+	end
+	local key = `{id}:{run.state}`
+	for i, s in run.steps do
+		if s.kind == "omp" and s.agent then
+			key ..= `:{i}.{s.state}.{s.tail or 0}`
+		end
+	end
+	if answer_cache.key == key then
+		return answer_cache.text, answer_cache.cut
+	end
+	local d = store.run_dir(c.store, id)
+	local found: string?, cut = nil, false
+	for i = #run.steps, 1, -1 do
+		local s = run.steps[i]
+		if s.kind == "omp" and s.agent and found == nil then
+			local f = agent.files(d, i)
+			for _, p in { f.answer, f.reply } do
+				local ok, text = pcall(tern.fs.read, p, agent.MAX_REPLY)
+				if ok and found == nil and util.trim(text :: string) ~= "" then
+					local t = text :: string
+					found, cut = string.sub(t, 1, MAX_ANSWER), #t > MAX_ANSWER
+				end
+			end
+		end
+	end
+	answer_cache = { key = key, text = found, cut = cut }
+	return found, cut
+end
+
+-- Runs that continue `id` (follow-ups) or open its PR, newest first.
+function M.children(c: Core, id: string): { store.Run }
+	local out: { store.Run } = {}
+	for i = #c.store.runs, 1, -1 do
+		local r = c.store.runs[i]
+		if r.parent == id then
+			table.insert(out, r)
+		end
+	end
+	return out
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Inbox (lib/inbox.luau): what workflows report needs a person
+
+-- Applies what a step of `run` wrote to $ROOST_INBOX; returns a line for the run's log, if any.
+function M.inbox_report(c: Core, run: store.Run, raw: string): string?
+	if run.task then
+		return "内置运行不写收件箱,已忽略"
+	end
+	local p, note = inbox.parse(raw, now())
+	if not p then
+		return note
+	end
+	inbox.apply(c.inbox, run.workflow, p, run.id, now())
+	local err = inbox.save(c.data, c.inbox)
+	M.changed(c)
+	if err then
+		return `无法保存 {inbox.FILE}:{err}`
+	end
+	return note
+end
+
+-- On an observer the executor's inbox (uploaded with its runs), else this machine's.
+local function inbox_boxes(c: Core): { [string]: inbox.Box }?
+	return if M.role(c) == "observer" then c.dev.remote_inbox else nil
+end
+
+-- Every item not dismissed here, most pressing first.
+function M.inbox_items(c: Core): { inbox.Entry }
+	return inbox.list(c.inbox, inbox_boxes(c))
+end
+
+-- Hides an item on this machine until its text changes.
+function M.inbox_dismiss(c: Core, wf: string, id: string): string?
+	if not inbox.dismiss(c.inbox, wf, id, inbox_boxes(c)) then
+		return "这一条已经不在收件箱里"
+	end
+	local err = inbox.save(c.data, c.inbox)
+	M.changed(c)
+	return if err then `无法保存 {inbox.FILE}:{err}` else nil
+end
+
+-- Runs what an item offers (its workflow, on its PR when it names one); `cb` gets nil once queued.
+function M.inbox_run(c: Core, wf: string, id: string, cb: (string?) -> ())
+	for _, e in M.inbox_items(c) do
+		if e.workflow == wf and e.id == id then
+			local a = e.run
+			if not a then
+				cb("这一条没有可运行的操作")
+			elseif a.pr then
+				M.dispatch_pr(c, a.workflow, a.inputs, a.pr, cb)
+			else
+				cb(M.dispatch(c, a.workflow, a.inputs))
+			end
+			return
+		end
+	end
+	cb("这一条已经不在收件箱里")
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- API trigger tokens: 32 random bytes from the system (openssl), and their SHA-256 for the file
+
+local TOKEN_SCRIPT = [[
+tok=$(/usr/bin/openssl rand -hex 32) || exit 1
+printf '%s\n' "$tok"
+printf '%s' "$tok" | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1
+]]
+
+-- `cb` gets a new token and its SHA-256 (hex), or why there are none.
+function M.new_api_token(c: Core, cb: (token: string?, hash: string?, err: string?) -> ())
+	local ok, err = pcall(function(): string?
+		tern.process.run({ "/bin/sh", "-c", TOKEN_SCRIPT }, { timeout_ms = 10000 }, function(res: ProcessResult)
+			local tok, hash = string.match(res.stdout or "", "^(%x+)\n(%x+)%s*$")
+			if res.status == 0 and not res.timed_out and tok and #tok == 64 and hash and #hash == 64 then
+				cb(tok, string.lower(hash), nil)
+			else
+				cb(nil, nil, if res.timed_out then "生成令牌超时" else `生成令牌失败:{util.clip(util.trim(res.stderr or ""), 200)}`)
+			end
+		end)
+		return nil
+	end)
+	if not ok then
+		cb(nil, nil, `无法生成令牌:{err}`)
+	end
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- A workflow drafted from a description (the editor opens it for review; nothing is saved here)
+
+local GEN_MS = 180000
+local GEN_MAX_OUT = 256 * 1024
+local GEN_MAX_TEXT = 8 * 1024
+
+-- What omp is told: the file format in brief, every trigger kind with its filters, the declared
+-- repositories, and the description (plus what was wrong with the last try).
+local function gen_prompt(c: Core, text: string, problems: string?): string
+	local kinds: { string } = {}
+	for _, k in model.GITHUB_KINDS do
+		table.insert(kinds, `- github = "{k.id}"({k.label}):筛选器 {table.concat(k.filters, ", ")}`)
+	end
+	local schedules: { string } = {}
+	for _, s in model.SCHEDULES do
+		table.insert(schedules, `- schedule = "{s.id}"({s.label}):键 {table.concat(s.keys, ", ")}`)
+	end
+	local repos: { string } = {}
+	local w = c.workflows
+	if w then
+		for _, name in util.keys(w.repos) do
+			table.insert(repos, name)
+		end
+	end
+	local lines = {
+		"你为 Roost(本机自动化工作台)写一个工作流。只输出一个 ```toml 代码块,里面恰好一个 [[workflow]](不要写 [repos])。",
+		"",
+		"格式:",
+		"[[workflow]] 的键:id(小写字母数字和 -)、name、description、notify、reply(由议题/PR 事件触发时在原处评论结果)、workspace(auto | worktree | temp)、timeout(如 \"30m\")。",
+		"[[workflow.trigger]]:每个触发器是定时或 GitHub 之一,GitHub 触发器至少要有一个筛选器(通常是 repos = [\"owner/name\"])。",
+		table.concat(schedules, "\n"),
+		table.concat(kinds, "\n"),
+		"[[workflow.step]]:name,再加 omp = \"给编码 agent 的指令\"(主要用这个)或 run = \"shell 脚本\"。指令里可以用 {{repo}} {{number}} {{title}} {{body}} {{url}} {{comment}} {{request}} {{sender}} {{branch}} {{sha}}。",
+		`本机声明的仓库:{if #repos > 0 then table.concat(repos, "、") else "(没有)"}。`,
+		"",
+		`需求:{text}`,
+	}
+	if problems then
+		table.insert(lines, "")
+		table.insert(lines, `上一次的输出有这些问题,请改正后重新输出完整的代码块:\n{problems}`)
+	end
+	return table.concat(lines, "\n")
+end
+
+-- The TOML in omp's answer: its ```toml block, else the whole text.
+local function gen_block(out: string): string
+	return string.match(out, "```toml%s*\n(.-)```") or string.match(out, "```%s*\n(.-)```") or out
+end
+
+-- Drafts a workflow from `text` with omp (no tools, no saved session); `cb` gets the workflow's
+-- table (TOML-shaped, as the editor takes it) and, when it still has problems, what they are; or
+-- nil and why it failed. One retry feeds the validator's complaints back.
+function M.generate_workflow(c: Core, text: string, cb: (raw: { [string]: any }?, problems: string?) -> ())
+	local want = util.trim(text)
+	if want == "" then
+		cb(nil, "先描述要自动化的事")
+		return
+	elseif #want > GEN_MAX_TEXT then
+		cb(nil, `描述太长(上限 {GEN_MAX_TEXT // 1024} KiB)`)
+		return
+	end
+	if c.login.pending then
+		if #c.login_waiters >= MAX_LOGIN_WAITERS then
+			cb(nil, "正在读取登录 shell 的环境变量,稍后再试")
+			return
+		end
+		table.insert(c.login_waiters, function()
+			M.generate_workflow(c, text, cb)
+		end)
+		return
+	end
+	local function attempt(problems: string?, left: number)
+		local argv = { "/bin/sh", "-c", 'exec "$@"', "roost", c.config.runner.omp, "-p", "--no-session", "--tools=read", gen_prompt(c, want, problems) }
+		local ok, err = pcall(function(): string?
+			tern.process.run(argv, { env = local_env(c), timeout_ms = GEN_MS }, function(res: ProcessResult)
+				local out = res.stdout or ""
+				if res.timed_out then
+					cb(nil, "生成超时")
+					return
+				elseif res.status ~= 0 then
+					local msg = util.first_line(util.trim(res.stderr or ""))
+					cb(nil, `omp 失败:{if msg ~= "" then util.clip(msg, 200) else `退出码 {res.status}`}`)
+					return
+				elseif #out > GEN_MAX_OUT then
+					cb(nil, "omp 的输出过大")
+					return
+				end
+				local block = gen_block(out)
+				local root = toml.parse(block)
+				local wfs = if type(root) == "table" then root.workflow else nil
+				local raw = if type(wfs) == "table" and type(wfs[1]) == "table" then wfs[1] else nil
+				local _, issues = model.parse_workflows(block)
+				local found: { string } = {}
+				for i, it in issues do
+					if i > 10 then
+						break
+					end
+					table.insert(found, `{it.path}: {it.message}`)
+				end
+				local why = if raw == nil then "没有找到 [[workflow]]" elseif #found > 0 then table.concat(found, "\n") else nil
+				if why and left > 0 then
+					attempt(why, left - 1)
+				elseif raw == nil then
+					cb(nil, "omp 没有给出可用的工作流")
+				else
+					cb(raw, why)
+				end
+			end)
+			return nil
+		end)
+		if not ok then
+			cb(nil, `无法启动 omp:{err}`)
+		end
+	end
+	attempt(nil, 1)
 end
 
 -- Pushes now even when unchanged, so the button always reports the relay's answer.
@@ -1383,6 +2021,14 @@ local function runtime_issues(c: Core, wf: model.Workflow, out: { model.Issue })
 	local base = `workflow.{wf.id}`
 	local known = M.app(c) ~= nil
 	local me = M.me(c)
+	if wf.environment and c.config.environments[wf.environment] == nil then
+		table.insert(out, {
+			file = "workflows.toml",
+			path = `{base}.environment`,
+			message = `roost.toml 中没有环境「{wf.environment}」:在 [environments.{wf.environment}] 定义它,否则运行会在「准备环境」失败`,
+			line = wf.line,
+		})
+	end
 	for i, tr in wf.triggers do
 		local path = `{base}.trigger[{i}]`
 		if tr.kind == "cron" then
@@ -3007,6 +3653,18 @@ end
 -- revisions watching its workflow (which may undo one); a failure may start an evolver (not when
 -- it just undid a revision of that workflow: the cause is known).
 function on_finished(c: Core, run: store.Run)
+	-- Built-in runs (lib/tasks.luau) have no workflow to evolve: a PR run only links its PR from the
+	-- run whose changes it opened.
+	if run.task then
+		local pr = run.outputs and run.outputs.pr
+		local p = if run.task.kind == "pr" and run.parent then c.store.by_id[run.parent] else nil
+		if p and pr and string.match(pr, "^https://") then
+			p.pr = pr
+			runner.save(c.runner)
+		end
+		M.changed(c)
+		return
+	end
 	local h = evolve_host(c)
 	local w = c.workflows
 	local wf = if w then w.by_id[run.workflow] else nil
@@ -3387,9 +4045,9 @@ local function upload_runs(c: Core)
 		tails[id] = x.text
 	end
 	-- A log that isn't valid UTF-8 can't be encoded: send the runs without tails then.
-	local ok, json = pcall(fleet.summaries, list, tails)
+	local ok, json = pcall(fleet.summaries, list, tails, c.inbox.boxes)
 	if not ok then
-		ok, json = pcall(fleet.summaries, list, {})
+		ok, json = pcall(fleet.summaries, list, {}, c.inbox.boxes)
 	end
 	-- Unchanged: sent already, unless the relay no longer has it (checked at most every minute;
 	-- its record of the runs comes with the status, not at once).
@@ -3628,7 +4286,7 @@ local function fetch_runs(c: Core)
 		if type(meta) ~= "table" then
 			-- Nothing uploaded yet.
 			if d.remote_rev ~= nil or #d.remote > 0 then
-				d.remote, d.remote_tails, d.remote_rev, d.remote_at, d.remote_from = {}, {}, nil, nil, nil
+				d.remote, d.remote_tails, d.remote_inbox, d.remote_rev, d.remote_at, d.remote_from = {}, {}, {}, nil, nil, nil
 				M.changed(c)
 			end
 			return
@@ -3639,9 +4297,9 @@ local function fetch_runs(c: Core)
 		-- Still the previous executor's upload (the new one hasn't sent its own yet): show none.
 		local ex = relay.executor(c.relay)
 		if ex and meta.client ~= ex.id then
-			d.remote, d.remote_tails = {}, {}
+			d.remote, d.remote_tails, d.remote_inbox = {}, {}, {}
 		else
-			d.remote, d.remote_tails = fleet.decode_runs(body.body)
+			d.remote, d.remote_tails, d.remote_inbox = fleet.decode_runs(body.body)
 		end
 		d.remote_rev = if type(meta.revision) == "string" then meta.revision else nil
 		d.remote_at = util.rfc3339(meta.at)

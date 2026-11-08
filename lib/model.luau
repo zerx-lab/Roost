@@ -33,7 +33,10 @@ export type Runner = {
 export type Github = { login: string?, identity: "app" | "local" }
 -- What Roost keeps on disk and for how long (seconds; 0 = no age limit).
 export type Retention = { runs: number, run_age: number, events: number, event_age: number }
-export type Config = { relay: Relay, runner: Runner, github: Github, retention: Retention }
+-- `[environments.<name>]` in roost.toml: what runs of workflows (and tasks) naming it get. `vars`
+-- reach shell and omp steps; `path` goes before PATH; `setup` runs in the workspace first.
+export type Environment = { name: string, vars: { [string]: string }, path: { string }, setup: string? }
+export type Config = { relay: Relay, runner: Runner, github: Github, retention: Retention, environments: { [string]: Environment } }
 
 export type Repo = { name: string, path: string?, branch: string?, worktree: boolean }
 export type Input = { name: string, description: string?, default: string?, required: boolean }
@@ -58,7 +61,10 @@ export type CronTrigger = {
 -- Fires when a run of a workflow this one evolves (`evolve`) ends badly: `streak` such runs in a
 -- row (failed or timed out), optionally only for the listed workflows.
 export type RoostTrigger = { kind: "roost", on: "run_failed", workflows: { string }, streak: number, line: number? }
-export type Trigger = CronTrigger | GithubTrigger | RoostTrigger
+-- Started from outside: `POST /hooks/dispatch/<workflow id>` on the relay with the bearer token
+-- whose SHA-256 is `token_sha256` (the token itself is shown once and never stored).
+export type ApiTrigger = { kind: "api", token_sha256: string, line: number? }
+export type Trigger = CronTrigger | GithubTrigger | RoostTrigger | ApiTrigger
 -- A GitHub trigger of kind `on` (see GITHUB_KINDS); every list filter is "any" when empty.
 export type GithubTrigger = {
 	kind: "github",
@@ -76,6 +82,7 @@ export type GithubTrigger = {
 	review_states: { string },
 	thread_actions: { string },
 	comment: string?,
+	handle: string?, -- mention: the name to look for besides the App's own (`@roost`)
 	skip_drafts: boolean,
 	include_closed: boolean,
 	ignore_bots: boolean,
@@ -120,11 +127,15 @@ export type Workflow = {
 	enabled: boolean,
 	manual: boolean,
 	notify: boolean,
+	-- Runs started by an issue/PR event say on that issue/PR that they started, then how they ended
+	-- with the final answer (lib/reply.luau).
+	reply: boolean,
 	timeout: number?,
 	concurrency: "queue" | "skip" | "replace",
 	workspace: "auto" | "worktree" | "repo" | "temp",
 	env: { [string]: string },
 	identity: ("app" | "local")?, -- nil: roost.toml [github] identity
+	environment: string?, -- a roost.toml [environments.<name>] its runs get
 	daily_budget: number?, -- USD the workflow's omp steps may spend per local day (estimated)
 	inputs: { Input },
 	triggers: { Trigger },
@@ -208,6 +219,7 @@ M.FILTERS = {
 	workflows = { label = "工作流名称", kind = "list", suggest = "workflows" },
 	actions = { label = "动作", kind = "list", hint = "事件的 action,如 opened、published" },
 	comment = { label = "评论前缀", kind = "text", hint = "只在评论以此开头时触发,如 /roost" },
+	handle = { label = "另一个提及名", kind = "text", hint = "总是响应 @<App 名>;这里可再加一个,如 @roost" },
 	label_actions = {
 		label = "标签操作",
 		kind = "choice",
@@ -282,6 +294,14 @@ M.GITHUB_KINDS = {
 		icon = "message",
 		events = { "issue_comment" },
 		filters = { "repos", "authors", "assignees", "comment", "ignore_bots", "ignore_self" },
+	},
+	{
+		id = "mention",
+		label = "被 @ 提及",
+		detail = "当议题、PR 或审查评论里 @ 了 App(或你设的提及名)时触发;{{request}} 是去掉提及后的请求。配合「在评论中回复」把结果写回原处。",
+		icon = "message",
+		events = { "issue_comment", "pull_request_review_comment", "issues" },
+		filters = { "repos", "authors", "handle", "ignore_bots", "ignore_self" },
 	},
 	{
 		id = "push",
@@ -490,6 +510,26 @@ M.TEMPLATES = {
 				{
 					name = "执行指令",
 					omp = "{{sender}} 在 {{repo}} #{{number}}「{{title}}」上留言:\n\n{{comment}}\n\n按留言中 /roost 之后的要求处理,完成后用 gh 在该 issue/PR 下回复结果。",
+				},
+			},
+		},
+	},
+	{
+		id = "mention",
+		name = "@ 提及就处理",
+		description = "在议题、PR 或审查评论里 @ 了 App 时按要求处理,并把结果写回原处的评论。",
+		icon = "message",
+		group = "议题",
+		raw = {
+			name = "@ 提及",
+			icon = "message",
+			reply = true,
+			workspace = "worktree",
+			trigger = { { github = "mention" } },
+			step = {
+				{
+					name = "处理",
+					omp = "{{sender}} 在 {{repo}} 的 #{{number}}「{{title}}」({{url}})里 @ 了你:\n\n{{request}}\n\n按要求处理。需要改代码时在当前 worktree 里改,提交并推送到一个新分支、开 PR。最后用几句中文说明你做了什么,这段说明会作为评论回复。",
 				},
 			},
 		},
@@ -879,7 +919,7 @@ function M.parse_config(text: string): (Config?, { Issue })
 		return nil, errs
 	end
 	local c: Ctx = { file = "roost.toml", issues = {}, pos = pos }
-	check_keys(c, root, "roost", { "relay", "runner", "github", "retention" })
+	check_keys(c, root, "roost", { "relay", "runner", "github", "retention", "environments" })
 	local r = get_table(c, root, "relay", "relay")
 	check_keys(c, r, "relay", { "url", "token", "token_env", "client_name" })
 	local url = get_string(c, r, "url", "relay")
@@ -957,6 +997,33 @@ function M.parse_config(text: string): (Config?, { Issue })
 		events = get_int(c, k, "events", "retention", 200, 10, 2000),
 		event_age = age("event_age"),
 	}
+	local environments: { [string]: Environment } = {}
+	local envs = get_table(c, root, "environments", "environments")
+	for name, e in envs do
+		local path = `environments.{name}`
+		if type(name) ~= "string" or not valid_id(name) then
+			issue(c, path, "环境名应为小写字母、数字、- 或 _", line_of(c, envs, name))
+			continue
+		end
+		if type(e) ~= "table" then
+			issue(c, path, "应为表", line_of(c, envs, name))
+			continue
+		end
+		check_keys(c, e, path, { "vars", "path", "setup" })
+		local vars = get_map(c, e, "vars", path)
+		for var in vars do
+			if not string.match(var, "^[%a_][%w_]*$") then
+				issue(c, `{path}.vars`, `变量名 "{var}" 无效`, line_of(c, e, "vars"))
+			end
+		end
+		local setup = get_string(c, e, "setup", path)
+		environments[name] = {
+			name = name,
+			vars = vars,
+			path = get_strings(c, e, "path", path),
+			setup = if setup and util.trim(setup) ~= "" then setup else nil,
+		}
+	end
 	if #c.issues > 0 then
 		return nil, c.issues
 	end
@@ -965,6 +1032,7 @@ function M.parse_config(text: string): (Config?, { Issue })
 		runner = runner,
 		github = { login = if login == "" then nil else login, identity = identity :: any },
 		retention = retention,
+		environments = environments,
 	}, {}
 end
 
@@ -1311,14 +1379,24 @@ local function compile_roost(c: Ctx, t: { [string]: any }, path: string, line: n
 	return { kind = "roost", on = "run_failed", workflows = wfs, streak = get_int(c, t, "streak", path, 1, 1, 20), line = line }
 end
 
+local function compile_api(c: Ctx, t: { [string]: any }, path: string, line: number?): ApiTrigger?
+	check_keys(c, t, path, { "api" })
+	local h = get_string(c, t, "api", path) or ""
+	if not string.match(h, "^%x+$") or #h ~= 64 or string.lower(h) ~= h then
+		issue(c, `{path}.api`, "应为调用令牌的 SHA-256(64 位小写十六进制;在编辑器里生成)", line_of(c, t, "api") or line)
+		return nil
+	end
+	return { kind = "api", token_sha256 = h, line = line }
+end
+
 local function compile_trigger(c: Ctx, t: any, path: string, line: number?, repos: { [string]: Repo }): Trigger?
 	if type(t) ~= "table" then
 		issue(c, path, "应为表", line)
 		return nil
 	end
-	local n = (if t.github ~= nil then 1 else 0) + (if t.schedule ~= nil then 1 else 0) + (if t.roost ~= nil then 1 else 0)
+	local n = (if t.github ~= nil then 1 else 0) + (if t.schedule ~= nil then 1 else 0) + (if t.roost ~= nil then 1 else 0) + (if t.api ~= nil then 1 else 0)
 	if n > 1 then
-		issue(c, path, "github、schedule 与 roost 只能选一个", line)
+		issue(c, path, "github、schedule、roost 与 api 只能选一个", line)
 		return nil
 	elseif t.github ~= nil then
 		return compile_github(c, t, path, line)
@@ -1326,6 +1404,8 @@ local function compile_trigger(c: Ctx, t: any, path: string, line: number?, repo
 		return compile_schedule(c, t, path, line, repos)
 	elseif t.roost ~= nil then
 		return compile_roost(c, t, path, line)
+	elseif t.api ~= nil then
+		return compile_api(c, t, path, line)
 	end
 	issue(
 		c,
@@ -1379,8 +1459,8 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		local id = get_string(c, w, "id", `workflow[{wi}]`) or ""
 		local base = `workflow.{if id ~= "" then id else tostring(wi)}`
 		check_keys(c, w, base, {
-			"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace",
-			"identity", "daily_budget", "state", "libs", "evolve", "env", "input", "trigger", "step",
+			"id", "name", "icon", "description", "enabled", "manual", "notify", "reply", "timeout", "concurrency", "workspace",
+			"identity", "environment", "daily_budget", "state", "libs", "evolve", "env", "input", "trigger", "step",
 		})
 		if not valid_id(id) then
 			issue(c, `{base}.id`, `id "{id}" 无效:1-64 位 a-z 0-9 _ -,以字母或数字开头`, line_of(c, w, "id") or wline)
@@ -1402,6 +1482,11 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 		if identity ~= nil and identity ~= "app" and identity ~= "local" then
 			issue(c, `{base}.identity`, "应为 app 或 local(省略则用 roost.toml [github] identity)", line_of(c, w, "identity"))
 			identity = nil
+		end
+		local environment = get_string(c, w, "environment", base)
+		if environment ~= nil and not valid_id(environment) then
+			issue(c, `{base}.environment`, "应为 roost.toml 中 [environments.<名>] 的名字", line_of(c, w, "environment"))
+			environment = nil
 		end
 		local state = get_string(c, w, "state", base)
 		if state ~= nil and not valid_id(state) then
@@ -1441,9 +1526,13 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 
 		local triggers: { Trigger } = {}
 		local rawtrig = get_list(c, w, "trigger", base)
+		local api_seen = false
 		for ti, t in rawtrig do
 			local tr = compile_trigger(c, t, `{base}.trigger[{ti}]`, line_of(c, rawtrig, ti), repos)
-			if tr then
+			if tr and tr.kind == "api" and api_seen then
+				issue(c, `{base}.trigger[{ti}]`, "一个工作流只能有一个 API 触发器", line_of(c, rawtrig, ti))
+			elseif tr then
+				api_seen = api_seen or tr.kind == "api"
 				table.insert(triggers, tr)
 			end
 		end
@@ -1608,11 +1697,13 @@ function M.parse_workflows(text: string): (Workflows?, { Issue })
 			enabled = get_bool(c, w, "enabled", base, true),
 			manual = get_bool(c, w, "manual", base, true),
 			notify = get_bool(c, w, "notify", base, true),
+			reply = get_bool(c, w, "reply", base, false),
 			timeout = get_duration(c, w, "timeout", base),
 			concurrency = conc :: any,
 			workspace = ws :: any,
 			env = get_map(c, w, "env", base),
 			identity = identity :: any,
+			environment = environment,
 			daily_budget = get_budget(c, w, "daily_budget", base),
 			inputs = inputs,
 			triggers = triggers,
@@ -1713,8 +1804,24 @@ function M.subscriptions(w: Workflows): { [string]: Subscription }
 	return out
 end
 
--- The `subscriptions.toml` text the agent would hold, for the manual fallback.
-function M.subscriptions_toml(subs: { [string]: Subscription }): string
+-- Workflows outside callers may start (enabled ones with an `api` trigger): id → token SHA-256.
+function M.dispatch(w: Workflows): { [string]: string }
+	local out: { [string]: string } = {}
+	for _, wf in w.list do
+		if wf.enabled then
+			for _, t in wf.triggers do
+				if t.kind == "api" then
+					out[wf.id] = (t :: ApiTrigger).token_sha256
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- The `subscriptions.toml` text the agent would hold, for the manual fallback; `dispatch` (see
+-- M.dispatch) adds the workflows outside callers may start.
+function M.subscriptions_toml(subs: { [string]: Subscription }, dispatch: { [string]: string }?): string
 	local lines = {
 		"# Roost relay subscriptions (manual copy). Save as the agent's subscriptions.toml,",
 		"# then press 重新加载 in Roost (or send SIGHUP / POST /api/v1/reload).",
@@ -1728,6 +1835,14 @@ function M.subscriptions_toml(subs: { [string]: Subscription }): string
 			table.insert(evs, toml.quote(e))
 		end
 		table.insert(lines, `events = [{table.concat(evs, ", ")}]`)
+		table.insert(lines, "")
+	end
+	local d = dispatch or {}
+	if next(d) then
+		table.insert(lines, "[dispatch]")
+		for _, id in util.keys(d) do
+			table.insert(lines, `{toml.quote(id)} = {toml.quote(d[id])}`)
+		end
 		table.insert(lines, "")
 	end
 	return table.concat(lines, "\n")
@@ -1791,6 +1906,9 @@ function M.describe_trigger(t: Trigger, omit_repos: boolean?): string
 			s ..= ` · {table.concat(rt.workflows, "、")}`
 		end
 		return s
+	end
+	if t.kind == "api" then
+		return "API 调用 · POST /hooks/dispatch/<工作流 id>"
 	end
 	local gt = t :: GithubTrigger
 	local meta = KIND_BY_ID[gt.on]
@@ -1934,17 +2052,17 @@ function M.slug(name: string, taken: { [string]: boolean }): string
 end
 
 local WF_ORDER = {
-	"id", "name", "icon", "description", "enabled", "manual", "notify", "timeout", "concurrency", "workspace", "identity",
-	"daily_budget", "state", "libs", "evolve", "env",
+	"id", "name", "icon", "description", "enabled", "manual", "notify", "reply", "timeout", "concurrency", "workspace", "identity",
+	"environment", "daily_budget", "state", "libs", "evolve", "env",
 }
-local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify = true, concurrency = "queue", workspace = "auto" }
+local WF_DEFAULTS: { [string]: any } = { enabled = true, manual = true, notify = true, reply = false, concurrency = "queue", workspace = "auto" }
 local SUB_ORDER: { [string]: { string } } = {
 	input = { "name", "description", "default", "required" },
 	trigger = {
 		"roost", "streak",
 		"schedule", "at", "days", "between", "day", "date", "time", "cron", "tz", "repo", "ref",
 		"github", "event", "repos", "authors", "assignees", "actions", "branches", "labels", "label_actions",
-		"conclusions", "workflows", "review_states", "thread_actions", "comment",
+		"conclusions", "workflows", "review_states", "thread_actions", "comment", "handle",
 		"skip_drafts", "include_closed", "ignore_bots", "ignore_self", "forks", "associations",
 	},
 	step = {

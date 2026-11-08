@@ -81,6 +81,8 @@ export type Handlers = {
 	ready: () -> boolean,
 	-- The current local subscriptions (nil when no valid workflows.toml).
 	subs: () -> Subs?,
+	-- Workflows outside callers may start: id → SHA-256 of their token (api triggers).
+	dispatch: () -> { [string]: string },
 }
 
 export type Relay = {
@@ -258,20 +260,29 @@ function M.encode_subs(subs: Subs): { [string]: any }
 	return out
 end
 
-function M.fingerprint(subs: Subs): string
+function M.fingerprint(subs: Subs, dispatch: { [string]: string }?): string
 	local parts = {}
 	for _, name in util.keys(subs) do
 		local evs = table.clone(subs[name].events)
 		table.sort(evs)
 		table.insert(parts, `{string.lower(name)}={table.concat(evs, ",")}`)
 	end
+	local d = dispatch or {}
+	for _, id in util.keys(d) do
+		table.insert(parts, `!{id}={d[id]}`)
+	end
 	return table.concat(parts, ";")
+end
+
+-- What a push of `subs` would send, as compared with the last push.
+local function fp_of(r: Relay, subs: Subs): string
+	return M.fingerprint(subs, r.h.dispatch())
 end
 
 -- Whether `subs` differ from what was last pushed to (or adopted from) this relay.
 function M.needs_push(r: Relay, subs: Subs): boolean
 	local s = mine(r, "subs")
-	return s == nil or s.fp ~= M.fingerprint(subs)
+	return s == nil or s.fp ~= fp_of(r, subs)
 end
 
 -- Pushes `subs`; `force` overwrites a server-side change instead of reporting a conflict. A push
@@ -297,11 +308,15 @@ function M.push_subs(r: Relay, subs: Subs, force: boolean)
 	st.sync = { state = "pushing", at = r.h.now(), revision = st.sync.revision }
 	r.h.changed()
 	local body: { [string]: any } = { repos = M.encode_subs(subs) }
+	local dispatch = r.h.dispatch()
+	if next(dispatch) then
+		body.dispatch = dispatch
+	end
 	local saved = mine(r, "subs")
 	if not force and saved and type(saved.rev) == "string" then
 		body.base_revision = saved.rev
 	end
-	local fp = M.fingerprint(subs)
+	local fp = fp_of(r, subs)
 	local gen, url = r.gen, r.cfg.url
 	M.request(r, "PUT", "/api/v1/subscriptions", body, 20000, function(ok, status, resp, err)
 		if gen ~= r.gen then
@@ -366,7 +381,7 @@ local function reconcile(r: Relay, may_push: boolean)
 		if may_push then
 			M.push_subs(r, subs, remote.repos == 0)
 		end
-	elseif saved.fp == M.fingerprint(subs) then
+	elseif saved.fp == fp_of(r, subs) then
 		st.sync = {
 			state = if saved.adopted == true then "adopted" else "ok",
 			at = if type(saved.at) == "number" then saved.at else nil,
@@ -409,7 +424,7 @@ function M.adopt_remote(r: Relay)
 	if st.sync.state ~= "conflict" or subs == nil then
 		return
 	end
-	local fp = M.fingerprint(subs :: Subs)
+	local fp = fp_of(r, subs :: Subs)
 	local url = r.cfg.url
 	local function keep(rev: string)
 		local t = r.h.now()

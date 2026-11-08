@@ -155,12 +155,72 @@ local function kind_mismatch(t: model.GithubTrigger, info: { [string]: any }): s
 		if a ~= "opened" then
 			return want("打开")
 		end
+	elseif on == "mention" then
+		local issue = info.event == "issues"
+		local expect: string = if issue then "opened" else "created"
+		if a ~= expect then
+			return want(if issue then "打开" else "新建")
+		end
 	elseif on == "event" then
 		if #t.actions > 0 and not has(t.actions, a) then
 			return `action {a or "—"} 不在 {table.concat(t.actions, ",")}`
 		end
 	end
 	return nil
+end
+
+-- The names a mention trigger answers to: the App's (`<slug>[bot]` is mentioned as `@<slug>`) and
+-- the trigger's own `handle`, lower-cased without the `@`.
+function M.handles(t: model.GithubTrigger, ctx: Ctx): { string }
+	local out: { string } = {}
+	local bot = if ctx.bot then string.match(ctx.bot, "^(.-)%[bot%]$") or ctx.bot else nil
+	for _, h in { bot, t.handle } do
+		local name = if h then string.lower((string.gsub(h, "^%s*@?", ""))) else nil
+		if name and string.match(name, "^[%w%-_]+$") then
+			table.insert(out, name)
+		end
+	end
+	return out
+end
+
+-- The text a mention trigger reads: an opened issue's body, else the comment.
+local function mention_text(info: { [string]: any }): string
+	local s = if info.event == "issues" then info.body else info.comment
+	return if type(s) == "string" then s else ""
+end
+
+-- Where `@name` (any of `names`) stands alone in `text` (not inside a longer name or an e-mail).
+local function find_mention(text: string, names: { string }): (number?, number?)
+	local low = string.lower(text)
+	for _, n in names do
+		local from = 1
+		while true do
+			local a, b = string.find(low, "@" .. n, from, true)
+			if not a then
+				break
+			end
+			local before = if a > 1 then string.sub(low, a - 1, a - 1) else ""
+			local after = string.sub(low, (b :: number) + 1, (b :: number) + 1)
+			if not string.match(before, "[%w%._%-]") and not string.match(after, "[%w_%-]") then
+				return a, b
+			end
+			from = (b :: number) + 1
+		end
+	end
+	return nil, nil
+end
+
+-- The request in a mention: the text without the mentions, trimmed.
+function M.request(info: { [string]: any }, names: { string }): string
+	local text = mention_text(info)
+	for _ = 1, 20 do
+		local a, b = find_mention(text, names)
+		if not a then
+			break
+		end
+		text = string.sub(text, 1, a - 1) .. string.sub(text, (b :: number) + 1)
+	end
+	return (string.gsub(string.gsub(text, "^%s+", ""), "%s+$", ""))
 end
 
 -- Why `t` doesn't fire for `info`, or nil when it does.
@@ -230,6 +290,14 @@ function M.mismatch(t: model.GithubTrigger, info: { [string]: any }, ctx: Ctx): 
 		local body = string.match(info.comment or "", "^%s*(.*)$") or ""
 		if string.sub(body, 1, #t.comment) ~= t.comment then
 			return `评论不以 {t.comment} 开头`
+		end
+	end
+	if t.on == "mention" then
+		local names = M.handles(t, ctx)
+		if #names == 0 then
+			return "不知道 App 的名字(中继未连接),也没有设置提及名"
+		elseif not find_mention(mention_text(info), names) then
+			return `没有提及 @{table.concat(names, " 或 @")}`
 		end
 	end
 	-- Naming someone as an author lets their activity through the bot/self filters.

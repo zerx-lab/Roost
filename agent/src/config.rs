@@ -407,6 +407,10 @@ pub struct RepoSub {
 struct SubsFile {
     #[serde(default)]
     repos: BTreeMap<String, RepoSub>,
+    /// Workflows outside callers may start (`POST /hooks/dispatch/<id>`): id → SHA-256 (hex) of
+    /// the bearer token that may start it. The token itself never reaches the relay.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dispatch: BTreeMap<String, String>,
 }
 
 /// A validated `subscriptions.toml`.
@@ -415,6 +419,7 @@ pub struct Subscriptions {
     pub revision: String,
     pub text: String,
     pub repos: BTreeMap<String, RepoSub>,
+    pub dispatch: BTreeMap<String, String>,
 }
 
 const SUBS_HEADER: &str = "# Roost relay subscriptions: repos this agent accepts webhooks for, and the\n\
@@ -427,6 +432,7 @@ impl Subscriptions {
             revision: revision_of(""),
             text: String::new(),
             repos: BTreeMap::new(),
+            dispatch: BTreeMap::new(),
         }
     }
 
@@ -460,18 +466,25 @@ impl Subscriptions {
         let raw: SubsFile =
             toml::from_str(text).map_err(|e| vec![toml_issue(text, "subscriptions.toml", &e)])?;
         let repos = validate_repos(raw.repos)?;
+        let dispatch = validate_dispatch(raw.dispatch)?;
         Ok(Subscriptions {
             revision: revision_of(text),
             text: text.to_string(),
             repos,
+            dispatch,
         })
     }
 
-    /// Canonical file text for `repos` (what a push writes).
-    pub fn from_repos(repos: BTreeMap<String, RepoSub>) -> Result<Subscriptions, Vec<Issue>> {
+    /// Canonical file text for `repos` and `dispatch` (what a push writes).
+    pub fn from_parts(
+        repos: BTreeMap<String, RepoSub>,
+        dispatch: BTreeMap<String, String>,
+    ) -> Result<Subscriptions, Vec<Issue>> {
         let repos = validate_repos(repos)?;
+        let dispatch = validate_dispatch(dispatch)?;
         let body = toml::to_string(&SubsFile {
             repos: repos.clone(),
+            dispatch: dispatch.clone(),
         })
         .map_err(|e| vec![Issue::new("subscriptions", e.to_string())])?;
         let text = format!("{SUBS_HEADER}{body}");
@@ -479,7 +492,51 @@ impl Subscriptions {
             revision: revision_of(&text),
             text,
             repos,
+            dispatch,
         })
+    }
+}
+
+/// At most this many workflows may be started from outside.
+pub const MAX_DISPATCH: usize = 100;
+
+/// A workflow id as Roost writes them (lowercase letters, digits, `-`, `_`).
+pub fn valid_workflow_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn validate_dispatch(
+    dispatch: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Vec<Issue>> {
+    let mut issues = Vec::new();
+    if dispatch.len() > MAX_DISPATCH {
+        issues.push(Issue::new(
+            "dispatch",
+            format!("at most {MAX_DISPATCH} workflows"),
+        ));
+    }
+    for (id, hash) in &dispatch {
+        if !valid_workflow_id(id) {
+            issues.push(Issue::new(format!("dispatch.{id:?}"), "not a workflow id"));
+        }
+        if hash.len() != 64
+            || !hash
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            issues.push(Issue::new(
+                format!("dispatch.{id:?}"),
+                "must be the token's SHA-256 as 64 lowercase hex digits",
+            ));
+        }
+    }
+    if issues.is_empty() {
+        Ok(dispatch)
+    } else {
+        Err(issues)
     }
 }
 
@@ -567,7 +624,7 @@ mod tests {
                 events: ["release".to_string()].into(),
             },
         );
-        let s = Subscriptions::from_repos(repos.clone()).unwrap();
+        let s = Subscriptions::from_parts(repos.clone(), BTreeMap::new()).unwrap();
         let back = Subscriptions::parse(&s.text).unwrap();
         assert_eq!(back.repos, repos);
         assert_eq!(back.revision, s.revision);

@@ -103,6 +103,12 @@ export type FilesPage = {
 export type Import = { path: field.Field, plan: core.ImportPlan?, error: string? }
 -- The group name dialog: a new group (moving workflow `wf` into it when set), or renaming `id`.
 export type GroupDialog = { id: string?, wf: string?, name: field.Field, error: string? }
+-- The home page's task box: what to do, in which repository ("" none), with which model.
+export type TaskBox = { text: field.Field, repo: string, model: string, env: string, focus: boolean, opens: { [string]: boolean } }
+export type DlgField = field.Field & { label: string, hint: string?, placeholder: string? }
+-- A dialog: a run's follow-up (`followup`: the text) or a PR from its changes (`pr`: title, body,
+-- base), or drafting a workflow from a description (`generate`, run = ""). `busy`: generating.
+export type Dialog = { kind: string, run: string, fields: { DlgField }, focus: number, error: string?, busy: boolean?, gen: number? }
 
 local function text_field(text: string, lines: boolean?): field.Field
 	return { text = text, cursor = utf8.len(text) or #text, lines = lines }
@@ -147,6 +153,9 @@ export type State = {
 	fp: FilesPage,
 	imp: Import?, -- the import overlay while open
 	grp: GroupDialog?, -- the group name dialog while open
+	task: TaskBox,
+	dlg: Dialog?, -- a run's follow-up or PR dialog while open
+	diff: string?, -- the run whose patch the diff overlay shows
 }
 
 -- ---------------------------------------------------------------------------------------------
@@ -174,16 +183,21 @@ local STATE_TONE: { [string]: string } = {
 	skipped = "muted",
 	pending = "muted",
 }
-local TRIGGER_LABEL: { [string]: string } = { github = "GitHub", cron = "定时", manual = "手动", rerun = "重跑" }
-local TRIGGER_ICON: { [string]: string } = { github = "branch", cron = "clock", manual = "user", rerun = "redo" }
+local TRIGGER_LABEL: { [string]: string } =
+	{ github = "GitHub", cron = "定时", manual = "手动", rerun = "重跑", task = "任务", followup = "追问", pr = "开 PR", api = "API" }
+local TRIGGER_ICON: { [string]: string } =
+	{ github = "branch", cron = "clock", manual = "user", rerun = "redo", task = "omp", followup = "send", pr = "push", api = "plug" }
 local STEP_ICON: { [string]: string } = {
 	auth = "plug",
+	ack = "send",
+	report = "send",
 	omp = "omp",
 	run = "terminal",
 	file = "file-code",
 	prepare = "folder-plus",
 	cleanup = "trash",
 	evolve = "pen",
+	resume = "redo",
 	tab = "open",
 	upgrade = "repeat",
 }
@@ -548,6 +562,9 @@ function M.new(c: core.Core, cx: BlockCx, args: { string }, saved: any, kind: Ki
 		fp = new_fp(),
 		imp = nil,
 		grp = nil,
+		task = { text = text_field("", true), repo = "", model = "auto", env = "", focus = false, opens = {} },
+		dlg = nil,
+		diff = nil,
 	}
 	if st.run_id and c.store.by_id[st.run_id] == nil then
 		st.run_id = nil
@@ -621,6 +638,8 @@ local function go(st: State, view: string): boolean
 	st.tab = view
 	st.last[page.id] = view
 	st.confirm = nil
+	st.task.focus = false
+	st.app_focus = false
 	return true
 end
 
@@ -712,7 +731,7 @@ end
 -- What a run was about beyond its workflow: the event's summary; manual and scheduled runs
 -- have none (their title only repeats the workflow and trigger).
 local function run_subject(r: store.Run): string?
-	return if r.event then r.title else nil
+	return if r.event or r.task then r.title else nil
 end
 
 -- A run's estimated agent spend; blank for runs without an agent tally.
@@ -949,6 +968,175 @@ local function evolve_card(st: State, t: number): Node
 	}, { key = "evolve", icon = "repeat" })
 end
 
+-- An inbox item's node key and action value: its workflow and id, hex-encoded (ids may hold dots).
+local function hex(s: string): string
+	return (string.gsub(s, ".", function(ch: string): string
+		return string.format("%02x", string.byte(ch))
+	end))
+end
+
+local function unhex(h: string): string?
+	if #h % 2 == 1 or not string.match(h, "^%x*$") then
+		return nil
+	end
+	return (string.gsub(h, "%x%x", function(x: string): string
+		return string.char(tonumber(x, 16) :: number)
+	end))
+end
+
+-- The workflow and id an inbox action names.
+local function inbox_ref(value: string): (string?, string?)
+	local raw = unhex(value)
+	if not raw then
+		return nil, nil
+	end
+	return string.match(raw, "^(.-)%z(.*)$")
+end
+
+local INBOX_LABEL: { [string]: string } = { failed = "失败", approve = "待批准", decide = "待决定", review = "待审阅", info = "通知" }
+local INBOX_TONE: { [string]: string } = { failed = "error", approve = "accent", decide = "warning", review = "pending", info = "muted" }
+local MAX_INBOX_ROWS = 30
+
+-- What workflows reported needs a person (lib/inbox.luau): one row each, with its actions.
+local function inbox_rows(st: State, t: number): { Node }
+	local c = st.core
+	local rows: { Node } = {}
+	local items = core.inbox_items(c)
+	local w = c.workflows
+	local blocked: any = core.run_block(c) or false
+	for i, e in items do
+		if i > MAX_INBOX_ROWS then
+			table.insert(rows, keyed(ui.overflow(#items - MAX_INBOX_ROWS), "more"))
+			break
+		end
+		local ref = hex(`{e.workflow}\0{e.id}`)
+		local wf = if w then w.by_id[e.workflow] else nil
+		local text: { Node } = {
+			keyed(ui.text({ ui.span(INBOX_LABEL[e.kind] or e.kind, INBOX_TONE[e.kind] or "muted"), ui.span(`  {e.title}`, "strong") }), "title"),
+		}
+		if e.detail then
+			table.insert(text, N("text", { key = "detail", spans = { ui.span(e.detail, "muted") }, lines = 2, title = e.detail }))
+		end
+		table.insert(text, keyed(muted(`{if wf then wf.name else e.workflow} · {util.ago(e.at, t)}`), "meta"))
+		local tools: { Node } = {}
+		if e.url then
+			table.insert(tools, btn("打开", `ib-open={ref}`, { icon = "open", key = "open", title = e.url }))
+		end
+		if e.run then
+			local target = if w then w.by_id[e.run.workflow] else nil
+			table.insert(tools, btn("运行", `ib-run={ref}`, {
+				icon = "play",
+				variant = "quiet",
+				key = "run",
+				title = `运行 {if target then target.name else e.run.workflow}{if e.run.pr then " · PR " .. e.run.pr else ""}`,
+				disabled = blocked or (if target then false else "工作流不存在"),
+			}))
+		end
+		table.insert(tools, btn("忽略", `ib-dismiss={ref}`, { variant = "quiet", key = "dismiss", title = "在本机隐藏,内容变化后再出现" }))
+		table.insert(rows, N("row", { key = `ib_{ref}`, role = "roost.inboxitem", justify = "between", align = "center", gap = "md" }, {
+			N("col", { key = "text", gap = "xs" }, text),
+			N("row", { key = "end", gap = "sm", align = "center" }, tools),
+		}))
+	end
+	return rows
+end
+
+local TASK_ID = "main.body.overview.task.input"
+local TASK_REPO_ID = "main.body.overview.task.bar.opts.repo"
+local TASK_MODEL_ID = "main.body.overview.task.bar.opts.model"
+local TASK_ENV_ID = "main.body.overview.task.bar.opts.env"
+
+-- The home page's task box: what to do, the repository (a worktree of its checkout, never the
+-- checkout itself) and the model; ⌘↵ or 开始 starts it.
+local function task_box(st: State): Node
+	local c = st.core
+	local tb = st.task
+	local blocked = core.run_block(c)
+	local repos: { any } = { { value = "", label = "不关联仓库", detail = "在空的临时目录里运行" } }
+	local w = c.workflows
+	if w then
+		for _, name in util.keys(w.repos) do
+			local r = w.repos[name]
+			table.insert(repos, {
+				value = name,
+				label = name,
+				detail = if r.path then "在检出的临时 worktree 中运行" else "没有本机检出:临时目录",
+			})
+		end
+	end
+	if tb.repo ~= "" and not (w and w.repos[tb.repo]) then
+		tb.repo = ""
+	end
+	local envs = c.config.environments
+	if tb.env ~= "" and envs[tb.env] == nil then
+		tb.env = ""
+	end
+	local opts: { Node } = {
+		N("select", {
+			key = "repo",
+			value = tb.repo,
+			options = repos,
+			title = "仓库",
+			open = tb.opens[TASK_REPO_ID] == true,
+		}),
+		N("select", {
+			key = "model",
+			value = tb.model,
+			options = editor.model_options(st, tb.model),
+			title = "模型",
+			open = tb.opens[TASK_MODEL_ID] == true,
+		}),
+	}
+	if next(envs) then
+		local env_opts: { any } = { { value = "", label = "不用环境" } }
+		for _, name in util.keys(envs) do
+			table.insert(env_opts, { value = name, label = `环境 {name}` })
+		end
+		table.insert(opts, N("select", { key = "env", value = tb.env, options = env_opts, title = "环境", open = tb.opens[TASK_ENV_ID] == true }))
+	end
+	local start: any = blocked or (if util.trim(tb.text.text) == "" then "先写下要做的事" else false)
+	return N("col", { key = "task", role = "roost.composer", gap = "sm" }, {
+		N("editor", {
+			key = "input",
+			text = tb.text.text,
+			cursor = field.utf16_cursor(tb.text),
+			placeholder = if blocked then blocked else "让 Roost 做点什么,例如:修复 #123 的崩溃并补上测试",
+			maxLines = 10,
+		}),
+		N("row", { key = "bar", justify = "between", align = "center", gap = "sm" }, {
+			N("row", { key = "opts", gap = "sm", align = "center" }, opts),
+			N("row", { key = "go", gap = "sm", align = "center" }, {
+				keyed(ui.text({ ui.span("⌘↵", "key"), ui.span(" 开始", "muted") }), "hint"),
+				btn("开始", "task-start", { key = "start", variant = "primary", icon = "play", size = "md", disabled = start }),
+			}),
+		}),
+	})
+end
+
+-- The latest tasks and follow-ups typed here, newest first.
+local function recent_tasks(st: State, t: number): { Node }
+	local out: { Node } = {}
+	local runs = source_runs(st)
+	for i = #runs, 1, -1 do
+		local r = runs[i]
+		if r.task and r.task.kind == "task" then
+			local spent = cost_cell(r)
+			table.insert(out, N("item", {
+				key = `run_{r.id}`,
+				label = r.title,
+				detail = if r.repo then r.repo else "临时目录",
+				value = `{STATE_LABEL[r.state] or r.state} · {util.ago(r.created_at, t)}{if spent ~= "" then " · " .. spent else ""}`,
+				icon = if r.parent then "send" else "omp",
+				tone = STATE_TONE[r.state],
+			}))
+			if #out >= 5 then
+				break
+			end
+		end
+	end
+	return out
+end
+
 local function overview(st: State): Node
 	local c = st.core
 	local t = now()
@@ -990,20 +1178,40 @@ local function overview(st: State): Node
 		},
 	})
 	local need = attention(st, t)
+	local reported = inbox_rows(st, t)
+	local pending: { Node } = { heading("h", "待处理", if #need + #reported > 0 then "系统状态与工作流上报的事项" else nil) }
+	if #need > 0 then
+		table.insert(pending, N("list", { key = "attention" }, need))
+	end
+	if #reported > 0 then
+		table.insert(pending, N("col", { key = "inbox", role = "roost.inbox", gap = "sm" }, reported))
+	end
+	if #need + #reported == 0 then
+		table.insert(pending, N("empty", {
+			key = "attention",
+			variant = "inline",
+			icon = "check",
+			title = "没有需要处理的事",
+			text = "配置、中继、订阅与各工作流最近一次运行都正常;工作流可以通过 $ROOST_INBOX 上报需要你处理的事项。",
+		}))
+	end
 	local children: { Node } = {
+		task_box(st),
 		keyed(tiles, "stats"),
-		N("col", { key = "attention_view", gap = "sm" }, {
-			heading("h", "待处理", if #need > 0 then "单击前往" else nil),
-			if #need > 0
-				then N("list", { key = "attention" }, need)
-				else N("empty", { key = "attention", variant = "inline", icon = "check", title = "没有需要处理的事", text = "配置、中继、订阅与各工作流最近一次运行都正常。" }),
-		}),
+		N("col", { key = "attention_view", gap = "sm" }, pending),
 	}
 	local busy = active_items(st, t)
 	if #busy > 0 then
 		table.insert(children, N("col", { key = "active_view", gap = "sm" }, {
 			heading("h", "进行中", "单击查看运行"),
 			N("list", { key = "active" }, busy),
+		}))
+	end
+	local recent = recent_tasks(st, t)
+	if #recent > 0 then
+		table.insert(children, N("col", { key = "tasks_view", gap = "sm" }, {
+			heading("h", "最近任务", "单击查看运行,运行详情里可以追问"),
+			N("list", { key = "tasks" }, recent),
 		}))
 	end
 	local cron_items: { Node } = {}
@@ -1337,12 +1545,119 @@ local function run_facts(r: store.Run, t: number, roles: (() -> { [string]: stri
 	return keyed(ui.kv(items :: any), "facts"), #items
 end
 
+-- Most changed files the detail lists at once (the table scrolls), and the answer's height.
+local DETAIL_FILES = 6
+local ANSWER_LINES = 8
+
+local function short_id(id: string): string
+	return string.sub(id, 1, 8)
+end
+
+-- Under a run's facts: what it continues and what continues it, its final answer (rendered), and
+-- what it changed with the ways to use that (diff, local branch, PR). Also the lines it takes, for
+-- the narrow layout's log height.
+local function outcome(st: State, r: store.Run): ({ Node }, number)
+	local c = st.core
+	local out: { Node } = {}
+	local lines = 0
+	local links: { Node } = {}
+	if r.parent then
+		local p = c.store.by_id[r.parent]
+		table.insert(links, btn(`接续自 {short_id(r.parent)}`, `open-run={r.parent}`, {
+			variant = "quiet",
+			icon = "redo",
+			key = "parent",
+			title = if p then p.title else "这次运行已被清理",
+			disabled = if p then false else "这次运行已被清理",
+		}))
+	end
+	for i, k in core.children(c, r.id) do
+		if i > 4 then
+			table.insert(links, keyed(muted(`… 另有 {#core.children(c, r.id) - 4} 次`), "more"))
+			break
+		end
+		local what = if k.task and k.task.kind == "pr" then "开 PR" else "追问"
+		table.insert(links, btn(`{what} · {STATE_LABEL[k.state] or k.state}`, `open-run={k.id}`, {
+			variant = "quiet",
+			icon = if what == "开 PR" then "push" else "send",
+			key = `k_{k.id}`,
+			title = k.title,
+		}))
+	end
+	if r.branch then
+		table.insert(links, keyed(ui.text({ ui.span("本地分支 ", "muted"), ui.span(r.branch, "mono") }), "branch"))
+	end
+	if r.pr then
+		local n = string.match(r.pr, "/pull/(%d+)")
+		table.insert(links, keyed(ui.text({ ui.link(if n then `PR #{n}` else r.pr, r.pr) }), "pr"))
+	end
+	if #links > 0 then
+		table.insert(out, N("row", { key = "links", gap = "sm", align = "center", wrap = true }, links))
+		lines += 1
+	end
+	local answer, cut = core.answer(c, r.id)
+	if answer then
+		table.insert(out, keyed(ui.rule(if cut then "结果(前 16 KiB,全文见日志)" else "结果"), "answer-rule"))
+		table.insert(out, N("scroll", { key = "answer", max = { h = `{ANSWER_LINES}lines` } }, { keyed(ui.md(answer), "md") }))
+		lines += ANSWER_LINES + 1
+	end
+	if r.changes then
+		local rows, sum, patch = core.changes(c, r.id)
+		local ch = sum or r.changes :: store.Changes
+		local blocked = core.changes_block(c, r)
+		local shown = if #rows < ch.files then `(列出前 {#rows} 个)` else ""
+		local head = `改动 +{ch.add} −{ch.del} · {ch.files} 个文件{shown}{if r.changes.too_big then "(补丁超过 8 MiB,未保存)" else ""}`
+		table.insert(out, keyed(ui.rule(head), "changes-rule"))
+		local trs = {}
+		for _, f in rows do
+			table.insert(trs, {
+				id = `f{#trs}`,
+				cells = list_of(
+					f.path,
+					if f.add then { ui.span(`+{f.add}`, "success") } else { ui.span("二进制", "muted") },
+					if f.del then { ui.span(`−{f.del}`, "error") } else ""
+				),
+			})
+		end
+		table.insert(out, N("scroll", { key = "files", max = { h = `{math.min(#trs, DETAIL_FILES) + 1}lines` } }, {
+			keyed(ui.table({
+				{ id = "path", head = "文件", grow = 1, truncate = "start", mono = true },
+				{ id = "add", head = "增", align = "end", mono = true },
+				{ id = "del", head = "删", align = "end", mono = true },
+			}, trs :: any, { empty = "没有文件" }), "table"),
+		}))
+		table.insert(out, N("row", { key = "change-tools", gap = "sm", align = "center", wrap = true }, {
+			btn("查看 diff", `diff={r.id}`, { icon = "file-code", key = "diff", disabled = if patch then false else "补丁没有保存" }),
+			btn(if r.branch then "已建分支" else "建本地分支", `branch={r.id}`, {
+				icon = "branch",
+				variant = "quiet",
+				key = "branch",
+				title = `在仓库检出里建分支 roost/{r.id}(不切换当前分支)`,
+				disabled = blocked or (if r.branch then `已建分支 {r.branch}` else false),
+			}),
+			btn(if r.pr then "已开 PR" else "开 PR", `pr-open={r.id}`, {
+				icon = "push",
+				variant = "quiet",
+				key = "pr",
+				disabled = blocked or (if r.pr then `已开 PR:{r.pr}` else false),
+			}),
+			btn("复制补丁路径", `copy-patch={r.id}`, { icon = "copy", variant = "quiet", key = "copy-patch", disabled = if patch then false else "补丁没有保存" }),
+		}))
+		lines += math.min(#trs, DETAIL_FILES) + 4
+	end
+	return out, lines
+end
+
 local function run_detail(st: State, r: store.Run, fill: boolean): Node
 	local t = now()
 	local active = r.state == "queued" or r.state == "running"
 	local primary = if active
 		then btn("取消", `cancel={r.id}`, { variant = "danger", icon = "stop", keys = { "c" }, key = "cancel" })
 		else btn("重跑", `rerun={r.id}`, { variant = "primary", icon = "redo", keys = { "r" }, key = "rerun" })
+	local head_end: { Node } = {}
+	if not active and core.followup_step(st.core, r) then
+		table.insert(head_end, btn("追问", `followup-open={r.id}`, { icon = "send", key = "followup", title = "接着这次运行的 omp 会话和改动继续" }))
+	end
 	local tools: { Node } = {}
 	for i = #r.steps, 1, -1 do
 		local s = r.steps[i]
@@ -1378,6 +1693,8 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 	local facts, fact_rows = run_facts(r, t, function(): { [string]: string }
 		return role_models(st)
 	end)
+	local more, more_lines = outcome(st, r)
+	fact_rows += more_lines
 	local lg = st.log
 	local log_body: Node
 	if lg.id == r.id and (lg.text ~= "" or lg.eof) then
@@ -1410,14 +1727,20 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 	local took = if r.state == "running" and r.started_at
 		then N("elapsed", { key = "took", age = math.max(0, t - r.started_at) * 1000, format = "short" })
 		else ui.text({ ui.span(duration(r.started_at, r.finished_at), "muted mono") })
-	return N("col", { key = "run", role = "roost.run", gap = "md" }, {
-		pane_head(title, { keyed(state_badge(r.state), "state"), keyed(took, "took"), primary }),
-		facts,
-		steps_table(r, t),
-		N("row", { key = "tools", gap = "sm", align = "center" }, tools),
-		keyed(ui.rule(if lg.cut then "日志(仅显示最近 512 KiB)" else "日志"), "rule"),
-		log_body,
-	})
+	local head: { Node } = { keyed(state_badge(r.state), "state"), keyed(took, "took") }
+	for _, b in head_end do
+		table.insert(head, b)
+	end
+	table.insert(head, primary)
+	local body: { Node } = { pane_head(title, head), facts }
+	for _, n in more do
+		table.insert(body, n)
+	end
+	table.insert(body, steps_table(r, t))
+	table.insert(body, N("row", { key = "tools", gap = "sm", align = "center" }, tools))
+	table.insert(body, keyed(ui.rule(if lg.cut then "日志(仅显示最近 512 KiB)" else "日志"), "rule"))
+	table.insert(body, log_body)
+	return N("col", { key = "run", role = "roost.run", gap = "md" }, body)
 end
 
 -- A run of the executor's, on an observer: what it uploaded (facts, steps, the log's last bytes);
@@ -1740,6 +2063,7 @@ local function workflows_toolbar(st: State, count: string?): Node
 		bar_start(st, ui.text({ ui.span(count or "", "muted") })),
 		N("row", { key = "end", gap = "sm", align = "center" }, {
 			btn("新建自动化", "editor-new", { icon = "plus", size = "md", key = "new", disabled = blocked }),
+			btn("用描述生成", "gen-open", { variant = "quiet", icon = "sparkle", size = "md", key = "gen", title = "用一句话描述,omp 起草工作流,审阅后保存", disabled = blocked }),
 			editor.template_menu(),
 			btn("新建分组", "grp-new", { variant = "quiet", icon = "folder-plus", size = "md", key = "group", title = "新建一个工作流分组", disabled = blocked }),
 			btn("导入", "imp-open", { variant = "quiet", icon = "plus", size = "md", key = "import", title = "从导出文件导入工作流", disabled = blocked }),
@@ -2296,7 +2620,7 @@ local function manual_subs_text(st: State): string?
 		return nil
 	end
 	local ok, text = pcall(function(): string
-		return model.subscriptions_toml(model.subscriptions(w))
+		return model.subscriptions_toml(model.subscriptions(w), model.dispatch(w))
 	end)
 	return if ok then text :: string else nil
 end
@@ -2820,6 +3144,35 @@ local function storage_card(st: State): Node
 	}, { key = "storage", icon = "folder-open" })
 end
 
+-- The roost.toml environments: names only for variables (values stay in the file).
+local function environments_card(st: State): Node
+	local envs = st.core.config.environments
+	local items: { any } = {}
+	for _, name in util.keys(envs) do
+		local e = envs[name]
+		local parts: { string } = {}
+		local vars = util.keys(e.vars)
+		table.insert(parts, if #vars > 0 then `变量 {table.concat(vars, " ")}` else "没有变量")
+		if #e.path > 0 then
+			table.insert(parts, `PATH 前加 {table.concat(e.path, ":")}`)
+		end
+		if e.setup then
+			table.insert(parts, `setup:{util.clip(util.first_line(e.setup), 60)}`)
+		end
+		table.insert(items, pair(name, { ui.span(table.concat(parts, " · "), "mono") }))
+	end
+	local body: { Node } = {
+		keyed(muted("在 roost.toml 的 [environments.<名>] 定义(vars、path、setup),只在本机,不同步、不导出;工作流的「环境」或首页任务选用它。变量 shell 与 omp 步骤都拿得到。"), "note"),
+	}
+	if #items > 0 then
+		table.insert(body, keyed(ui.kv(items :: any), "kv"))
+	else
+		table.insert(body, keyed(muted("还没有环境。"), "none"))
+	end
+	table.insert(body, N("row", { key = "actions", gap = "sm" }, { btn("编辑 roost.toml", "open=config", { icon = "pen", key = "edit" }) }))
+	return ui.card("环境", body, { key = "environments", icon = "terminal" })
+end
+
 local function config_tab(st: State): Node
 	local c = st.core
 	local p = c.paths
@@ -2850,6 +3203,7 @@ local function config_tab(st: State): Node
 		file_card("config", "roost.toml", p.config, c.config_issues, "有效"),
 		file_card("workflows", "workflows.toml", p.workflows, c.workflow_issues, wf_ok),
 		ui.card("运行设置", { keyed(runner_kv, "kv") }, { key = "runner", icon = "sliders" }),
+		environments_card(st),
 		ui.card("外观", {
 			keyed(muted("theme.css 放在数据目录中,保存后实时注入,覆盖 roost.css 的样式(钩子:data-role = roost.*)。"), "note"),
 			keyed(ui.text({ ui.path(p.theme) }), "path"),
@@ -3270,6 +3624,203 @@ local function group_view(st: State): Node?
 end
 
 -- ---------------------------------------------------------------------------------------------
+-- A run's dialogs (follow-up, PR from its changes) and the diff overlay
+
+local function dlg_input_id(i: number): string
+	return `layer.dlg.f{i}.input`
+end
+
+local function dlg_focus(st: State)
+	local d = st.dlg
+	if d and d.fields[d.focus] then
+		st.cx:frame({ { "focus", dlg_input_id(d.focus) } })
+	end
+end
+
+local function dlg_field(label: string, text: string, lines: boolean, hint: string?, placeholder: string?): DlgField
+	return { text = text, cursor = utf8.len(text) or #text, lines = lines, label = label, hint = hint, placeholder = placeholder }
+end
+
+-- Overlays take turns: the editor, the run form, import, the group dialog and these never stack.
+local function layer_busy(st: State): boolean
+	return st.editor ~= nil or st.form ~= nil or st.imp ~= nil or st.grp ~= nil or st.dlg ~= nil or st.diff ~= nil
+end
+
+-- Generations started, so a dialog closed (or reopened) meanwhile ignores a late answer.
+local gen_seq = 0
+
+local function dlg_open(st: State, kind: string, id: string)
+	local r = st.core.store.by_id[id]
+	if layer_busy(st) or (r == nil and kind ~= "generate") then
+		return
+	end
+	if kind == "generate" then
+		st.dlg = {
+			kind = "generate" :: string,
+			run = "",
+			fields = { dlg_field("描述", "", true, "omp 起草工作流(定时或 GitHub 触发 + 步骤),在编辑器里打开给你审阅后再保存。⌘↵ 生成", "例如:每个工作日 9 点总结 acme/web 昨天合并的 PR,发到 issue #1") },
+			focus = 1,
+			error = nil,
+		}
+		dlg_focus(st)
+		return
+	end
+	local run = r :: store.Run
+	local fields: { DlgField }
+	if kind == "followup" then
+		fields = { dlg_field("追问", "", true, "接着这次运行的 omp 会话继续:worktree 运行带上它的改动在新 worktree 里做,repo 模式的运行直接在本机检出里继续改。⌘↵ 发送", "还要做什么?") }
+	else
+		local answer = core.answer(st.core, id)
+		local body = `由 Roost 运行 {id}({run.workflow_name})生成。`
+		if answer then
+			body ..= "\n\n" .. util.clip(answer, 6000)
+		end
+		local w = st.core.workflows
+		local repo = if w and run.repo then w.repos[run.repo] else nil
+		fields = {
+			dlg_field("标题", util.clip(run.title, 120), false, nil, "PR 标题"),
+			dlg_field("说明", body, true, "Markdown;默认是这次运行的最终回复"),
+			dlg_field("目标分支", if repo and repo.branch then repo.branch else "", false, `推送 roost/{id};留空则合入仓库默认分支`, "main"),
+		}
+	end
+	st.dlg = { kind = kind, run = id, fields = fields, focus = 1, error = nil }
+	dlg_focus(st)
+end
+
+local function dlg_close(st: State)
+	st.dlg = nil
+	st.cx:frame({ pair("focus", tern.json.null) })
+end
+
+local function dlg_submit(st: State)
+	local d = st.dlg
+	if not d or d.busy then
+		return
+	end
+	local c = st.core
+	if d.kind == "generate" then
+		gen_seq += 1
+		local mine = gen_seq
+		d.busy, d.gen, d.error = true, mine, nil
+		core.generate_workflow(c, d.fields[1].text, function(raw, problems)
+			local cur = st.dlg
+			if st.closed or not cur or cur.gen ~= mine then
+				return
+			end
+			cur.busy = false
+			if raw then
+				dlg_close(st)
+				editor.open(st, "draft", nil, raw)
+				if problems then
+					st.cx:toast("info", "草稿还有问题,已在编辑器里标出", util.clip(problems, 200))
+				end
+			else
+				cur.error = problems or "生成失败"
+			end
+			st.cx:render()
+		end)
+		return
+	end
+	local id: string?, err: string?
+	if d.kind == "followup" then
+		id, err = core.followup(c, d.run, d.fields[1].text)
+	else
+		id, err = core.open_pr(c, d.run, { title = d.fields[1].text, body = d.fields[2].text, base = d.fields[3].text })
+	end
+	if err or not id then
+		d.error = err or "无法启动"
+		return
+	end
+	dlg_close(st)
+	go(st, "runs")
+	select_run(st, id)
+end
+
+local function dlg_view(st: State): Node?
+	local d = st.dlg
+	if not d then
+		return nil
+	end
+	local r = st.core.store.by_id[d.run]
+	local children: { Node } = {}
+	if r then
+		table.insert(children, keyed(ui.text({ ui.span(r.workflow_name, "strong"), ui.span(`   {r.title}`, "muted") }), "about"))
+	end
+	for i, f in d.fields do
+		local input = if f.lines
+			then N("editor", { key = "input", text = f.text, cursor = field.utf16_cursor(f), placeholder = f.placeholder, maxLines = 12 })
+			else N("input", { key = "input", text = f.text, cursor = field.utf16_cursor(f), placeholder = f.placeholder, variant = "field" })
+		table.insert(children, N("field", { key = `f{i}`, label = f.label, hint = f.hint }, { input }))
+	end
+	if d.error then
+		table.insert(children, keyed(ui.text({ ui.span(d.error, "error") }), "error"))
+	end
+	local follow, gen = d.kind == "followup", d.kind == "generate"
+	if d.busy then
+		table.insert(children, keyed(ui.progress(nil, "omp 正在起草…(最多 3 分钟)"), "busy"))
+	end
+	table.insert(children, N("row", { key = "foot", justify = "end", gap = "sm" }, {
+		btn("取消", "dlg-cancel", { variant = "quiet", keys = { "esc" }, key = "cancel", size = "md" }),
+		btn(if gen then "生成" elseif follow then "发送" else "开 PR", "dlg-ok", {
+			variant = "primary",
+			keys = { "cmd", "enter" },
+			key = "ok",
+			size = "md",
+			icon = if gen then "sparkle" elseif follow then "send" else "push",
+			busy = d.busy == true,
+		}),
+	}))
+	return N("col", {}, {
+		N("overlay", {
+			key = "dlg",
+			role = "roost.form",
+			head = if gen then "用描述生成自动化" elseif follow then "追问" else "从改动开 PR",
+			icon = if gen then "sparkle" elseif follow then "send" else "push",
+			modal = true,
+			size = "md",
+			foot = "layer.dlg.foot",
+		}, children),
+	})
+end
+
+local DIFF_MAX = 512 * 1024
+
+local function diff_view(st: State): Node?
+	local id = st.diff
+	if not id then
+		return nil
+	end
+	local text, more = core.patch_text(st.core, id, DIFF_MAX)
+	local children: { Node } = {}
+	if text then
+		if more then
+			table.insert(children, keyed(muted("补丁较大,这里只显示前 512 KiB;「用编辑器打开」查看全部。"), "more"))
+		end
+		table.insert(children, keyed(ui.diff(text, nil), "diff"))
+	else
+		table.insert(children, keyed(muted("补丁文件已不存在。"), "none"))
+	end
+	table.insert(children, N("row", { key = "foot", justify = "end", gap = "sm" }, {
+		btn("用编辑器打开", `open-patch={id}`, { variant = "quiet", icon = "file-code", key = "open", size = "md", disabled = if text then false else "补丁不存在" }),
+		btn("关闭", "diff-close", { variant = "primary", keys = { "esc" }, key = "close", size = "md" }),
+	}))
+	local r = st.core.store.by_id[id]
+	local ch = r and r.changes
+	return N("col", {}, {
+		N("overlay", {
+			key = "diff",
+			role = "roost.diff",
+			head = "改动",
+			meta = if ch then `+{ch.add} −{ch.del} · {ch.files} 个文件` else nil,
+			icon = "file-code",
+			modal = true,
+			size = "lg",
+			foot = "layer.diff.foot",
+		}, children),
+	})
+end
+
+-- ---------------------------------------------------------------------------------------------
 -- View
 
 local VIEWS: { [string]: (State) -> Node } = {
@@ -3304,7 +3855,7 @@ function M.view(st: State): BlockView
 			end
 		end
 		counts.activity = active
-		counts.home = #attention(st, now())
+		counts.home = #attention(st, now()) + #core.inbox_items(c)
 	end
 	local nav: { any } = {}
 	for _, p in PAGES[st.kind] do
@@ -3344,9 +3895,16 @@ function M.view(st: State): BlockView
 			hint("[ ]", "移到上/下一个分组")
 		end
 		hint("Esc", "取消选中")
+	elseif st.tab == "overview" and st.kind == "console" then
+		hint("⌘↵", "开始任务")
+		hint("Esc", "离开输入框")
 	end
 	local dock = N("col", {}, { ui.text(legend) })
-	return { main = main, dock = dock, layer = editor.view(st) or form_view(st) or import_view(st) or group_view(st) }
+	return {
+		main = main,
+		dock = dock,
+		layer = editor.view(st) or form_view(st) or import_view(st) or group_view(st) or dlg_view(st) or diff_view(st),
+	}
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -3434,6 +3992,40 @@ local function confirmed(st: State, what: string)
 	end
 end
 
+-- Starts what the home page's task box says; the box empties and the run's detail opens.
+local function task_start(st: State)
+	local tb = st.task
+	local id, err = core.start_task(st.core, {
+		prompt = tb.text.text,
+		repo = if tb.repo ~= "" then tb.repo else nil,
+		model = if tb.model ~= "auto" then tb.model else nil,
+		environment = if tb.env ~= "" then tb.env else nil,
+	})
+	if not id then
+		toast_err(st, err or "无法开始任务")
+		return
+	end
+	tb.text = text_field("", true)
+	tb.focus = false
+	st.cx:frame({ pair("focus", tern.json.null) })
+	go(st, "runs")
+	select_run(st, id)
+end
+
+-- Makes the local branch of run `id`'s changes; the result is a toast.
+local function make_branch(st: State, id: string)
+	core.make_branch(st.core, id, function(branch, err)
+		if branch then
+			st.cx:toast("success", `已建分支 {branch}`, "在仓库检出里,当前分支没有切换")
+		else
+			toast_err(st, err or "建分支失败")
+		end
+		if not st.closed then
+			st.cx:render()
+		end
+	end)
+end
+
 local function do_action(st: State, act: string, value: string?, item: string?)
 	local c = st.core
 	local target = value or item
@@ -3510,6 +4102,53 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		if r and r.cwd then
 			st.cx:open(r.cwd)
 		end
+	elseif act == "ib-open" or act == "ib-run" or act == "ib-dismiss" then
+		local wf, id = inbox_ref(value or "")
+		if wf and id then
+			if act == "ib-dismiss" then
+				toast_err(st, core.inbox_dismiss(c, wf, id))
+			elseif act == "ib-run" then
+				core.inbox_run(c, wf, id, function(err)
+					if err then
+						toast_err(st, err)
+					else
+						st.cx:toast("success", "已开始运行")
+					end
+				end)
+			else
+				for _, e in core.inbox_items(c) do
+					if e.workflow == wf and e.id == id and e.url then
+						st.cx:open(e.url)
+					end
+				end
+			end
+		end
+	elseif act == "task-start" then
+		task_start(st)
+	elseif act == "gen-open" then
+		dlg_open(st, "generate", "")
+	elseif act == "followup-open" and value then
+		dlg_open(st, "followup", value)
+	elseif act == "pr-open" and value then
+		dlg_open(st, "pr", value)
+	elseif act == "dlg-ok" then
+		dlg_submit(st)
+	elseif act == "dlg-cancel" then
+		dlg_close(st)
+	elseif act == "branch" and value then
+		make_branch(st, value)
+	elseif act == "diff" and value then
+		if not layer_busy(st) then
+			st.diff = value
+		end
+	elseif act == "diff-close" then
+		st.diff = nil
+	elseif act == "open-patch" and value then
+		st.diff = nil
+		st.cx:open(`{run_dir(st, value)}/changes.patch`)
+	elseif act == "copy-patch" and value then
+		st.cx:copy(`{run_dir(st, value)}/changes.patch`)
+		st.cx:toast("info", "已复制补丁路径")
 	elseif act == "open-run" and value then
 		go(st, "runs")
 		select_run(st, value)
@@ -3690,7 +4329,7 @@ function M.event(st: State, ev: UiEvent)
 			end
 		elseif name == "sub" then
 			go(st, item)
-		elseif name == "attention" or name == "active" then
+		elseif name == "attention" or name == "active" or name == "tasks" then
 			local view = string.match(item, "^set_(%l+)$")
 			local run = string.match(item, "^run_(%x+)$")
 			if view then
@@ -3722,13 +4361,36 @@ function M.event(st: State, ev: UiEvent)
 				end
 			end
 		end
+	elseif ev.ev == "change" or ev.ev == "toggle" then
+		-- The task box's selects (the editor's own are handled by editor.event above).
+		local id = ev.id or ""
+		if id == TASK_REPO_ID or id == TASK_MODEL_ID or id == TASK_ENV_ID then
+			if ev.ev == "toggle" then
+				st.task.opens[id] = ev.open == true
+			elseif type(ev.value) == "string" and string.sub(ev.value, 1, 1) ~= "\0" then
+				st.task.opens[id] = nil
+				if id == TASK_REPO_ID then
+					st.task.repo = ev.value
+				elseif id == TASK_ENV_ID then
+					st.task.env = ev.value
+				else
+					st.task.model = ev.value
+				end
+			end
+		end
 	elseif ev.ev == "action" then
 		local act = ev.act
 		if type(act) == "string" then
 			do_action(st, act, ev.value, if type(ev.item) == "string" then ev.item else nil)
 		end
 	elseif ev.ev == "focus" then
-		if st.imp then
+		if st.dlg then
+			local i = tonumber(string.match(ev.id or "", "^layer%.dlg%.f(%d+)%.input$") or "")
+			if i and st.dlg.fields[i] then
+				st.dlg.focus = i
+			end
+			dlg_focus(st)
+		elseif st.imp then
 			st.cx:frame({ { "focus", IMP_PATH_ID } })
 		elseif st.grp then
 			st.cx:frame({ { "focus", GRP_NAME_ID } })
@@ -3738,11 +4400,15 @@ function M.event(st: State, ev: UiEvent)
 				st.form.focus = i
 				focus_form(st)
 			end
+		elseif ev.id == TASK_ID then
+			st.task.focus = true
+			st.cx:frame({ pair("focus", TASK_ID) })
 		elseif string.match(ev.id or "", "github%.app%.org%.input$") then
 			st.app_focus = true
 			st.cx:frame({ pair("focus", ev.id) })
 		else
 			st.app_focus = false
+			st.task.focus = false
 			for fname, id in FP_IDS do
 				if st.tab == "files" and ev.id == id then
 					fp_focus(st, fname)
@@ -3753,8 +4419,14 @@ function M.event(st: State, ev: UiEvent)
 		-- A native edit (selection replaced, caret placed by a click) on the field M.key routes to.
 		st.confirm = nil
 		local id = ev.id or ""
-		local form, gd, imp = st.form, st.grp, st.imp
-		if form then
+		local form, gd, imp, dlg = st.form, st.grp, st.imp, st.dlg
+		if dlg then
+			local i = tonumber(string.match(id, "^layer%.dlg%.f(%d+)%.input$") or "")
+			local fl = if i then dlg.fields[i] else nil
+			if fl and field.edit(fl, ev) then
+				dlg.error = nil
+			end
+		elseif form then
 			local i = tonumber(string.match(id, "^layer%.form%.field(%d+)%.input$") or "")
 			local fl = if i then form.fields[i] else nil
 			if fl and field.edit(fl, ev) then
@@ -3768,6 +4440,8 @@ function M.event(st: State, ev: UiEvent)
 			if id == IMP_PATH_ID and field.edit(imp.path, ev) then
 				imp.plan, imp.error = nil, nil
 			end
+		elseif id == TASK_ID and st.tab == "overview" then
+			field.edit(st.task.text, ev)
 		elseif st.tab == "files" and st.fp.focus and id == FP_IDS[st.fp.focus] then
 			field.edit(st.fp.fields[st.fp.focus], ev)
 		elseif st.app_org and string.match(id, "github%.app%.org%.input$") then
@@ -3805,6 +4479,44 @@ function M.key(st: State, key: Key): boolean?
 	st.confirm = nil
 	if st.editor and editor.key(st, key) then
 		return true
+	end
+	local d = st.dlg
+	if d then
+		local fl = d.fields[d.focus]
+		if key.name == "escape" then
+			dlg_close(st)
+			return true
+		elseif key.name == "enter" and (key.meta or key.ctrl or not (fl and fl.lines)) then
+			dlg_submit(st)
+			return true
+		elseif key.name == "tab" then
+			d.focus = (d.focus - 1 + (if key.shift then -1 else 1)) % #d.fields + 1
+			dlg_focus(st)
+			return true
+		end
+		if fl and field.key(fl, key) then
+			d.error = nil
+			return true
+		end
+		return false
+	end
+	if st.diff then
+		if key.name == "escape" then
+			st.diff = nil
+			return true
+		end
+		return false
+	end
+	if st.tab == "overview" and st.task.focus then
+		if key.name == "escape" then
+			st.task.focus = false
+			st.cx:frame({ pair("focus", tern.json.null) })
+			return true
+		elseif key.name == "enter" and (key.meta or key.ctrl) then
+			task_start(st)
+			return true
+		end
+		return field.key(st.task.text, key)
 	end
 	local f = st.form
 	if f then
