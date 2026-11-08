@@ -478,12 +478,12 @@ do -- the org field takes keys only while it is drawn
 	local w = world({})
 	w.c.relay.state.configured = true
 	w.c.relay.state.agent = { github = { app = { slug = "r", owner = "zero", owner_type = "User" } } }
-	w.st.tab = "relay"
+	w.st = w.ui.new(w.c, w.cx, { "github" }, nil, "settings")
 	w.st.app_org = { text = "", cursor = 0 }
 	w.st.app_focus = true
 	press(w, "2", "2")
 	eq(w.st.app_org.text, "", "App already exists: no hidden field swallows keys")
-	eq(w.st.tab, "runs", "the digit switched tabs instead")
+	eq(w.st.tab, "relay", "the digit switched pages instead")
 end
 
 do -- delete asks, then removes the workflow

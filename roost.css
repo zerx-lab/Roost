@@ -2,10 +2,11 @@
  * Roost console styles. Tern's own kinds draw almost everything; this sheet only spaces the
  * regions. Theming contract (override any of these from plugin-data/roost/theme.css):
  *
- *   [data-surface='plugin.roost.console']   the block's regions (main, dock, layer)
+ *   [data-surface='plugin.roost.console']   the workbench block's regions (main, dock, layer)
+ *   [data-surface='plugin.roost.settings']  the settings block's (same header, tabs and fill)
  *   [data-role='roost.header']               title row with live badges and tools
  *   [data-role='roost.tabs']                 page tabs
- *   [data-role='roost.overview']             overview page
+ *   [data-role='roost.home']                 home page (what needs attention, what runs, what is due)
  *   [data-role='roost.runs']                 runs page (split: list | detail)
  *   [data-role='roost.fill']                 every page's body: fills the block below the tabs; the page scrolls inside it
  *   [data-role='roost.runlist']              runs list pane (filter bar, then the scrolling table)
@@ -17,9 +18,11 @@
  *   [data-role='roost.wfcards']              a wrapping row of workflow cards (stretched to the tallest in a row)
  *   [data-role='roost.wftail']               a workflow card's last run and history strip, kept at the card's bottom
  *   [data-role='roost.events']               relayed events page
- *   [data-role='roost.relay']                relay page
+ *   [data-role='roost.relay']                settings: relay and devices page
  *   [data-role='roost.deliveries']           relay page: webhook delivery counts
- *   [data-role='roost.config']               config page
+ *   [data-role='roost.github']               settings: GitHub App page
+ *   [data-role='roost.config']               settings: general page (config files, runner, theme)
+ *   [data-role='roost.storage']              settings: storage and cleanup page
  *   [data-role='roost.form']                 manual-run form overlay
  *   [data-role='roost.editor']               automation editor overlay
  *   [data-role='roost.trigger']              one trigger card inside the editor
@@ -37,14 +40,17 @@
 /* The block's outer margin: Tern's region has none at the sides (only 6px top and bottom), so a
  * page's right-hand toolbar and a card's edge sat against the pane's edge and its last button
  * looked cut off. Header, tabs, every page and the key legend share the same inset. */
-.sf-main[data-surface='plugin.roost.console'] {
+.sf-main[data-surface='plugin.roost.console'],
+.sf-main[data-surface='plugin.roost.settings'] {
 	padding: 10px 14px 6px;
 }
-.sf-dock[data-surface='plugin.roost.console'] {
+.sf-dock[data-surface='plugin.roost.console'],
+.sf-dock[data-surface='plugin.roost.settings'] {
 	padding: 0 14px;
 }
 
-[data-surface='plugin.roost.console'] [data-role='roost.header'] {
+[data-surface='plugin.roost.console'] [data-role='roost.header'],
+[data-surface='plugin.roost.settings'] [data-role='roost.header'] {
 	padding: 2px 2px 0;
 }
 
@@ -62,7 +68,9 @@
  * table and the run's log) takes what is left and scrolls inside it. A height counted in lines
  * can't match the pixels above, so this is done here. */
 .sf-main[data-surface='plugin.roost.console'] > [data-role='roost.fill'],
+.sf-main[data-surface='plugin.roost.settings'] > [data-role='roost.fill'],
 [data-surface='plugin.roost.console'] [data-role='roost.fill'] > .sf-scroll,
+[data-surface='plugin.roost.settings'] [data-role='roost.fill'] > .sf-scroll,
 [data-surface='plugin.roost.console'] [data-role='roost.fill'] > .sf-split[data-role='roost.runs'],
 [data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.runlist'],
 [data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.run'] {
@@ -72,7 +80,8 @@
 /* Tern's layout keeps the page body as tall as its content despite min-height: 0 (a headless
  * render measured it at the log's full height, the region scrolling past it); a body that clips
  * takes the room the region has, and the levels below follow. */
-.sf-main[data-surface='plugin.roost.console'] > [data-role='roost.fill'] {
+.sf-main[data-surface='plugin.roost.console'] > [data-role='roost.fill'],
+.sf-main[data-surface='plugin.roost.settings'] > [data-role='roost.fill'] {
 	overflow: hidden;
 }
 [data-surface='plugin.roost.console'] .sf-split[data-role='roost.runs'] [data-role='roost.runlist'] > *,

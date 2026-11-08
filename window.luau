@@ -1,34 +1,51 @@
 --!strict
--- Window half: the palette command that opens the console, a status-line segment fed by the
--- host's `status` kv record, the user's theme.css applied live, and the agent launcher that opens
--- omp steps as agent blocks (lib/launcher.luau) and answers `roost://` links.
+-- Window half: the palette commands that open the console and the settings, a status-line
+-- segment fed by the host's `status` kv record, the user's theme.css applied live, and the agent
+-- launcher that opens omp steps as agent blocks (lib/launcher.luau) and answers `roost://` links.
 
 local launcher = require("./lib/launcher")
 
 local KIND = "roost.console"
+local SETTINGS = "roost.settings"
 local THEME = tern.plugin.data .. "/theme.css"
 local POLL_MS = 2000
 local AGENT_MS = 1000
 local MAX_THEME = 256 * 1024
 
-local function open(cx: WindowCx)
+-- Focuses the block of `kind` if one is open here, else opens it in a new tab with `args`.
+local function open(cx: WindowCx, kind: string, args: { string }?)
 	local focused = cx.session:focused()
 	local here = if focused then cx.session:pane(focused) else nil
-	if here and here.block == KIND then
+	if here and here.block == kind then
 		return
 	end
 	for _, p in cx.session:panes() do
-		if p.block == KIND then
+		if p.block == kind then
 			cx.layout:focus(p.pane)
 			return
 		end
 	end
-	if cx:new_block(KIND, {}, "tab") == nil then
+	if cx:new_block(kind, args or {}, "tab") == nil then
 		cx:toast("error", "Roost 未就绪", "当前主机没有加载 roost 插件")
 	end
 end
 
-tern.command({ id = "open", title = "Roost:打开工作台", icon = "flow", run = open })
+tern.command({
+	id = "open",
+	title = "Roost:打开工作台",
+	icon = "flow",
+	run = function(cx: WindowCx)
+		open(cx, KIND)
+	end,
+})
+tern.command({
+	id = "settings",
+	title = "Roost:设置",
+	icon = "sliders",
+	run = function(cx: WindowCx)
+		open(cx, SETTINGS)
+	end,
+})
 
 -- Agent steps: claim and watch on a timer, end turns as soon as Tern reports them.
 local L = launcher.new(tern.plugin.data)
@@ -63,7 +80,18 @@ tern.on("pane_closed", function(ev: PaneEvent, _cx: WindowCx)
 	end
 end)
 
+-- The blocks' links to each other: `roost://console`, `roost://settings[/<page view>]` (an open
+-- settings block was already turned to that view by the host). Everything else is the launcher's.
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
+	if link.url == "roost://console" then
+		open(cx, KIND)
+		return { handled = true }
+	end
+	local view = string.match(link.url, "^roost://settings/(%l+)$")
+	if view or link.url == "roost://settings" then
+		open(cx, SETTINGS, if view then { view } else nil)
+		return { handled = true }
+	end
 	if launcher.route(L, cx, link) then
 		return { handled = true }
 	end

@@ -12,3 +12,8 @@ styles = ["roost.css"]
 id = "console"
 title = "Roost"
 icon = "flow"
+
+[[blocks]]
+id = "settings"
+title = "Roost 设置"
+icon = "sliders"

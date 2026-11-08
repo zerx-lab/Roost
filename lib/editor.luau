@@ -2138,7 +2138,7 @@ local function advanced_section(st: any, ed: Editor): any
 	end)
 	local libs_kids: { any } = {
 		txt("文件库(libs)", "lab", "muted"),
-		txt("在「文件」页管理共享库;此处只引用名称。", "hint", "muted"),
+		txt("在「自动化 › 文件库」管理共享库;此处只引用名称。", "hint", "muted"),
 		N("row", { key = "chips", gap = "xs", wrap = true, role = "roost.chips" }, lib_chips),
 		N("row", { key = "addrow", gap = "sm", align = "center" }, {
 			input_node(ed, LIBS_ADD_ID, { key = "add", placeholder = "库名,回车添加" }),

@@ -184,7 +184,7 @@ local DEFAULT_CONFIG = [[
 # login = "your-name"      # 你的 GitHub 用户名(@me 与「忽略我自己的活动」),默认取个人 App 的所有者
 
 [retention]
-# 自动清理:启动时、每小时、以及改动这里之后执行;「配置」页的「存储与清理」可手动清理。
+# 自动清理:启动时、每小时、以及改动这里之后执行;Roost 设置的「存储与清理」页可手动清理。
 # 运行包括 runs.json 记录、运行目录(日志、事件负载、omp 会话)与遗留的 worktree;只清理已结束的运行。
 # runs = 200               # 最多保留的已结束运行
 # run_age = "30d"          # 结束超过这么久的运行会被删除;"0" 表示不按时间清理
@@ -193,7 +193,7 @@ local DEFAULT_CONFIG = [[
 ]]
 
 local DEFAULT_WORKFLOWS = [==[
-# Roost 自动化。推荐在 Roost 面板的「工作流」页用表单新建和编辑;手改保存后同样自动生效,
+# Roost 自动化。推荐在 Roost 工作台的「自动化」页用表单新建和编辑;手改保存后同样自动生效,
 # GitHub 事件订阅会自动同步到中继(GitHub App)。
 #
 # [repos."owner/name"]          # 可选:GitHub 仓库 → 本机检出;没有声明的仓库在临时目录中运行
@@ -1098,7 +1098,7 @@ function M.run_block(c: Core): string?
 	if relay.role(c.relay) == "observer" then
 		local broken = relay.fleet_error(c.relay)
 		if broken then
-			return `中继读不出设备记录({broken}):在「中继」页重新指定执行者之前,任何设备都不运行`
+			return `中继读不出设备记录({broken}):在设置的「中继与设备」页重新指定执行者之前,任何设备都不运行`
 		end
 		return `本机是观察者:运行只在执行者「{fleet.label(relay.executor(c.relay))}」上进行`
 	end
@@ -1111,7 +1111,7 @@ function M.config_block(c: Core): string?
 	if relay.role(c.relay) == "observer" then
 		local broken = relay.fleet_error(c.relay)
 		if broken then
-			return `中继读不出设备记录({broken}):在「中继」页重新指定执行者之前不能修改工作流配置`
+			return `中继读不出设备记录({broken}):在设置的「中继与设备」页重新指定执行者之前不能修改工作流配置`
 		end
 		return `本机是观察者:工作流配置以执行者「{fleet.label(relay.executor(c.relay))}」为准,请在执行者上修改`
 	end
@@ -1660,7 +1660,7 @@ function M.save_workflow(
 		if there == nil then
 			return file_issue(`无法读取 "{id}" 的文件目录:{terr}`)
 		elseif #there.paths > 0 then
-			return file_issue(`工作流 "{id}" 的文件目录里已有文件,先在「文件」页清理再改 id`)
+			return file_issue(`工作流 "{id}" 的文件目录里已有文件,先在「自动化 › 文件库」清理再改 id`)
 		end
 		if want == nil then
 			local cur, lerr = own_files(c, old_id :: string, nil)
@@ -2195,7 +2195,7 @@ function M.export_workflows(c: Core, ids: { string }): (string?, string?)
 	local blanked = counts.blanked
 	local stamp = os.date("%Y-%m-%d %H:%M", math.floor(now())) :: string
 	local note = if blanked > 0 then `\n工作流 env 里的 {blanked} 个变量只保留了名字,值已清空(可能含令牌),导入后请自行填写。` else ""
-	local out = bundle.encode(b, `Roost 工作流导出({stamp},Roost {M.VERSION})。\n在 Roost「工作流」页用「导入」载入;导入的工作流默认停用。{note}`)
+	local out = bundle.encode(b, `Roost 工作流导出({stamp},Roost {M.VERSION})。\n在 Roost「自动化」页用「导入」载入;导入的工作流默认停用。{note}`)
 	if #out > bundle.MAX_BYTES then
 		return nil, `导出内容超过 {bundle.MAX_BYTES // (1024 * 1024)} MiB(文件太多或太大),请分开导出`
 	end

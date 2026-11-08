@@ -131,15 +131,53 @@ local function find(n: any, pred: (any) -> boolean): any
 	return hit
 end
 
-do -- the host block renders every page; keys switch pages
+-- The world's block becomes a settings block (on `view`, else its first page).
+local function as_settings(w: World, view: string?)
+	w.ui.close(w.st)
+	w.st = w.ui.new(w.c, w.cx, { view }, nil, "settings")
+end
+
+do -- the host blocks render every page; keys switch pages, the switch picks a page's view
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = ROOST })
 	step(w, 1)
-	for i, id in { "overview", "runs", "workflows", "events", "relay", "config", "files" } do
+	for i, id in { "overview", "workflows", "runs" } do
 		eq(press(w, tostring(i)), if i == 1 then false else true, `key {i}`)
 		eq(w.st.tab, id)
 		local v = view(w)
 		truthy(F.text(v.main) ~= "", `page {id} has content`)
 	end
+	eq(press(w, "4"), false, "the console has three pages")
+	w.ui.event(w.st, { ev = "select", id = "main.body.runs.left.bar.start.sub", item = "events" })
+	eq(w.st.tab, "events", "the switch shows the page's other view")
+	truthy(F.text(view(w).main) ~= "", "events page has content")
+	eq(press(w, "2"), true)
+	w.ui.event(w.st, { ev = "select", id = "main.body.workflows.bar.start.sub", item = "files" })
+	eq(w.st.tab, "files")
+	truthy(F.text(view(w).main) ~= "", "files page has content")
+	w.ui.event(w.st, { ev = "select", id = "main.body.files.bar.start.sub", item = "relay" })
+	eq(w.st.tab, "files", "a view of the settings block is not one of the console's")
+	eq(press(w, "3"), true)
+	eq(w.st.tab, "events", "a page reopens on the view it last showed")
+	eq(press(w, "2"), true)
+	eq(w.st.tab, "files")
+	eq(w.ui.new(w.c, w.cx, {}, w.ui.save(w.st)).last.activity, "events", "the last views are saved")
+	-- The header's settings button names the page; the window opens the block on it.
+	w.ui.event(w.st, { ev = "action", id = "main.head.end.settings", act = "settings", value = "config" })
+	eq(w.cx.opened[#w.cx.opened], "roost://settings/config")
+	local s = w.ui.new(w.c, w.cx, {}, nil, "settings")
+	w.ui.event(w.st, { ev = "action", id = "main.head.end.relay", act = "settings", value = "relay" })
+	eq(s.tab, "relay", "an open settings block turns to the page")
+	w.ui.close(s)
+	as_settings(w, "github")
+	eq(w.st.tab, "github", "a new settings block opens on the page it was opened for")
+	for i, id in { "config", "relay", "github", "storage" } do
+		press(w, tostring(i))
+		eq(w.st.tab, id)
+		truthy(F.text(view(w).main) ~= "", `settings page {id} has content`)
+	end
+	eq(w.ui.title(w.st), "Roost 设置")
+	w.ui.close(w.st)
+	w.st = w.ui.new(w.c, w.cx, {}, nil)
 	w.st.tab = "workflows"
 	local page = view(w)
 	truthy(string.find(F.text(page.main), "新建自动化", 1, true), "new automation button")
@@ -177,7 +215,7 @@ do -- the host block renders every page; keys switch pages
 	eq(cards(view(w)).plain.p.selected, false)
 	eq(press(w, "x"), false, "unbound key changes nothing")
 	-- The relay page shows the manual fallback while pushes fail.
-	w.st.tab = "relay"
+	as_settings(w, "relay")
 	local v = view(w)
 	local code = find(v.main, function(x)
 		return x.k == "code" and x.p and string.find(x.p.text or "", 'repos."acme/web"', 1, true) ~= nil
@@ -186,10 +224,11 @@ do -- the host block renders every page; keys switch pages
 	truthy(string.find(code.p.text, 'events = ["issues"]', 1, true), "with the subscribed events")
 	w.ui.event(w.st, { ev = "action", id = "main.body.relay.subs.manual.copy", act = "copy", value = "subs" })
 	eq(w.cx.copied[1], code.p.text, "copy puts the same text on the clipboard")
-	local relay_text = F.text(v.main)
-	truthy(string.find(relay_text, "GitHub App", 1, true), "GitHub App card")
-	eq(string.find(relay_text, "GitHub Webhook", 1, true), nil, "webhook card is gone")
-	truthy(string.find(relay_text, "中继未连接", 1, true), "disconnected relay explains itself")
+	eq(string.find(F.text(v.main), "GitHub Webhook", 1, true), nil, "webhook card is gone")
+	w.st.tab = "github"
+	local app_text = F.text(view(w).main)
+	truthy(string.find(app_text, "GitHub App", 1, true), "GitHub App card")
+	truthy(string.find(app_text, "中继未连接", 1, true), "disconnected relay explains itself")
 end
 
 do -- manual run with a required input goes through the form; the log tails by appends
@@ -798,7 +837,7 @@ do -- storage lists the new areas and clears exports with two clicks
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	act(w, "export-all")
 	eq(#w.c.store.runs, 0)
-	w.st.tab = "config"
+	as_settings(w, "storage")
 	local labels = ""
 	F.walk(view(w).main, function(x)
 		if x.k == "kv" and x.p and x.p.items then
@@ -853,6 +892,35 @@ do -- overview lists evolver revisions and a self-upgrade; only a watching one r
 	eq(#got, 1, "the second click rolls back")
 	eq(got[1], 2)
 	truthy(string.find(w.cx.toasts[#w.cx.toasts].text, "refused", 1, true), "rollback error is toasted")
+end
+
+do -- home lists what needs a person; each item leads to its run or its settings page
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	local function items(): { [string]: any }
+		local out = {}
+		local list = find(view(w).main, function(x)
+			return x.k == "list" and x.p and x.p.key == "attention"
+		end)
+		for _, it in (list and list.c) or {} do
+			out[it.p.key] = it
+		end
+		return out
+	end
+	eq(next(items()), nil, "nothing to do yet")
+	w.core.dispatch(w.c, "plain")
+	local r = require("../lib/store").list(w.c.store, 1, "plain")[1]
+	eq(items()[`run_{r.id}`], nil, "a running workflow is not a failure")
+	r.state, r.finished_at, r.reason = "failed", w.now, "exit 1"
+	local it = items()[`run_{r.id}`]
+	truthy(it and string.find(it.p.detail, "exit 1", 1, true), "the failed last run, with why")
+	w.ui.event(w.st, { ev = "select", id = "main.body.overview.attention_view.attention", item = `run_{r.id}` })
+	eq(w.st.tab, "runs", "the item opens the run")
+	eq(w.st.run_id, r.id)
+	w.st.tab = "overview"
+	w.c.workflow_issues = { { path = "workflow[1]", message = "bad", line = 1 } }
+	truthy(items().set_config, "config errors lead to the settings")
+	w.ui.event(w.st, { ev = "select", id = "main.body.overview.attention_view.attention", item = "set_config" })
+	eq(w.cx.opened[#w.cx.opened], "roost://settings/config")
 end
 
 do -- runs show their id; the detail and the row menu copy it

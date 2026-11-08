@@ -1,12 +1,15 @@
 --!strict
--- The `roost.console` block: overview, runs (with a live log), workflows, relayed events, relay
--- sync and remote operations, and config diagnostics. Views are built from state only; every
--- repeated node carries a stable key so Tern's diff sends small frames, and the log grows by
--- suffix so new output goes out as appends.
+-- The `roost.console` and `roost.settings` blocks. The console is the daily workbench: 首页 (what
+-- needs attention, what is running, what is due), 自动化 (workflows, the file libraries) and 活动
+-- (runs with a live log, relayed events). Settings holds what is set up once: config files and
+-- runner settings, relay and devices, the GitHub App, storage and cleanup. Views are built from
+-- state only; every repeated node carries a stable key so Tern's diff sends small frames, and the
+-- log grows by suffix so new output goes out as appends.
 --
 -- Theming contract (roost.css, the user's theme.css): data-role hooks `roost.header`,
--- `roost.tabs`, `roost.overview`, `roost.runs`, `roost.run`, `roost.log`, `roost.workflows`,
--- `roost.workflow`, `roost.events`, `roost.relay`, `roost.deliveries`, `roost.config`, `roost.form`.
+-- `roost.tabs`, `roost.home`, `roost.runs`, `roost.run`, `roost.log`, `roost.workflows`,
+-- `roost.workflow`, `roost.events`, `roost.relay`, `roost.github`, `roost.deliveries`,
+-- `roost.config`, `roost.storage`, `roost.form`.
 
 local core = require("./core")
 local store = require("./store")
@@ -27,19 +30,37 @@ local N = ui.node
 
 local M = {}
 
-local TABS = {
-	{ id = "overview", label = "概览" },
-	{ id = "runs", label = "运行" },
-	{ id = "workflows", label = "工作流" },
-	{ id = "events", label = "事件" },
-	{ id = "relay", label = "中继" },
-	{ id = "config", label = "配置" },
-	{ id = "files", label = "文件" },
+export type Kind = "console" | "settings"
+
+-- Each block's top-level pages; a page shows one of its views (a segmented switch picks among
+-- several). `st.tab` is the view; the tabs strip shows the page it belongs to.
+type Page = { id: string, label: string, views: { string } }
+local PAGES: { [Kind]: { Page } } = {
+	console = {
+		{ id = "home", label = "首页", views = { "overview" } },
+		{ id = "automations", label = "自动化", views = { "workflows", "files" } },
+		{ id = "activity", label = "活动", views = { "runs", "events" } },
+	},
+	settings = {
+		{ id = "general", label = "通用", views = { "config" } },
+		{ id = "relay", label = "中继与设备", views = { "relay" } },
+		{ id = "github", label = "GitHub App", views = { "github" } },
+		{ id = "storage", label = "存储与清理", views = { "storage" } },
+	},
 }
-local TAB_IDS: { [string]: boolean } = {}
-for _, t in TABS do
-	TAB_IDS[t.id] = true
+local VIEW_LABEL: { [string]: string } = { workflows = "工作流", files = "文件库", runs = "运行", events = "事件" }
+-- view → its page, per block kind.
+local PAGE_OF: { [string]: { [string]: Page } } = { console = {}, settings = {} }
+for _, kind: Kind in { "console", "settings" } :: { Kind } do
+	for _, p in PAGES[kind] do
+		for _, v in p.views do
+			PAGE_OF[kind][v] = p
+		end
+	end
 end
+
+-- Open settings blocks: the console's links to a settings page turn the one already open there.
+local settings_open: { [any]: boolean } = {}
 
 local LOG_CHUNK = 256 * 1024
 local LOG_MAX = 512 * 1024
@@ -105,7 +126,9 @@ export type State = {
 	born: number,
 	closed: boolean,
 	unsubscribe: (() -> ())?,
-	tab: string,
+	kind: Kind,
+	tab: string, -- the view shown (PAGES)
+	last: { [string]: string }, -- page id → the view last shown on it
 	run_id: string?,
 	wf_id: string?, -- the workflow shown beside the list on the workflows page
 	filter: string, -- all | active | failed
@@ -467,15 +490,34 @@ end
 -- ---------------------------------------------------------------------------------------------
 -- Lifecycle
 
-function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
+-- `kind` picks the block; a settings block opened on a page names it in `args[1]`.
+function M.new(c: core.Core, cx: BlockCx, args: { string }, saved: any, kind: Kind?): State
+	local k: Kind = kind or "console"
+	local views = PAGE_OF[k]
 	local s: { [string]: any } = if type(saved) == "table" then saved else {}
+	local tab = PAGES[k][1].views[1]
+	if type(s.tab) == "string" and views[s.tab] then
+		tab = s.tab
+	elseif type(args[1]) == "string" and views[args[1]] then
+		tab = args[1]
+	end
+	local last: { [string]: string } = {}
+	if type(s.last) == "table" then
+		for p, v in s.last do
+			if type(p) == "string" and type(v) == "string" and views[v] and views[v].id == p then
+				last[p] = v
+			end
+		end
+	end
 	local st: State = {
 		core = c,
 		cx = cx,
 		born = tern.now(),
 		closed = false,
 		unsubscribe = nil,
-		tab = if type(s.tab) == "string" and TAB_IDS[s.tab] then s.tab else "overview",
+		kind = k,
+		tab = tab,
+		last = last,
 		run_id = if type(s.run_id) == "string" then s.run_id else nil,
 		wf_id = if type(s.wf_id) == "string" then s.wf_id else nil,
 		filter = if s.filter == "active" or s.filter == "failed" then s.filter else "all",
@@ -513,6 +555,9 @@ function M.new(c: core.Core, cx: BlockCx, _args: { string }, saved: any): State
 	if st.run_id then
 		reset_log(st, st.run_id)
 	end
+	if k == "settings" then
+		settings_open[st] = true
+	end
 	return st
 end
 
@@ -534,6 +579,7 @@ function M.close(st: State)
 		return
 	end
 	st.closed = true
+	settings_open[st] = nil
 	stop_log_timer(st)
 	st.log.gen += 1
 	if st.unsubscribe then
@@ -543,12 +589,15 @@ function M.close(st: State)
 end
 
 function M.title(st: State): string?
+	if st.kind == "settings" then
+		return "Roost 设置"
+	end
 	local running = select(1, require("./runner").active(st.core.runner))
 	return if running > 0 then `Roost · {running} 运行中` else "Roost"
 end
 
 function M.save(st: State): any
-	return { tab = st.tab, run_id = st.run_id, wf_id = st.wf_id, filter = st.filter, log_wrap = st.log_wrap }
+	return { tab = st.tab, last = st.last, run_id = st.run_id, wf_id = st.wf_id, filter = st.filter, log_wrap = st.log_wrap }
 end
 
 function M.resize(st: State, cols: number, rows: number)
@@ -563,43 +612,78 @@ local function select_run(st: State, id: string?)
 	end
 end
 
+-- Shows `view` (a view of this block) and remembers it as its page's last.
+local function go(st: State, view: string): boolean
+	local page = PAGE_OF[st.kind][view]
+	if page == nil then
+		return false
+	end
+	st.tab = view
+	st.last[page.id] = view
+	st.confirm = nil
+	return true
+end
+
+-- The segmented switch among a page's views (none for a page with one view).
+local function subnav(st: State): Node?
+	local page = PAGE_OF[st.kind][st.tab]
+	if page == nil or #page.views < 2 then
+		return nil
+	end
+	local items: { any } = {}
+	for _, v in page.views do
+		table.insert(items, { id = v, label = VIEW_LABEL[v] or v })
+	end
+	return N("tabs", { key = "sub", variant = "segmented", active = st.tab, items = items })
+end
+
+-- A page's toolbar start: the view switch, then `rest`.
+local function bar_start(st: State, rest: Node): Node
+	local sw = subnav(st)
+	if sw == nil then
+		return rest
+	end
+	return N("row", { key = "start", gap = "md", align = "center" }, { sw, keyed(rest, "rest") })
+end
+
+-- Turns every open settings block to `view`, then has the window show one (or open it there).
+local function open_settings(st: State, view: string)
+	if PAGE_OF.settings[view] == nil then
+		return
+	end
+	for s in settings_open do
+		local o = s :: State
+		if not o.closed and go(o, view) then
+			o.cx:render()
+		end
+	end
+	st.cx:open(`roost://settings/{view}`)
+end
+
 -- ---------------------------------------------------------------------------------------------
 -- Views: header
 
+-- Only what is off shows as a badge (a broken relay, the device role, config errors); counts of
+-- what runs are on the 活动 tab, the block's title and the status line.
 local function header(st: State): Node
 	local c = st.core
-	local running, queued = 0, 0
-	for _, r in c.store.runs do
-		if r.state == "running" then
-			running += 1
-		elseif r.state == "queued" then
-			queued += 1
-		end
-	end
 	local rs = c.relay.state
-	local relay_badge = if not rs.configured
-		then ui.badge("中继未配置", "muted")
-		elseif rs.waiting then ui.badge("中继等待配置", "warning")
-		elseif rs.connected then ui.badge("中继已连接", "success")
-		else ui.badge("中继断开", "error")
 	local badges: { Node } = {}
-	if running > 0 then
-		table.insert(badges, keyed(ui.badge(`{running} 运行中`, "accent"), "running"))
+	local settings = st.kind == "settings"
+	if not settings and rs.configured and (rs.waiting or not rs.connected) then
+		local badge = if rs.waiting then ui.badge("中继等待配置", "warning") else ui.badge("中继断开", "error")
+		table.insert(badges, keyed(with(badge, { actions = { click = "settings=relay" } }), "relay"))
 	end
-	if queued > 0 then
-		table.insert(badges, keyed(ui.badge(`{queued} 排队`, "pending"), "queued"))
-	end
-	table.insert(badges, keyed(relay_badge, "relay"))
 	local role = core.role(c)
 	if core.fleet_error(c) then
-		table.insert(badges, keyed(with(ui.badge("中继设备记录损坏 · 暂停运行", "warning"), { actions = { click = "tab=relay" } }), "role"))
+		table.insert(badges, keyed(with(ui.badge("中继设备记录损坏 · 暂停运行", "warning"), { actions = { click = "settings=relay" } }), "role"))
 	elseif role ~= "solo" then
 		local who = if role == "executor" then "本机是执行者" else `观察者 · 执行者「{fleet.label(core.executor(c))}」`
-		table.insert(badges, keyed(with(ui.badge(who, if role == "executor" then "accent" else "muted"), { actions = { click = "tab=relay" } }), "role"))
+		table.insert(badges, keyed(with(ui.badge(who, if role == "executor" then "accent" else "muted"), { actions = { click = "settings=relay" } }), "role"))
 	end
 	local issues = #c.config_issues + #c.workflow_issues
-	if issues > 0 then
-		table.insert(badges, keyed(with(ui.badge(`{issues} 个配置错误`, "error"), { actions = { click = "tab=config" } }), "issues"))
+	if issues > 0 and not settings then
+		table.insert(badges, keyed(with(ui.badge(`{issues} 个配置错误`, "error"), { actions = { click = "settings=config" } }), "issues"))
 	end
 	local meta = `   v{core.VERSION}`
 	if c.workflows then
@@ -611,8 +695,13 @@ local function header(st: State): Node
 	end
 	local tools: { Node } = badges
 	table.insert(tools, btn("", "reload_files", { icon = "repeat", variant = "quiet", size = "md", title = "重新读取配置文件", key = "reload" }))
+	if settings then
+		table.insert(tools, btn("工作台", "console", { icon = "flow", variant = "quiet", size = "md", title = "打开 Roost 工作台", key = "console" }))
+	else
+		table.insert(tools, btn("设置", "settings=config", { icon = "sliders", variant = "quiet", size = "md", title = "中继与设备、GitHub App、存储与清理、配置文件", key = "settings" }))
+	end
 	return N("row", { key = "head", role = "roost.header", justify = "between", align = "center" }, {
-		ui.text({ ui.span("Roost", "title"), ui.span(meta, "muted") }),
+		ui.text({ ui.span(if settings then "Roost 设置" else "Roost", "title"), ui.span(meta, "muted") }),
 		N("row", { key = "end", gap = "sm", align = "center" }, tools),
 	})
 end
@@ -701,7 +790,7 @@ local function trend_charts(st: State, days: { stats.Day }): Node
 			variant = "inline",
 			icon = "activity",
 			title = `近 {TREND_DAYS} 天没有运行`,
-			text = "到「工作流」手动运行一次,或等待定时 / GitHub 事件。",
+			text = "到「自动化」手动运行一次,或等待定时 / GitHub 事件。",
 		})
 	end
 	local runs_chart = N("col", { key = "runs", gap = "sm", grow = 1, basis = 0 }, {
@@ -735,59 +824,76 @@ local function trend_charts(st: State, days: { stats.Day }): Node
 	return N("row", { key = "trends", gap = "lg", align = "stretch" }, { runs_chart, took_chart })
 end
 
--- One row per workflow: how it has been doing (the services table of an APM).
-local function health_table(st: State, t: number): Node
+-- What needs a person, from what Roost already knows: config errors, a relay or device problem,
+-- subscriptions out of sync, App permissions not granted, workflows whose last run failed. An
+-- item's key says where it leads (`set_<settings view>`, `run_<run id>`; M.event).
+local function attention(st: State, t: number): { Node }
 	local c = st.core
+	local out: { Node } = {}
+	local function add(key: string, label: string, detail: string, icon: string, tone: string, value: string?)
+		table.insert(out, N("item", { key = key, label = label, detail = detail, icon = icon, tone = tone, value = value }))
+	end
+	local issues = #c.config_issues + #c.workflow_issues
+	if issues > 0 then
+		add("set_config", `{issues} 个配置错误`, "roost.toml 或 workflows.toml 校验失败,改好之前沿用上一份有效配置", "warn", "error")
+	end
+	if core.fleet_error(c) then
+		add("set_relay", "中继的设备记录读不出", "重新指定执行者之前,任何设备都不运行", "warn", "error")
+	end
+	local rs = c.relay.state
+	if rs.configured and not rs.connected and not rs.waiting then
+		add("set_relay", "中继断开", rs.error or "收不到 GitHub 事件;定时与手动运行不受影响", "server", "error")
+	end
+	local sync = rs.sync
+	if sync.state == "conflict" or sync.state == "invalid" or sync.state == "offline" then
+		add("set_relay", `事件订阅:{SYNC_LABEL[sync.state] or sync.state}`, sync.error or "中继的订阅与本地工作流不一致", "broadcast", "warning")
+	end
+	if rs.gap_at and t - rs.gap_at < 86400 then
+		add("set_relay", "有事件在本机读取前被中继淘汰", "这些事件没有触发运行", "warn", "warning", util.ago(rs.gap_at, t))
+	end
+	local info = core.app(c)
+	if info and info.missing and #info.missing > 0 then
+		add("set_github", "GitHub App 权限尚未生效", table.concat(info.missing, " "), "plug", "warning")
+	end
 	local w = c.workflows
-	local health = stats.health(c.store.runs, t, TREND_DAYS)
-	local latest = store.latest(c.store)
-	local rows = {}
-	local list: { model.Workflow } = if w then w.list else {}
-	for _, wf in list do
-		local h = health[wf.id]
-		local last = latest[wf.id]
-		local spark: { number } = if h then h.daily else table.create(TREND_DAYS, 0)
-		local nxt: number? = nil
-		for _, row in c.crons do
-			if row.workflow == wf.id and row.next and (nxt == nil or row.next < (nxt :: number)) then
-				nxt = row.next
+	if w and not observing(st) then
+		local latest = store.latest(c.store)
+		local shown = 0
+		for _, wf in w.list do
+			local r = latest[wf.id]
+			local at = if r then r.finished_at or r.created_at else 0
+			if r and wf.enabled and stats.BAD[r.state] and t - at < 7 * 86400 then
+				shown += 1
+				if shown > 8 then
+					break
+				end
+				local why = r.reason or run_subject(r) or "查看日志了解原因"
+				add(`run_{r.id}`, `{wf.name}:最近一次运行{STATE_LABEL[r.state] or r.state}`, why, "warn", "error", util.ago(at, t))
 			end
 		end
-		local rate_cell: any = stats.percent(h and h.rate)
-		if h and h.bad > 0 then
-			rate_cell = { ui.span(rate_cell, if (h.rate or 0) < 0.8 then "error" else "warning") }
-		end
-		table.insert(rows, {
-			id = wf.id,
-			title = wf.description,
-			cells = list_of(
-				{
-					text = { ui.span(wf.name), ui.span(if wf.enabled then "" else "  已停用", "muted") },
-					dot = if last then STATE_TONE[last.state] or "muted" else "muted",
-				},
-				if h then tostring(h.runs) else "0",
-				rate_cell,
-				secs(h and h.p50),
-				secs(h and h.p95),
-				{ spark = { values = spark, tone = if h and h.bad > 0 then "warning" else "accent", title = `近 {TREND_DAYS} 天每日运行次数` } },
-				{ ui.span(if last then util.ago(last.created_at, t) else "—", "muted") },
-				{ ui.span(if nxt then util.until_(nxt, t) else "—", "muted") }
-			),
-		})
 	end
-	return keyed(
-		ui.table({
-			{ id = "name", head = "工作流", grow = 1, truncate = "end", priority = 9 },
-			{ id = "runs", head = "运行", align = "end", mono = true, priority = 7 },
-			{ id = "rate", head = "成功率", align = "end", mono = true, priority = 8 },
-			{ id = "p50", head = "P50", align = "end", mono = true, priority = 5 },
-			{ id = "p95", head = "P95", align = "end", mono = true, priority = 4 },
-			{ id = "trend", head = "趋势", priority = 2 },
-			{ id = "last", head = "最近运行", align = "end", priority = 3 },
-			{ id = "next", head = "下次", align = "end", priority = 1 },
-		}, rows :: any, { selectable = true, selected = st.wf_id, empty = "还没有工作流" }),
-		"health"
-	)
+	return out
+end
+
+-- Queued and running runs (the executor's on an observer), newest first.
+local function active_items(st: State, t: number): { Node }
+	local out: { Node } = {}
+	for _, r in source_runs(st) do
+		if r.state == "running" or r.state == "queued" then
+			table.insert(out, N("item", {
+				key = `run_{r.id}`,
+				label = r.workflow_name,
+				detail = run_subject(r) or TRIGGER_LABEL[r.trigger.kind] or r.trigger.kind,
+				value = `{STATE_LABEL[r.state]} · {duration(r.started_at or r.created_at, nil)}`,
+				icon = if r.state == "running" then "play" else "clock",
+				tone = STATE_TONE[r.state],
+			}))
+			if #out >= 8 then
+				break
+			end
+		end
+	end
+	return out
 end
 
 local function changed_line(workflows: { string }, libs: { string }): string
@@ -883,14 +989,23 @@ local function overview(st: State): Node
 			sub = if next_row and next_row.next then next_row.name else "没有定时触发",
 		},
 	})
+	local need = attention(st, t)
 	local children: { Node } = {
 		keyed(tiles, "stats"),
-		trend_charts(st, stats.days(c.store.runs, t, TREND_DAYS)),
-		N("col", { key = "health_view", gap = "sm" }, {
-			heading("h", "工作流", `近 {TREND_DAYS} 天 · 双击打开`),
-			health_table(st, t),
+		N("col", { key = "attention_view", gap = "sm" }, {
+			heading("h", "待处理", if #need > 0 then "单击前往" else nil),
+			if #need > 0
+				then N("list", { key = "attention" }, need)
+				else N("empty", { key = "attention", variant = "inline", icon = "check", title = "没有需要处理的事", text = "配置、中继、订阅与各工作流最近一次运行都正常。" }),
 		}),
 	}
+	local busy = active_items(st, t)
+	if #busy > 0 then
+		table.insert(children, N("col", { key = "active_view", gap = "sm" }, {
+			heading("h", "进行中", "单击查看运行"),
+			N("list", { key = "active" }, busy),
+		}))
+	end
 	local cron_items: { Node } = {}
 	for _, row in c.crons do
 		if #cron_items >= 5 then
@@ -914,6 +1029,7 @@ local function overview(st: State): Node
 			N("list", { key = "crons" }, cron_items),
 		}))
 	end
+	table.insert(children, trend_charts(st, stats.days(c.store.runs, t, TREND_DAYS)))
 	local notice_items: { Node } = {}
 	for i, n in c.notices do
 		if i > 5 then
@@ -937,7 +1053,7 @@ local function overview(st: State): Node
 		}))
 	end
 	table.insert(children, evolve_card(st, t))
-	return N("col", { key = "overview", role = "roost.overview", gap = "lg" }, children)
+	return N("col", { key = "overview", role = "roost.home", gap = "lg" }, children)
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -1373,7 +1489,7 @@ local function runs_tab(st: State): Node
 	end
 	local left = N("col", { key = "left", role = "roost.runlist", gap = "sm" }, {
 		N("row", { key = "bar", justify = "between", align = "center" }, {
-			ui.text(count),
+			bar_start(st, ui.text(count)),
 			N("tabs", {
 				key = "filter",
 				variant = "segmented",
@@ -1621,7 +1737,7 @@ end
 local function workflows_toolbar(st: State, count: string?): Node
 	local blocked: any = core.config_block(st.core) or false
 	return N("row", { key = "bar", justify = "between", align = "center" }, {
-		ui.text({ ui.span(count or "", "muted") }),
+		bar_start(st, ui.text({ ui.span(count or "", "muted") })),
 		N("row", { key = "end", gap = "sm", align = "center" }, {
 			btn("新建自动化", "editor-new", { icon = "plus", size = "md", key = "new", disabled = blocked }),
 			editor.template_menu(),
@@ -1660,7 +1776,7 @@ local function workflows_tab(st: State): Node
 				tone = "error",
 				icon = "warn",
 				title = "workflows.toml 还没有可用的版本",
-				text = "修好「配置」页列出的错误后自动加载。",
+				text = "修好「设置 › 通用」列出的错误后自动加载。",
 			}),
 		})
 	end
@@ -1968,7 +2084,7 @@ local function files_tab(st: State): Node
 
 	local children: { Node } = {
 		N("row", { key = "bar", justify = "between", align = "center" }, {
-			muted("脚本和提示词由 Roost 保管;运行时使用的是开始时复制的副本。"),
+			bar_start(st, muted("脚本和提示词由 Roost 保管;运行时使用的是开始时复制的副本。")),
 			btn("刷新", "fp-reload", { variant = "quiet", icon = "repeat", key = "reload" }),
 		}),
 		ui.card("文件库", lib_rows, { key = "libs", icon = "folder-open" }),
@@ -2144,7 +2260,7 @@ local function events_tab(st: State): Node
 		else `中继游标 {rs.head or "—"} · 最近事件 {util.ago(rs.last_event, t)}`
 	return N("col", { key = "events", role = "roost.events", gap = "sm" }, {
 		N("row", { key = "bar", justify = "between", align = "center", gap = "sm" }, {
-			keyed(muted(`{note} · 保留 {k.events} 条 / {fmt_age(k.event_age)}`), "note"),
+			bar_start(st, keyed(muted(`{note} · 保留 {k.events} 条 / {fmt_age(k.event_age)}`), "note")),
 			N("row", { key = "end", gap = "sm", align = "center" }, {
 				confirm_btn(st, "清空记录", "确认清空", "clear-events", {
 					key = "clear",
@@ -2163,7 +2279,7 @@ local function events_tab(st: State): Node
 			}, rows :: any, {
 				selectable = true,
 				empty = if rs.configured
-					then "还没有收到中继事件。只有已订阅的事件才会转发到本机,见「中继」页的 Webhook 投递"
+					then "还没有收到中继事件。只有已订阅的事件才会转发到本机,见「设置 › 中继与设备」的 Webhook 投递"
 					else "还没有收到中继事件",
 			}),
 			"table"
@@ -2516,7 +2632,25 @@ local function relay_tab(st: State): Node
 	end
 	local sub_card = ui.card("事件订阅", sub_body, { key = "subs", icon = "broadcast" })
 
-	-- GitHub App
+	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, {
+		conn_card,
+		devices_card(st, t),
+		sub_card,
+		deliveries_view(st, t),
+	})
+end
+
+-- The GitHub App the relay runs as: created here, then installed and managed on GitHub.
+local function github_tab(st: State): Node
+	local c = st.core
+	if not c.relay.state.configured then
+		return N("empty", {
+			key = "github",
+			icon = "plug",
+			title = "中继未配置",
+			text = "GitHub App 由服务器上的 roost-agent 创建与保管:先在 roost.toml 的 [relay] 填写 url 与 token。",
+		}, { btn("编辑 roost.toml", "open=config", { variant = "primary", size = "md" }) })
+	end
 	local info = core.app(c)
 	local app_body: { Node } = {}
 	if info == nil then
@@ -2585,14 +2719,7 @@ local function relay_tab(st: State): Node
 		}))
 	end
 	local app_card = ui.card("GitHub App", app_body, { key = "app", icon = "plug" })
-
-	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, {
-		conn_card,
-		devices_card(st, t),
-		sub_card,
-		app_card,
-		deliveries_view(st, t),
-	})
+	return N("col", { key = "github", role = "roost.github", gap = "md" }, { app_card })
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -2647,7 +2774,7 @@ local function storage_card(st: State): Node
 		{ "worktree", size({ "worktrees" }) },
 		{ "事件记录", `{#c.events} 条 · 保留 {k.events} 条 / {fmt_age(k.event_age)} · {size({ "events.json", "events.json.bak" })}` },
 		{ "脚本与文件", `文件库 {size({ "library" })} · 工作流文件 {size({ "workflows" })}` },
-		{ "状态目录", `{size({ "state" })} · 不会自动清理,在「文件」页手动删除` },
+		{ "状态目录", `{size({ "state" })} · 不会自动清理,在工作台「自动化 › 文件库」手动删除` },
 		{ "导出文件", `{exports_n} 个 · 保留最新 {core.MAX_EXPORTS} 个 · {size({ "exports" })}` },
 		{ "上次自动清理", last },
 	}
@@ -2665,7 +2792,7 @@ local function storage_card(st: State): Node
 	return ui.card("存储与清理", {
 		keyed(
 			muted(
-				"运行目录含日志、事件负载与 omp 会话。启动时、每小时以及修改 roost.toml [retention] 后按策略自动清理;只删除已结束的运行。中继侧的事件缓存与投递统计在「中继」页清理。"
+				"运行目录含日志、事件负载与 omp 会话。启动时、每小时以及修改 roost.toml [retention] 后按策略自动清理;只删除已结束的运行。中继侧的事件缓存与投递统计在「中继与设备」页清理。"
 			),
 			"note"
 		),
@@ -2723,7 +2850,6 @@ local function config_tab(st: State): Node
 		file_card("config", "roost.toml", p.config, c.config_issues, "有效"),
 		file_card("workflows", "workflows.toml", p.workflows, c.workflow_issues, wf_ok),
 		ui.card("运行设置", { keyed(runner_kv, "kv") }, { key = "runner", icon = "sliders" }),
-		storage_card(st),
 		ui.card("外观", {
 			keyed(muted("theme.css 放在数据目录中,保存后实时注入,覆盖 roost.css 的样式(钩子:data-role = roost.*)。"), "note"),
 			keyed(ui.text({ ui.path(p.theme) }), "path"),
@@ -2732,6 +2858,10 @@ local function config_tab(st: State): Node
 			}),
 		}, { key = "theme", icon = "palette" }),
 	})
+end
+
+local function storage_tab(st: State): Node
+	return N("col", { key = "storage", role = "roost.storage", gap = "md" }, { storage_card(st) })
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -2781,7 +2911,7 @@ end
 local function form_done(st: State, f: Form)
 	st.form = nil
 	st.cx:frame({ pair("focus", tern.json.null) })
-	st.tab = "runs"
+	go(st, "runs")
 	local newest = store.list(st.core.store, 1, f.workflow)[1]
 	if newest then
 		select_run(st, newest.id)
@@ -3142,42 +3272,46 @@ end
 -- ---------------------------------------------------------------------------------------------
 -- View
 
+local VIEWS: { [string]: (State) -> Node } = {
+	overview = overview,
+	workflows = workflows_tab,
+	files = files_tab,
+	runs = runs_tab,
+	events = events_tab,
+	config = config_tab,
+	relay = relay_tab,
+	github = github_tab,
+	storage = storage_tab,
+}
+
 function M.view(st: State): BlockView
-	local body: Node
-	if st.tab == "runs" then
-		body = runs_tab(st)
-	elseif st.tab == "workflows" then
-		body = workflows_tab(st)
-	elseif st.tab == "events" then
-		body = events_tab(st)
-	elseif st.tab == "relay" then
-		body = relay_tab(st)
-	elseif st.tab == "config" then
-		body = config_tab(st)
-	elseif st.tab == "files" then
-		body = files_tab(st)
-	else
-		body = overview(st)
+	local page = PAGE_OF[st.kind][st.tab]
+	if page == nil then
+		-- Set from outside to a view of the other block: show this block's first page.
+		st.tab = PAGES[st.kind][1].views[1]
+		page = PAGE_OF[st.kind][st.tab]
 	end
+	local body = VIEWS[st.tab](st)
 	local c = st.core
-	local active = 0
-	for _, r in c.store.runs do
-		if r.state == "running" or r.state == "queued" then
-			active += 1
+	local counts: { [string]: number } = {}
+	if st.kind == "settings" then
+		counts.general = #c.config_issues + #c.workflow_issues
+	else
+		local active = 0
+		for _, r in source_runs(st) do
+			if r.state == "running" or r.state == "queued" then
+				active += 1
+			end
 		end
+		counts.activity = active
+		counts.home = #attention(st, now())
 	end
-	local counts: { [string]: number } = {
-		runs = active,
-		workflows = if c.workflows then #c.workflows.list else 0,
-		events = #c.events,
-		config = #c.config_issues + #c.workflow_issues,
-	}
 	local nav: { any } = {}
-	for _, tab in TABS do
-		local n = counts[tab.id]
+	for _, p in PAGES[st.kind] do
+		local n = counts[p.id]
 		table.insert(nav, {
-			id = tab.id,
-			label = if n and n > 0 then { ui.span(`{tab.label} `), ui.span(tostring(n), "muted") } else tab.label,
+			id = p.id,
+			label = if n and n > 0 then { ui.span(`{p.label} `), ui.span(tostring(n), "muted") } else p.label,
 		})
 	end
 	-- Only the page scrolls: the head and the tabs stay put. The body always fills the block below
@@ -3189,10 +3323,10 @@ function M.view(st: State): BlockView
 	end
 	local main = N("col", { gap = "lg" }, {
 		header(st),
-		N("tabs", { key = "nav", role = "roost.tabs", active = st.tab, items = nav }),
+		N("tabs", { key = "nav", role = "roost.tabs", active = page.id, items = nav }),
 		N("col", { key = "body", role = "roost.fill", gap = "lg" }, { body }),
 	})
-	local legend: { any } = { ui.span("1-7", "key"), ui.span(" 切换页面", "muted") }
+	local legend: { any } = { ui.span(`1-{#PAGES[st.kind]}`, "key"), ui.span(" 切换页面", "muted") }
 	local function hint(k: string, what: string)
 		table.insert(legend, ui.span("   "))
 		table.insert(legend, ui.span(k, "key"))
@@ -3307,8 +3441,12 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		-- A two-click action is disarmed by anything in between.
 		st.confirm = nil
 	end
-	if act == "tab" and value and TAB_IDS[value] then
-		st.tab = value
+	if act == "tab" and value then
+		go(st, value)
+	elseif act == "settings" and value then
+		open_settings(st, value)
+	elseif act == "console" then
+		st.cx:open("roost://console")
 	elseif act == "open" and value then
 		open_path(st, value)
 	elseif act == "reload_files" then
@@ -3325,7 +3463,7 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 				toast_err(st, err)
 			else
 				local newest = store.list(c.store, 1, value)[1]
-				st.tab = "runs"
+				go(st, "runs")
 				if newest then
 					select_run(st, newest.id)
 				end
@@ -3373,7 +3511,7 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 			st.cx:open(r.cwd)
 		end
 	elseif act == "open-run" and value then
-		st.tab = "runs"
+		go(st, "runs")
 		select_run(st, value)
 	elseif act == "push" then
 		core.push_subscriptions(c, false)
@@ -3544,16 +3682,25 @@ function M.event(st: State, ev: UiEvent)
 		if type(item) ~= "string" then
 			return
 		end
-		if name == "nav" and TAB_IDS[item] then
-			st.tab = item
-			st.confirm = nil
+		if name == "nav" then
+			for _, p in PAGES[st.kind] do
+				if p.id == item then
+					go(st, st.last[p.id] or p.views[1])
+				end
+			end
+		elseif name == "sub" then
+			go(st, item)
+		elseif name == "attention" or name == "active" then
+			local view = string.match(item, "^set_(%l+)$")
+			local run = string.match(item, "^run_(%x+)$")
+			if view then
+				open_settings(st, view)
+			elseif run then
+				go(st, "runs")
+				select_run(st, run)
+			end
 		elseif name == "tpl" then
 			st.tpl = item
-		elseif name == "health" then
-			st.wf_id = item
-			if ev.ev == "activate" then
-				st.tab = "workflows"
-			end
 		elseif name == "filter" then
 			st.filter = item
 		elseif name == "runs" then
@@ -3569,7 +3716,7 @@ function M.event(st: State, ev: UiEvent)
 			for _, e in st.core.events do
 				local run = if e.delivery == delivery then e.runs[1] else nil
 				if run and st.core.store.by_id[run] then
-					st.tab = "runs"
+					go(st, "runs")
 					select_run(st, run)
 					break
 				end
@@ -3591,7 +3738,7 @@ function M.event(st: State, ev: UiEvent)
 				st.form.focus = i
 				focus_form(st)
 			end
-		elseif string.match(ev.id or "", "relay%.app%.org%.input$") then
+		elseif string.match(ev.id or "", "github%.app%.org%.input$") then
 			st.app_focus = true
 			st.cx:frame({ pair("focus", ev.id) })
 		else
@@ -3623,7 +3770,7 @@ function M.event(st: State, ev: UiEvent)
 			end
 		elseif st.tab == "files" and st.fp.focus and id == FP_IDS[st.fp.focus] then
 			field.edit(st.fp.fields[st.fp.focus], ev)
-		elseif st.app_org and string.match(id, "relay%.app%.org%.input$") then
+		elseif st.app_org and string.match(id, "github%.app%.org%.input$") then
 			field.edit(st.app_org, ev)
 		end
 	end
@@ -3735,7 +3882,7 @@ function M.key(st: State, key: Key): boolean?
 			return true
 		end
 	end
-	local app = if st.tab == "relay" and st.app_focus and st.app_org then core.app(st.core) else nil
+	local app = if st.tab == "github" and st.app_focus and st.app_org then core.app(st.core) else nil
 	-- Keys go to the org field only while it is drawn (no App yet, relay status known).
 	if app and not app.configured and st.app_org then
 		if key.name == "escape" or key.name == "enter" then
@@ -3751,12 +3898,13 @@ function M.key(st: State, key: Key): boolean?
 		return false
 	end
 	local n = tonumber(key.name)
-	if n and TABS[n] then
-		if st.tab == TABS[n].id then
+	local pages = PAGES[st.kind]
+	local p = if n then pages[n] else nil
+	if p then
+		if PAGE_OF[st.kind][st.tab] == p then
 			return false
 		end
-		st.tab = TABS[n].id
-		return true
+		return go(st, st.last[p.id] or p.views[1])
 	end
 	if st.tab == "runs" then
 		if key.name == "j" or key.name == "down" then
