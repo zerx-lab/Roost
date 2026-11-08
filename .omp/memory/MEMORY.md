@@ -9,6 +9,7 @@
 
 ## 决策(当前有效)
 
+- [2026-11-08] 去掉首页任务输入框(`core.start_task` 一并删除):用户直接与编码 agent 对话来改工作流,框多余;追问/开 PR/建分支等内置运行保留。上一轮提的「长期目标 + 值守调度器」方案未采纳 — 依据:用户确认
 - [2026-11-08] 多设备改为按工作流分配(取代 11-06 的执行者/观察者):中继 `owners` 记默认设备(`*`)与各工作流的分配历史,条目 `seq` = 指派时事件 head,事件按收到时的分配归属(改派不漏不重,离线设备上线补跑);没指定的工作流跟默认设备,没有默认设备 = 每台都跑。工作流配置共用、任何设备可改(中继按版本 CAS,后到的一方套用新版本前备份本机未同步修改);手动运行别的设备负责的工作流经中继 `roost_run` 转发给它;内置运行与迭代者在本机;每台设备上传自己的运行摘要,运行页合并显示。设置页四页同时重排(并排卡片、数字瓷砖、危险操作分组)。中继需重新部署,所有设备都要升级 — 依据:用户选择「任何设备都能改」「转发给 B 执行」「由默认设备运行」
 - [2026-11-08] 审查后的取舍:`reply = true` 的 ack/report 在 App 身份拿不到令牌时直接拒绝(绝不用本机 gh 代发);运行进入 cleanup/report 后不可取消,两者的截止时间不改变运行结果(report 过 120 s 被杀,cleanup 不杀、只放宽到 600 s);`workspace = "repo"` 运行的追问照旧在本机检出里继续(工作流作者选了 repo 模式,只在对话框说明);开 PR 对 `roost/<运行id>` 强推(Roost 自有分支,重试 gh pr create 失败的情况);中继 dispatch 事件只认 `sender = "api"` 且无 repo — 依据:WorkbenchReviewRunner/WorkbenchReviewCore 审查,主会话取舍
 - [2026-11-08] bot 工作台(对标 Claude Code 云端/Codex 云端/Grok)分四阶段连续做完:P1 内置任务(`task.<hex>` 合成工作流,不进 workflows.toml,有仓库一律 worktree)、结果 Markdown、改动卡片(只存 `runs/<id>/changes.patch`,不往仓库写 ref;建本地分支 `roost/<运行id>`、开 PR 走内置运行)、追问(新运行接续:复制父会话 `--resume` 并扣除复制进来的费用,worktree 建在父 base 上并 apply 父补丁;工作流运行也可追问);P2 收件箱(`$ROOST_INBOX` JSON,replace/增量/resolve,`inbox.json`,随运行摘要同步观察者),同时改 library/fluxdown 脚本上报;P3 `mention` 触发 + `reply` 评论回复、一句话生成自动化;P4 中继公开端点 `POST /hooks/dispatch/<工作流>`(每工作流令牌,workflows.toml 只存 SHA-256,限速)、环境配置(变量也给 omp 步骤,以 0600 文件随运行清理)。设计稿见会话 local://workbench-design.md — 依据:用户选择「做,按设计」「一起改」「omp 也给」「连续做完 P1–P4」

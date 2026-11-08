@@ -495,9 +495,19 @@ do -- a task works in a worktree, keeps its changes; a follow-up resumes its con
 		return "exit:0"
 	end
 	s.core.start(s.c)
-	local id, err = s.core.start_task(s.c, { prompt = "修 {{number}} 的崩溃\n细节见 issue", repo = "acme/web" })
+	-- A built-in task run, as core's submit_task makes one.
+	local tasks = require("../lib/tasks")
+	local task: any = { kind = "task", prompt = "修 {{number}} 的崩溃\n细节见 issue", workspace = "worktree" }
+	local made, err = require("../lib/runner").submit(s.c.runner, tasks.workflow(tasks.new_id(), task, "acme/web"), {
+		trigger = { kind = "task", detail = "首页" },
+		repo = "acme/web",
+		ref = s.c.workflows and s.c.workflows.repos["acme/web"].branch,
+		inputs = {},
+		task = task,
+	})
 	eq(err, nil)
-	local run = s.c.store.by_id[id]
+	local run = made :: any
+	local id = run.id
 	truthy(string.sub(run.workflow, 1, 5) == "task.", "a built-in workflow id: " .. run.workflow)
 	eq(run.title, "修 {{number}} 的崩溃", "titled by its first line")
 	eq(run.workspace, "worktree", "a repository with a checkout: always a worktree")

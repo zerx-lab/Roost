@@ -103,8 +103,6 @@ export type FilesPage = {
 export type Import = { path: field.Field, plan: core.ImportPlan?, error: string? }
 -- The group name dialog: a new group (moving workflow `wf` into it when set), or renaming `id`.
 export type GroupDialog = { id: string?, wf: string?, name: field.Field, error: string? }
--- The home page's task box: what to do, in which repository ("" none), with which model.
-export type TaskBox = { text: field.Field, repo: string, model: string, env: string, focus: boolean, opens: { [string]: boolean } }
 export type DlgField = field.Field & { label: string, hint: string?, placeholder: string? }
 -- A dialog: a run's follow-up (`followup`: the text) or a PR from its changes (`pr`: title, body,
 -- base), or drafting a workflow from a description (`generate`, run = ""). `busy`: generating.
@@ -153,7 +151,6 @@ export type State = {
 	fp: FilesPage,
 	imp: Import?, -- the import overlay while open
 	grp: GroupDialog?, -- the group name dialog while open
-	task: TaskBox,
 	dlg: Dialog?, -- a run's follow-up or PR dialog while open
 	diff: string?, -- the run whose patch the diff overlay shows
 }
@@ -574,7 +571,6 @@ function M.new(c: core.Core, cx: BlockCx, args: { string }, saved: any, kind: Ki
 		fp = new_fp(),
 		imp = nil,
 		grp = nil,
-		task = { text = text_field("", true), repo = "", model = "auto", env = "", focus = false, opens = {} },
 		dlg = nil,
 		diff = nil,
 	}
@@ -650,7 +646,6 @@ local function go(st: State, view: string): boolean
 	st.tab = view
 	st.last[page.id] = view
 	st.confirm = nil
-	st.task.focus = false
 	st.app_focus = false
 	return true
 end
@@ -1078,79 +1073,7 @@ local function inbox_rows(st: State, t: number): { Node }
 	return rows
 end
 
-local TASK_ID = "main.body.overview.task.input"
-local TASK_REPO_ID = "main.body.overview.task.bar.opts.repo"
-local TASK_MODEL_ID = "main.body.overview.task.bar.opts.model"
-local TASK_ENV_ID = "main.body.overview.task.bar.opts.env"
-
--- The home page's task box: what to do, the repository (a worktree of its checkout, never the
--- checkout itself) and the model; ⌘↵ or 开始 starts it.
-local function task_box(st: State): Node
-	local c = st.core
-	local tb = st.task
-	local blocked = core.run_block(c)
-	local repos: { any } = { { value = "", label = "不关联仓库", detail = "在空的临时目录里运行" } }
-	local w = c.workflows
-	if w then
-		for _, name in util.keys(w.repos) do
-			local r = w.repos[name]
-			table.insert(repos, {
-				value = name,
-				label = name,
-				detail = if r.path then "在检出的临时 worktree 中运行" else "没有本机检出:临时目录",
-			})
-		end
-	end
-	if tb.repo ~= "" and not (w and w.repos[tb.repo]) then
-		tb.repo = ""
-	end
-	local envs = c.config.environments
-	if tb.env ~= "" and envs[tb.env] == nil then
-		tb.env = ""
-	end
-	local opts: { Node } = {
-		N("select", {
-			key = "repo",
-			value = tb.repo,
-			options = repos,
-			title = "仓库",
-			open = tb.opens[TASK_REPO_ID] == true,
-		}),
-		N("select", {
-			key = "model",
-			value = tb.model,
-			options = editor.model_options(st, tb.model),
-			title = "模型",
-			open = tb.opens[TASK_MODEL_ID] == true,
-		}),
-	}
-	if next(envs) then
-		local env_opts: { any } = { { value = "", label = "不用环境" } }
-		for _, name in util.keys(envs) do
-			table.insert(env_opts, { value = name, label = `环境 {name}` })
-		end
-		table.insert(opts, N("select", { key = "env", value = tb.env, options = env_opts, title = "环境", open = tb.opens[TASK_ENV_ID] == true }))
-	end
-	local start: any = blocked or (if util.trim(tb.text.text) == "" then "先写下要做的事" else false)
-	return N("col", { key = "task", role = "roost.composer", gap = "sm" }, {
-		N("editor", {
-			key = "input",
-			text = tb.text.text,
-			cursor = field.utf16_cursor(tb.text),
-			placeholder = if blocked then blocked else "让 Roost 做点什么,例如:修复 #123 的崩溃并补上测试",
-			maxLines = 10,
-		}),
-		N("row", { key = "bar", justify = "between", align = "center", gap = "sm" }, {
-			N("row", { key = "opts", gap = "sm", align = "center" }, opts),
-			N("row", { key = "go", gap = "sm", align = "center" }, {
-				keyed(ui.text({ ui.span("⌘↵", "key"), ui.span(" 开始", "muted") }), "hint"),
-				btn("开始", "task-start", { key = "start", variant = "primary", icon = "play", size = "md", disabled = start }),
-			}),
-		}),
-	})
-end
-
--- The latest tasks and follow-ups typed here, newest first.
+-- The latest built-in task runs, newest first.
 local function recent_tasks(st: State, t: number): { Node }
 	local out: { Node } = {}
 	local runs = store.list(st.core.store, MAX_RUN_ROWS, nil)
@@ -1233,7 +1156,6 @@ local function overview(st: State): Node
 		}))
 	end
 	local children: { Node } = {
-		task_box(st),
 		keyed(tiles, "stats"),
 		N("col", { key = "attention_view", gap = "sm" }, pending),
 	}
@@ -4189,9 +4111,6 @@ function M.view(st: State): BlockView
 			hint("[ ]", "移到上/下一个分组")
 		end
 		hint("Esc", "取消选中")
-	elseif st.tab == "overview" and st.kind == "console" then
-		hint("⌘↵", "开始任务")
-		hint("Esc", "离开输入框")
 	end
 	local dock = N("col", {}, { ui.text(legend) })
 	return {
@@ -4286,26 +4205,6 @@ local function confirmed(st: State, what: string)
 			toast_err(st, core.rollback_revision(c, tonumber(n) :: number))
 		end
 	end
-end
-
--- Starts what the home page's task box says; the box empties and the run's detail opens.
-local function task_start(st: State)
-	local tb = st.task
-	local id, err = core.start_task(st.core, {
-		prompt = tb.text.text,
-		repo = if tb.repo ~= "" then tb.repo else nil,
-		model = if tb.model ~= "auto" then tb.model else nil,
-		environment = if tb.env ~= "" then tb.env else nil,
-	})
-	if not id then
-		toast_err(st, err or "无法开始任务")
-		return
-	end
-	tb.text = text_field("", true)
-	tb.focus = false
-	st.cx:frame({ pair("focus", tern.json.null) })
-	go(st, "runs")
-	select_run(st, id)
 end
 
 -- Makes the local branch of run `id`'s changes; the result is a toast.
@@ -4419,8 +4318,6 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 				end
 			end
 		end
-	elseif act == "task-start" then
-		task_start(st)
 	elseif act == "gen-open" then
 		dlg_open(st, "generate", "")
 	elseif act == "followup-open" and value then
@@ -4663,23 +4560,6 @@ function M.event(st: State, ev: UiEvent)
 				end
 			end
 		end
-	elseif ev.ev == "change" or ev.ev == "toggle" then
-		-- The task box's selects (the editor's own are handled by editor.event above).
-		local id = ev.id or ""
-		if id == TASK_REPO_ID or id == TASK_MODEL_ID or id == TASK_ENV_ID then
-			if ev.ev == "toggle" then
-				st.task.opens[id] = ev.open == true
-			elseif type(ev.value) == "string" and string.sub(ev.value, 1, 1) ~= "\0" then
-				st.task.opens[id] = nil
-				if id == TASK_REPO_ID then
-					st.task.repo = ev.value
-				elseif id == TASK_ENV_ID then
-					st.task.env = ev.value
-				else
-					st.task.model = ev.value
-				end
-			end
-		end
 	elseif ev.ev == "action" then
 		local act = ev.act
 		if type(act) == "string" then
@@ -4702,15 +4582,11 @@ function M.event(st: State, ev: UiEvent)
 				st.form.focus = i
 				focus_form(st)
 			end
-		elseif ev.id == TASK_ID then
-			st.task.focus = true
-			st.cx:frame({ pair("focus", TASK_ID) })
 		elseif string.match(ev.id or "", "github%.page%.app%.org%.input$") then
 			st.app_focus = true
 			st.cx:frame({ pair("focus", ev.id) })
 		else
 			st.app_focus = false
-			st.task.focus = false
 			for fname, id in FP_IDS do
 				if st.tab == "files" and ev.id == id then
 					fp_focus(st, fname)
@@ -4742,8 +4618,6 @@ function M.event(st: State, ev: UiEvent)
 			if id == IMP_PATH_ID and field.edit(imp.path, ev) then
 				imp.plan, imp.error = nil, nil
 			end
-		elseif id == TASK_ID and st.tab == "overview" then
-			field.edit(st.task.text, ev)
 		elseif st.tab == "files" and st.fp.focus and id == FP_IDS[st.fp.focus] then
 			field.edit(st.fp.fields[st.fp.focus], ev)
 		elseif st.app_org and string.match(id, "github%.page%.app%.org%.input$") then
@@ -4808,17 +4682,6 @@ function M.key(st: State, key: Key): boolean?
 			return true
 		end
 		return false
-	end
-	if st.tab == "overview" and st.task.focus then
-		if key.name == "escape" then
-			st.task.focus = false
-			st.cx:frame({ pair("focus", tern.json.null) })
-			return true
-		elseif key.name == "enter" and (key.meta or key.ctrl) then
-			task_start(st)
-			return true
-		end
-		return field.key(st.task.text, key)
 	end
 	local f = st.form
 	if f then

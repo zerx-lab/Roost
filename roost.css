@@ -7,7 +7,6 @@
  *   [data-role='roost.header']               title row with live badges and tools
  *   [data-role='roost.tabs']                 page tabs
  *   [data-role='roost.home']                 home page (what needs attention, what runs, what is due)
- *   [data-role='roost.composer']             home page: the task box (text, repository, model, start)
  *   [data-role='roost.inbox']                home page: what workflows reported; each row is [data-role='roost.inboxitem']
  *   [data-role='roost.diff']                 a run's diff overlay
  *   [data-role='roost.runs']                 runs page (split: list | detail)

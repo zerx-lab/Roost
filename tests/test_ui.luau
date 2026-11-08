@@ -1210,24 +1210,24 @@ do -- an unreadable groups.json is reported and never overwritten
 	eq(w.env.files[DATA .. "/groups.json"], "{broken", "the file is untouched")
 end
 
-do -- home: the task box starts a task; a finished run shows its answer and changes; 追问 continues it; the inbox acts
+do -- home: a finished run shows its answer and changes; 追问 continues it; the inbox acts
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
-	local TASK = "main.body.overview.task.input"
 	view(w)
-	w.ui.event(w.st, { ev = "change", id = "main.body.overview.task.bar.opts.repo", value = "acme/web" })
-	eq(w.st.task.repo, "acme/web")
-	w.ui.event(w.st, { ev = "focus", id = TASK })
-	eq(press(w, "1", "1"), true, "digits type while the box has the keys")
-	eq(w.st.tab, "overview", "and don't switch pages")
-	press(w, "enter")
-	press(w, "x", "x")
-	eq(w.st.task.text.text, "1\nx", "Enter is a new line")
-	eq(press(w, "enter", nil, { meta = true }), true, "⌘↵ starts it")
-	eq(w.st.tab, "runs", "the run opens")
-	local run = w.c.store.by_id[w.st.run_id]
-	truthy(run and run.task and run.task.kind == "task", "a task run")
+	-- A built-in task run, as core's submit_task makes one.
+	local tasks = require("../lib/tasks")
+	local repo = w.c.workflows and w.c.workflows.repos["acme/web"]
+	local task: any = { kind = "task", prompt = "1\nx", workspace = if repo and repo.path then "worktree" else "temp" }
+	local created = require("../lib/runner").submit(w.c.runner, tasks.workflow(tasks.new_id(), task, "acme/web"), {
+		trigger = { kind = "task", detail = "首页" },
+		repo = "acme/web",
+		inputs = {},
+		task = task,
+	})
+	truthy(created, "a task run")
+	local run: any = created
+	w.st.tab, w.st.run_id = "runs", run.id
+	eq(run.task.kind, "task")
 	eq(run.repo, "acme/web")
-	eq(w.st.task.text.text, "", "the box empties")
 
 	-- Pretend it finished with an answer, changes and a conversation to continue.
 	local d = `{DATA}/runs/{run.id}`

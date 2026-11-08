@@ -1486,8 +1486,6 @@ end
 -- ---------------------------------------------------------------------------------------------
 -- Built-in runs (lib/tasks.luau): tasks, follow-ups, a run's changes as a branch or a PR
 
-export type TaskSpec = { prompt: string, repo: string?, model: string?, environment: string? }
-
 local function submit_task(c: Core, task: store.Task, req: runner.Request): (string?, string?)
 	local blocked = M.run_block(c)
 	if blocked then
@@ -1506,41 +1504,6 @@ local function task_text(text: string): (string?, string?)
 		return nil, `内容太长(上限 {tasks.MAX_PROMPT // 1024} KiB)`
 	end
 	return t, nil
-end
-
--- Starts a task: one omp step, in a worktree of `repo` when it has a checkout (never in the
--- checkout itself), else in an empty directory. Returns the run's id, or why not.
-function M.start_task(c: Core, spec: TaskSpec): (string?, string?)
-	local text, why = task_text(spec.prompt)
-	if not text then
-		return nil, why
-	end
-	local repo = spec.repo
-	local r: model.Repo? = nil
-	if repo then
-		local w = c.workflows
-		r = if w then w.repos[repo] else nil
-		if r == nil then
-			return nil, `workflows.toml 里没有仓库 {repo}`
-		end
-	end
-	local model_ = if spec.model and spec.model ~= "" then spec.model else nil
-	local env = if spec.environment and spec.environment ~= "" then spec.environment else nil
-	if env and c.config.environments[env] == nil then
-		return nil, `roost.toml 中没有环境「{env}」`
-	end
-	return submit_task(c, {
-		kind = "task",
-		prompt = text :: string,
-		model = model_,
-		workspace = if r and r.path then "worktree" else "temp",
-		environment = env,
-	}, {
-		trigger = { kind = "task", detail = "首页" },
-		repo = repo,
-		ref = if r then r.branch else nil,
-		inputs = {},
-	})
 end
 
 -- The omp step a follow-up of `run` continues: its last one that ran as an agent and left a session.
