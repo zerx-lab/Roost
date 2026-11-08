@@ -833,7 +833,36 @@ do -- export copies the path; import previews and brings the workflow back disab
 	truthy(string.find(F.text(view(u).layer), "无法读取", 1, true), "preview error shown")
 end
 
-do -- storage lists the new areas and clears exports with two clicks
+-- Node id → node for a view region (ids join the keys from the region root: `main.body.x.y`).
+local function ids_of(root: any): { [string]: any }
+	local out: { [string]: any } = {}
+	local function go(n: any, id: string)
+		out[id] = n
+		for i, ch in n.c or {} do
+			local key = if ch.p and ch.p.key then ch.p.key else tostring(i - 1)
+			go(ch, `{id}.{key}`)
+		end
+	end
+	go(root, "main")
+	return out
+end
+
+-- Every card of a view that names a head control (`end`) must name a real node, keyed `end`.
+local function head_controls(main: any, what: string): number
+	local ids = ids_of(main)
+	local n = 0
+	F.walk(main, function(x)
+		if x.k == "card" and x.p and x.p["end"] then
+			n += 1
+			local target = ids[x.p["end"]]
+			truthy(target, `{what}: the card {x.p.key} names {x.p["end"]}, which is not a node`)
+			eq(target.p.key, "end", `{what}: {x.p.key}'s head control is keyed end`)
+		end
+	end)
+	return n
+end
+
+do -- storage shows the areas as number tiles and clears exports with two clicks
 	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
 	act(w, "export-all")
 	eq(#w.c.store.runs, 0)
@@ -844,12 +873,98 @@ do -- storage lists the new areas and clears exports with two clicks
 			for _, item in x.p.items do
 				labels ..= tostring(item[1] or item.k) .. "|"
 			end
+		elseif x.k == "stats" and x.p and x.p.items then
+			for _, item in x.p.items do
+				labels ..= tostring(item.label) .. "|"
+			end
 		end
 	end)
-	truthy(string.find(labels, "导出文件", 1, true) and string.find(labels, "脚本与文件", 1, true) and string.find(labels, "状态目录", 1, true), "storage rows: " .. labels)
+	for _, label in { "运行", "事件记录", "导出文件", "脚本与文件", "状态目录", "上次自动清理" } do
+		truthy(string.find(labels, label, 1, true), `storage shows {label}: {labels}`)
+	end
+	-- The tiles are on the page, never inside a card.
+	local in_card = false
+	F.walk(view(w).main, function(x)
+		if x.k == "card" then
+			F.walk(x, function(y)
+				if y.k == "stats" then
+					in_card = true
+				end
+			end)
+		end
+	end)
+	eq(in_card, false, "stats are not inside a card")
+	truthy(head_controls(view(w).main, "storage") >= 1, "the refresh control is a head control")
+	-- The cleanup group and the deletions are separate cards; the deletions stay two-click.
+	local ids = ids_of(view(w).main)
+	truthy(ids["main.body.storage.page.main.right.cleanup"], "cleanup card")
+	local wipe = ids["main.body.storage.page.main.right.wipe"]
+	truthy(wipe, "deletions card")
+	local acts = {}
+	F.walk(wipe, function(x)
+		if x.k == "button" and x.p and x.p.actions then
+			table.insert(acts, x.p.actions.click)
+		end
+	end)
+	eq(table.concat(acts, ","), "confirm=clear-runs,confirm=clear-events,confirm=clear-exports")
 	confirm_click(w, "clear-exports")
 	w.env.advance(200)
 	eq(#w.core.exports(w.c), 0, "exports cleared")
+end
+
+do -- the general page: both config files side by side with their status and Edit at the head's end
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = LOCAL })
+	as_settings(w, "config")
+	local main = view(w).main
+	truthy(head_controls(main, "config") >= 4, "files, environments and theme cards have head controls")
+	local ids = ids_of(main)
+	local pair = ids["main.body.config.page.files"]
+	eq(#pair.c, 2, "two config cards in one row")
+	eq(pair.p.wrap, true, "the row wraps when narrow")
+	for _, key in { "config", "workflows" } do
+		local card = ids[`main.body.config.page.files.{key}`]
+		eq(card.p.basis, 0.49, "wide pane: half each") -- the world's pane is wide
+		local acts = ""
+		F.walk(card, function(x)
+			if x.k == "button" and x.p and x.p.actions then
+				acts ..= x.p.actions.click .. ";"
+			end
+		end)
+		eq(acts, `open={key};`)
+	end
+	truthy(string.find(F.text(main), "已加载 2 个工作流", 1, true), "the workflows status stays: " .. F.text(main))
+	w.st.cols = 80
+	eq(ids_of(view(w).main)["main.body.config.page.files.config"].p.basis, 1, "narrow pane: one column")
+end
+
+do -- the GitHub page: identity apart from actions, forgetting credentials apart from both
+	local w = world({ [DATA .. "/workflows.toml"] = WORKFLOWS, [DATA .. "/roost.toml"] = ROOST })
+	w.c.relay.state.configured = true
+	w.c.relay.state.agent = { github = { app = { name = "Roost", slug = "roost", owner = "zero", owner_type = "User", installations = 1, missing = { "issues:write" } } } }
+	as_settings(w, "github")
+	local main = view(w).main
+	truthy(head_controls(main, "github") >= 1, "the installed badge is a head control")
+	local ids = ids_of(main)
+	local base = "main.body.github.page.main.right"
+	local function actions(id: string): string
+		local out = ""
+		F.walk(ids[id], function(x)
+			if x.k == "button" and x.p and x.p.actions then
+				out ..= x.p.actions.click .. ";"
+			end
+		end)
+		return out
+	end
+	eq(actions(base .. ".manage"), "app-install;app-manage;app-permissions;app-logo;")
+	eq(actions(base .. ".danger"), "confirm=forget-app;")
+	truthy(ids["main.body.github.page.missing"], "ungranted permissions get their own card")
+	truthy(string.find(F.text(main), "issues:write", 1, true), "and name the permission")
+	-- Before an App exists the org input keeps the id the key handler routes typing by.
+	w.c.relay.state.agent = { github = {} }
+	local input = ids_of(view(w).main)["main.body.github.page.app.org.input"]
+	truthy(input and input.k == "input", "the org input sits at github.page.app.org.input")
+	w.ui.event(w.st, { ev = "focus", id = "main.body.github.page.app.org.input" })
+	truthy(w.st.app_focus, "focusing it arms typing")
 end
 
 do -- overview lists evolver revisions and a self-upgrade; only a watching one rolls back

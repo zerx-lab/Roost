@@ -227,7 +227,7 @@ local SYNC_LABEL: { [string]: string } = {
 	invalid = "被拒绝",
 	offline = "推送失败",
 	unconfigured = "未配置",
-	observer = "由执行者推送",
+	behind = "等待配置同步",
 }
 local SYNC_TONE: { [string]: string } = {
 	idle = "muted",
@@ -238,7 +238,7 @@ local SYNC_TONE: { [string]: string } = {
 	invalid = "error",
 	offline = "error",
 	unconfigured = "muted",
-	observer = "muted",
+	behind = "pending",
 }
 
 
@@ -336,16 +336,27 @@ local function when_label(w: model.When): string
 	return `条件 {if w.negate then "!" else ""}{w.source}.{w.key}`
 end
 
--- An observer's runs page shows the executor's runs (uploaded through the relay, read-only).
-local function observing(st: State): boolean
-	return core.role(st.core) == "observer"
-end
-
+-- This machine's runs and, with devices sharing the work, the other devices' (uploaded through
+-- the relay, read-only; `device` set), newest first.
 local function source_runs(st: State): { store.Run }
-	if observing(st) then
-		return st.core.dev.remote
+	local mine = store.list(st.core.store, MAX_RUN_ROWS, nil)
+	local others = core.remote_runs(st.core)
+	if #others == 0 then
+		return mine
 	end
-	return store.list(st.core.store, MAX_RUN_ROWS, nil)
+	local out: { store.Run } = {}
+	local i, j = 1, 1
+	while #out < MAX_RUN_ROWS and (i <= #mine or j <= #others) do
+		local a, b = mine[i], others[j]
+		if b == nil or (a ~= nil and a.created_at >= b.created_at) then
+			table.insert(out, a)
+			i += 1
+		else
+			table.insert(out, b)
+			j += 1
+		end
+	end
+	return out
 end
 
 local function runs_list(st: State): { store.Run }
@@ -368,15 +379,16 @@ local function selected_run(st: State): store.Run?
 	if not st.run_id then
 		return nil
 	end
-	if observing(st) then
-		for _, r in st.core.dev.remote do
-			if r.id == st.run_id then
-				return r
-			end
-		end
-		return nil
+	local own = st.core.store.by_id[st.run_id]
+	if own then
+		return own
 	end
-	return st.core.store.by_id[st.run_id]
+	for _, r in core.remote_runs(st.core) do
+		if r.id == st.run_id then
+			return r
+		end
+	end
+	return nil
 end
 
 local function run_dir(st: State, id: string): string
@@ -693,12 +705,21 @@ local function header(st: State): Node
 		local badge = if rs.waiting then ui.badge("中继等待配置", "warning") else ui.badge("中继断开", "error")
 		table.insert(badges, keyed(with(badge, { actions = { click = "settings=relay" } }), "relay"))
 	end
-	local role = core.role(c)
 	if core.fleet_error(c) then
 		table.insert(badges, keyed(with(ui.badge("中继设备记录损坏 · 暂停运行", "warning"), { actions = { click = "settings=relay" } }), "role"))
-	elseif role ~= "solo" then
-		local who = if role == "executor" then "本机是执行者" else `观察者 · 执行者「{fleet.label(core.executor(c))}」`
-		table.insert(badges, keyed(with(ui.badge(who, if role == "executor" then "accent" else "muted"), { actions = { click = "settings=relay" } }), "role"))
+	elseif core.shared(c) and c.workflows then
+		local here = 0
+		for _, wf in c.workflows.list do
+			local _, mine = core.owner(c, wf.id)
+			if mine then
+				here += 1
+			end
+		end
+		local label = `本机运行 {here}/{#c.workflows.list} 个工作流`
+		table.insert(badges, keyed(with(ui.badge(label, if here > 0 then "accent" else "muted"), {
+			actions = { click = "settings=relay" },
+			title = "各工作流由哪台设备运行:设置 › 中继与设备",
+		}), "role"))
 	end
 	local issues = #c.config_issues + #c.workflow_issues
 	if issues > 0 and not settings then
@@ -740,26 +761,31 @@ local function cost_cell(r: store.Run): string
 	return if tokens ~= nil and tokens > 0 then fmt_usd(cost or 0) else ""
 end
 
-local function run_row(r: store.Run, t: number, remote: boolean?): any
+-- `device`: the device column's text (shown only while devices share the work).
+local function run_row(r: store.Run, t: number, device: string?): any
 	local trig = r.trigger.kind
 	local subject = run_subject(r)
 	local name: { any } = { ui.span(r.workflow_name) }
 	if subject then
 		table.insert(name, ui.span(`  {subject}`, "muted"))
 	end
+	local cells = list_of(
+		{ text = STATE_LABEL[r.state] or r.state, dot = STATE_TONE[r.state] or "muted" },
+		r.id,
+		{ text = name },
+		{ text = TRIGGER_LABEL[trig] or trig, icon = TRIGGER_ICON[trig] or "dot" },
+		cost_cell(r),
+		util.ago(r.created_at, t),
+		duration(r.started_at, r.finished_at)
+	)
+	if device then
+		table.insert(cells, 4, { text = device, icon = if r.device then "server" else "monitor" })
+	end
 	return {
 		id = r.id,
-		cells = list_of(
-			{ text = STATE_LABEL[r.state] or r.state, dot = STATE_TONE[r.state] or "muted" },
-			r.id,
-			{ text = name },
-			{ text = TRIGGER_LABEL[trig] or trig, icon = TRIGGER_ICON[trig] or "dot" },
-			cost_cell(r),
-			util.ago(r.created_at, t),
-			duration(r.started_at, r.finished_at)
-		),
+		cells = cells,
 		title = `运行 {r.id}`,
-		menu = if remote
+		menu = if r.device
 			then { "copy-id" }
 			elseif r.state == "queued" or r.state == "running" then { "cancel", "open-log", "copy-id" }
 			else { "rerun", "open-log", "copy-id" },
@@ -774,6 +800,17 @@ local RUN_COLS: { Col } = {
 	{ id = "run", head = "运行", grow = 1, truncate = "end", priority = 9 },
 	{ id = "trigger", head = "触发", priority = 3 },
 	-- Agent runs only; it gives way before the creation time does.
+	{ id = "cost", head = "费用", align = "end", mono = true, priority = 5 },
+	{ id = "at", head = "创建", align = "end", priority = 6 },
+	{ id = "took", head = "耗时", align = "end", mono = true, priority = 7 },
+}
+-- The same with the device that ran each run, while devices share the work.
+local RUN_COLS_DEVICES: { Col } = {
+	{ id = "state", head = "状态", priority = 8 },
+	{ id = "id", head = "ID", mono = true, priority = 4 },
+	{ id = "run", head = "运行", grow = 1, truncate = "end", priority = 9 },
+	{ id = "device", head = "设备", truncate = "end", priority = 2 },
+	{ id = "trigger", head = "触发", priority = 3 },
 	{ id = "cost", head = "费用", align = "end", mono = true, priority = 5 },
 	{ id = "at", head = "创建", align = "end", priority = 6 },
 	{ id = "took", head = "耗时", align = "end", mono = true, priority = 7 },
@@ -857,7 +894,7 @@ local function attention(st: State, t: number): { Node }
 		add("set_config", `{issues} 个配置错误`, "roost.toml 或 workflows.toml 校验失败,改好之前沿用上一份有效配置", "warn", "error")
 	end
 	if core.fleet_error(c) then
-		add("set_relay", "中继的设备记录读不出", "重新指定执行者之前,任何设备都不运行", "warn", "error")
+		add("set_relay", "中继的设备记录读不出", "重新指定默认设备之前,任何设备都不运行", "warn", "error")
 	end
 	local rs = c.relay.state
 	if rs.configured and not rs.connected and not rs.waiting then
@@ -875,7 +912,7 @@ local function attention(st: State, t: number): { Node }
 		add("set_github", "GitHub App 权限尚未生效", table.concat(info.missing, " "), "plug", "warning")
 	end
 	local w = c.workflows
-	if w and not observing(st) then
+	if w then
 		local latest = store.latest(c.store)
 		local shown = 0
 		for _, wf in w.list do
@@ -894,7 +931,7 @@ local function attention(st: State, t: number): { Node }
 	return out
 end
 
--- Queued and running runs (the executor's on an observer), newest first.
+-- Queued and running runs (other devices' too), newest first.
 local function active_items(st: State, t: number): { Node }
 	local out: { Node } = {}
 	for _, r in source_runs(st) do
@@ -1116,7 +1153,7 @@ end
 -- The latest tasks and follow-ups typed here, newest first.
 local function recent_tasks(st: State, t: number): { Node }
 	local out: { Node } = {}
-	local runs = source_runs(st)
+	local runs = store.list(st.core.store, MAX_RUN_ROWS, nil)
 	for i = #runs, 1, -1 do
 		local r = runs[i]
 		if r.task and r.task.kind == "task" then
@@ -1743,19 +1780,20 @@ local function run_detail(st: State, r: store.Run, fill: boolean): Node
 	return N("col", { key = "run", role = "roost.run", gap = "md" }, body)
 end
 
--- A run of the executor's, on an observer: what it uploaded (facts, steps, the log's last bytes);
--- nothing here acts on it.
+-- A run another device ran: what it uploaded (facts, steps, the log's last bytes); nothing here
+-- acts on it.
 local function remote_detail(st: State, r: store.Run, fill: boolean): Node
 	local t = now()
 	local facts, fact_rows = run_facts(r, t)
-	local tail = st.core.dev.remote_tails[r.id]
+	local tail = core.remote_tail(st.core, r)
+	local who = core.device_name(st.core, r.device or "?")
 	local frame: { [string]: any } = { key = "term" }
 	local p: { [string]: any } = { key = "log", role = "roost.log", stick = "end" }
 	if not fill then
 		p.max = { h = `{math.max(8, pane_lines(st) - 9 - fact_rows - math.ceil(#r.steps * 1.3))}lines` }
 	end
 	local text = if tail == nil
-		then "(执行者只上传最近 20 条运行的日志结尾)"
+		then "(设备只上传最近 20 条运行的日志结尾)"
 		elseif tail == "" then "(还没有输出)"
 		else tail
 	local subject = run_subject(r)
@@ -1772,7 +1810,7 @@ local function remote_detail(st: State, r: store.Run, fill: boolean): Node
 		steps_table(r, t),
 		N("row", { key = "tools", gap = "sm", align = "center" }, {
 			btn("复制 ID", `copy-id={r.id}`, { icon = "copy", variant = "quiet", key = "copy-id", title = `复制运行 ID {r.id}` }),
-			keyed(muted("在执行者上运行;取消、重跑与完整日志在执行者的 Roost 里"), "where"),
+			keyed(muted(`在「{who}」上运行;取消、重跑与完整日志在那台设备的 Roost 里`), "where"),
 		}),
 		keyed(ui.rule(`日志结尾(最多 {fleet.TAIL_BYTES // 1024} KiB)`), "rule"),
 		N("scroll", p, { N("col", frame, { N("ansi", { key = "text", text = text }) }) }),
@@ -1781,11 +1819,11 @@ end
 
 local function runs_tab(st: State): Node
 	local t = now()
-	local remote = observing(st)
+	local shared = core.shared(st.core) and #core.remote_runs(st.core) > 0
 	local rows = {}
 	local list = runs_list(st)
 	for _, r in list do
-		table.insert(rows, run_row(r, t, remote))
+		table.insert(rows, run_row(r, t, if shared then (if r.device then core.device_name(st.core, r.device) else "本机") else nil))
 	end
 	local running, failed = 0, 0
 	for _, r in source_runs(st) do
@@ -1796,10 +1834,9 @@ local function runs_tab(st: State): Node
 		end
 	end
 	local count: { any } = { ui.span(`{#list} 条运行`, "muted") }
-	if remote then
+	if shared then
 		local d = st.core.dev
-		local who = fleet.label(core.executor(st.core))
-		table.insert(count, ui.span(`  执行者「{who}」的运行{if d.remote_at then " · " .. util.ago(d.remote_at, t) .. "更新" else ""}`, "muted"))
+		table.insert(count, ui.span(`  含其他设备上传的运行`, "muted"))
 		if d.remote_err then
 			table.insert(count, ui.span(`  {d.remote_err}`, "warning"))
 		end
@@ -1826,20 +1863,20 @@ local function runs_tab(st: State): Node
 		}),
 		N("scroll", lp, {
 			keyed(
-				ui.table(RUN_COLS, rows :: any, { selectable = true, selected = st.run_id, empty = "没有符合条件的运行" }),
+				ui.table(if shared then RUN_COLS_DEVICES else RUN_COLS, rows :: any, { selectable = true, selected = st.run_id, empty = "没有符合条件的运行" }),
 				"runs"
 			),
 		}),
 	})
 	local r = selected_run(st)
-	local right = if r and remote
+	local right = if r and r.device
 		then remote_detail(st, r, fill)
 		elseif r then run_detail(st, r, fill)
 		else N("empty", {
 			key = "run",
 			icon = "activity",
 			title = "选择一条运行",
-			text = if remote then "j / k 选择;这些运行在执行者上,本机只读" else "j / k 选择,c 取消,r 重跑",
+			text = if shared then "j / k 选择,c 取消,r 重跑(其他设备的运行只读)" else "j / k 选择,c 取消,r 重跑",
 		})
 	if not fill then
 		return N("col", { key = "runs", role = "roost.runs", gap = "lg" }, { left, right })
@@ -1933,6 +1970,48 @@ local function group_menu(g: groups.Groups, wf: string): Node
 	})
 end
 
+-- Where a workflow runs, for people: this machine, another device, or every device.
+local function owner_label(c: core.Core, wf: string): string
+	local owner, mine = core.owner(c, wf)
+	return if owner == nil then "每台设备" elseif mine then "本机" else core.device_name(c, owner)
+end
+
+-- The card's "设备" menu (with a relay): which device runs this workflow, its own choice or the
+-- default device. Picking one goes to the relay (`dev:<workflow>:<device>`; empty: the default).
+local function device_menu(c: core.Core, wf: string): Node?
+	if not c.relay.state.configured then
+		return nil
+	end
+	local own = core.assigned(c, wf)
+	local def = core.default_device(c)
+	local items: { any } = { { header = "由哪台设备运行" } }
+	table.insert(items, {
+		id = `dev:{wf}:`,
+		label = if def then `跟随默认设备「{fleet.label(def)}」` else "跟随默认设备(未指定:每台设备都运行)",
+		radio = "device",
+		checked = own == nil,
+	})
+	for _, d in core.devices(c) do
+		table.insert(items, {
+			id = `dev:{wf}:{d.id}`,
+			label = `{d.name or d.id}{if d.me then "(本机)" else ""}`,
+			radio = "device",
+			checked = own == d.id,
+		})
+	end
+	local broken = core.fleet_error(c)
+	return N("menu", {
+		key = "device",
+		text = owner_label(c, wf),
+		icon = "server",
+		trigger = "quiet",
+		size = "sm",
+		align = "end",
+		title = if broken then "中继读不出设备记录,先在设置里重新指定默认设备" else "由哪台设备运行",
+		items = items,
+	})
+end
+
 -- One workflow as a card among its siblings: what fires it, where, its steps, then how it has
 -- been doing (the last run, the rate, a strip of recent runs colored by outcome). `path`: the id
 -- of the row the card sits in (the head's controls are named by id).
@@ -1984,18 +2063,22 @@ local function workflow_card(
 	if nxt then
 		table.insert(items, pair("下次", { ui.span(util.clock(nxt), "mono"), ui.span(`  {util.until_(nxt, t)}`, "muted") }))
 	end
-	local body: { Node } = {
-		N("row", { key = "end", gap = "sm", align = "center" }, {
-			group_menu(c.groups, wf.id),
-			btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }),
-			btn("导出", `export={wf.id}`, { variant = "quiet", icon = "file-code", key = "export", title = "导出这个工作流(含脚本文件)到 exports 目录" }),
-			btn("运行", `dispatch={wf.id}`, {
-				icon = "play",
-				key = "run",
-				disabled = core.run_block(c) or (if not wf.manual then "manual = false:只允许自动触发" else false),
-			}),
-		}),
-	}
+	local head: { Node } = {}
+	local dm = device_menu(c, wf.id)
+	if dm then
+		table.insert(head, dm)
+	end
+	table.insert(head, group_menu(c.groups, wf.id))
+	table.insert(head, btn("编辑", `edit={wf.id}`, { variant = "quiet", icon = "pen", key = "edit" }))
+	table.insert(head, btn("导出", `export={wf.id}`, { variant = "quiet", icon = "file-code", key = "export", title = "导出这个工作流(含脚本文件)到 exports 目录" }))
+	local _, mine = core.owner(c, wf.id)
+	table.insert(head, btn("运行", `dispatch={wf.id}`, {
+		icon = "play",
+		key = "run",
+		title = if mine then nil else `交给「{owner_label(c, wf.id)}」运行`,
+		disabled = core.run_block(c) or (if not wf.manual then "manual = false:只允许自动触发" else false),
+	}))
+	local body: { Node } = { N("row", { key = "end", gap = "sm", align = "center" }, head) }
 	local desc: Node
 	if wf.description then
 		local full = wf.description
@@ -2073,20 +2156,18 @@ local function workflows_toolbar(st: State, count: string?): Node
 	})
 end
 
--- On an observer: says the page mirrors the executor (shown above workflows and files).
-local function observer_note(st: State): Node?
+-- Above workflows and files: why the shared configuration can't be edited, or why it didn't
+-- sync last time (edits here still go to the other devices once it does).
+local function sync_note(st: State): Node?
 	local blocked = core.config_block(st.core)
-	if blocked == nil then
-		return nil
+	if blocked then
+		return N("empty", { key = "sync", variant = "inline", tone = "error", icon = "server", title = "暂停修改", text = blocked })
 	end
-	local d = st.core.dev
-	local text = blocked
-	if d.mirror_err then
-		text ..= `。上次同步失败:{d.mirror_err}`
-	elseif d.mirror_at then
-		text ..= `。{util.ago(d.mirror_at, now())}同步`
+	local err = st.core.dev.cfg_err
+	if err and core.shared(st.core) then
+		return N("empty", { key = "sync", variant = "inline", tone = "warning", icon = "server", title = "配置没有同步", text = `{err}(设置 › 中继与设备)` })
 	end
-	return N("empty", { key = "observer", variant = "inline", icon = "server", title = "本机是观察者", text = text })
+	return nil
 end
 
 local function workflows_tab(st: State): Node
@@ -2131,7 +2212,7 @@ local function workflows_tab(st: State): Node
 	end
 	local count = `{#w.list} 个工作流{if off > 0 then ` · {off} 个已停用` else ""}`
 	local children: { Node } = { workflows_toolbar(st, count) }
-	local note = observer_note(st)
+	local note = sync_note(st)
 	if note then
 		table.insert(children, note)
 	end
@@ -2413,7 +2494,7 @@ local function files_tab(st: State): Node
 		}),
 		ui.card("文件库", lib_rows, { key = "libs", icon = "folder-open" }),
 	}
-	local note = observer_note(st)
+	local note = sync_note(st)
 	if note then
 		table.insert(children, 2, note)
 	end
@@ -2612,6 +2693,90 @@ local function events_tab(st: State): Node
 end
 
 -- ---------------------------------------------------------------------------------------------
+-- Settings pages: the shared pieces. Every page is built from these so the four read alike.
+--
+--   settings_page(key, role, children)                       the page root (M.view turns it into a scroll) over one width-capped column
+--   settings_at(key): string                                 node id of that column: the `parent` of what sits directly in it
+--   settings_card(parent, key, title, icon, body, opts?)     a card; opts.head are the controls at the head's end
+--   settings_pair(st, key, left, right)                      two columns when the pane is wide, stacked when narrow
+--   settings_stack(key, cards)                               several cards stacked in one column of a pair
+--   kv_block(key, items) / note_text(key, text) / path_line(path) / btn_row(key, buttons) / btn_group(key, label, buttons)
+--
+-- A card's head controls are drawn by the card at its end and named by the child's full node id
+-- (`end`), so every card needs the id of whatever holds it: `parent`. Page → `settings_at(key)`;
+-- a row (pair) in it → `<that>.<pair key>`; a stack in the pair → `<that>.<stack key>`.
+
+local SETTINGS_MAX = "170ch" -- the widest a settings page grows; wider panes keep readable lines
+local PAIR_WIDE_COLS = 100 -- pane width (cells) from which a pair sits side by side
+local PAIR_MIN = "46ch" -- a column of a pair is never narrower: below twice this it wraps under the first
+
+type SettingsCardOpts = { head: { Node }?, meta: string?, tone: string?, role: string? }
+
+local function settings_page(key: string, role: string, children: { Node }): Node
+	return N("col", { key = key, role = role, gap = "md" }, {
+		N("col", { key = "page", role = "roost.page", gap = "md", max = { w = SETTINGS_MAX } }, children),
+	})
+end
+
+local function settings_at(key: string): string
+	return `main.body.{key}.page`
+end
+
+local function settings_card(parent: string, key: string, title: string, icon: string, body: { Node }, opts: SettingsCardOpts?): Node
+	local o: SettingsCardOpts = opts or {}
+	local kids: { Node } = {}
+	local p: { [string]: any } = { key = key, icon = icon, meta = o.meta, tone = o.tone, role = o.role }
+	local head = o.head
+	if head and #head > 0 then
+		table.insert(kids, N("row", { key = "end", gap = "sm", align = "center" }, head))
+		p["end"] = `{parent}.{key}.end`
+	end
+	for _, n in body do
+		table.insert(kids, n)
+	end
+	return ui.card({ ui.span(title, "strong") }, kids, p)
+end
+
+-- Two cards (or stacks) side by side, each half the page; narrow panes put them under each other.
+-- The row stretches direct children to one height; a stack keeps its cards' own.
+local function settings_pair(st: State, key: string, left: Node, right: Node): Node
+	local basis = if st.cols >= PAIR_WIDE_COLS then 0.49 else 1
+	local function side(n: Node): Node
+		return with(n, { grow = 1, basis = basis, min = { w = PAIR_MIN } })
+	end
+	return N("row", { key = key, role = "roost.pair", gap = "md", wrap = true, align = "stretch" }, { side(left), side(right) })
+end
+
+local function settings_stack(key: string, cards: { Node }): Node
+	return N("col", { key = key, gap = "md" }, cards)
+end
+
+-- Aligned label/value rows (values may be spans); keys come out muted in one column.
+local function kv_block(key: string, items: { { any } }): Node
+	return keyed(ui.kv(items :: any), key)
+end
+
+-- Muted explanatory text capped at a readable line length.
+local function note_text(key: string, text: string): Node
+	return N("text", { key = key, spans = { ui.span(text, "muted") }, max = { w = "72ch" } })
+end
+
+-- A path on one line, cut in the middle when it does not fit; the tooltip has all of it.
+local function path_line(path: string): Node
+	return N("text", { spans = { ui.path(path) }, lines = 1, title = path })
+end
+
+-- Buttons in a row (gap sm, wrapping).
+local function btn_row(key: string, buttons: { Node }): Node
+	return N("row", { key = key, gap = "sm", align = "center", wrap = true }, buttons)
+end
+
+-- A labelled group of buttons: a rule with the label, then the row.
+local function btn_group(key: string, label: string, buttons: { Node }): Node
+	return N("col", { key = key, gap = "sm" }, { keyed(ui.rule(label), "label"), btn_row("buttons", buttons) })
+end
+
+-- ---------------------------------------------------------------------------------------------
 -- Relay
 
 local function manual_subs_text(st: State): string?
@@ -2743,102 +2908,152 @@ local function deliveries_view(st: State, t: number): Node
 	return N("col", { key = "deliveries", role = "roost.deliveries", gap = "sm" }, out)
 end
 
--- Devices on this relay: which one runs (the executor) and which only watch; the executor is
--- picked here (two clicks). Below, what this machine syncs in its role.
-local function devices_card(st: State, t: number): Node
+-- Devices on this relay: which is the default one (runs every workflow without a device of its
+-- own), what each runs now; the default is picked here (two clicks).
+local function devices_card(st: State, parent: string, t: number): Node
 	local c = st.core
-	local role = core.role(c)
-	local ex = core.executor(c)
-	local d = c.dev
+	local def = core.default_device(c)
 	local busy = c.relay.state.busy.assign == true
 	local broken = core.fleet_error(c)
 	local body: { Node } = {}
 	if broken then
 		table.insert(
 			body,
-			keyed(ui.text({ ui.span(`中继读不出设备记录({broken}):重新指定一台执行者之前,任何设备都不运行工作流,也不读取新事件。`, "warning") }), "broken")
+			keyed(ui.text({ ui.span(`中继读不出设备记录({broken}):重新指定默认设备之前,任何设备都不运行工作流,也不读取新事件。`, "warning") }), "broken")
 		)
 	else
 		table.insert(
 			body,
-			keyed(
-				muted(
-					if ex == nil
-						then "还没有指定执行者:每台连着中继的设备都会运行工作流,多台同时在线会重复执行。选一台设为执行者,其余设备只观察。"
-						else "只有执行者运行工作流(GitHub 事件、定时、手动)、取得 App 令牌、推送订阅;其余设备是观察者:同步执行者的工作流配置、显示它的运行,不能运行也不能改配置。"
-				),
-				"explain"
+			note_text(
+				"explain",
+				if def == nil
+					then "还没有默认设备:没有单独指定设备的工作流会在每台在线设备上各运行一次。先选一台设为默认设备,再按需给工作流指定设备。"
+					else "默认设备运行所有没单独指定设备的工作流,指定了设备的只在那台上运行。各设备共用一份工作流配置,哪台都能修改;手动运行会交给负责的设备执行。"
 			)
 		)
 	end
+	local devices = core.devices(c)
 	local rows: { Node } = {}
-	for i, dv in core.devices(c) do
+	for i, dv in devices do
 		local spans: { any } = { ui.span(dv.name or dv.id, "strong") }
 		if dv.name then
 			table.insert(spans, ui.span(`  {dv.id}`, "mono muted"))
 		end
-		table.insert(spans, ui.span(if dv.last_seen then `  {util.ago(dv.last_seen, t)}在线` else "  中继重启后还没上线", "muted"))
-		local items: { Node } = { keyed(ui.text(spans), "name") }
+		local items: { Node } = { with(keyed(ui.text(spans), "name"), { grow = 1 }) }
 		if dv.me then
 			table.insert(items, keyed(ui.badge("本机", "accent"), "me"))
 		end
-		if dv.executor then
-			table.insert(items, keyed(ui.badge("执行者", "success"), "role"))
-		elseif ex then
-			table.insert(items, keyed(ui.badge("观察者", "muted"), "role"))
+		if dv.default then
+			table.insert(items, keyed(ui.badge("默认设备", "success"), "default"))
 		end
-		if not dv.executor then
+		table.insert(items, keyed(muted(`运行 {dv.workflows} 个工作流`), "count"))
+		table.insert(items, keyed(muted(if dv.last_seen then `{util.ago(dv.last_seen, t)}在线` else "中继重启后没上线"), "seen"))
+		if dv.default then
 			table.insert(
 				items,
-				confirm_btn(st, "设为执行者", "确认设为执行者", `assign:{dv.id}`, {
+				confirm_btn(st, "取消默认", "确认取消默认", "assign:", {
 					key = "assign",
 					variant = "quiet",
 					busy = busy,
-					title = "它成为唯一运行工作流的设备,从当前执行者处理到的事件之后接着处理;其余设备只观察",
+					title = "取消后,没单独指定设备的工作流会在每台在线设备上各运行一次",
+				})
+			)
+		else
+			table.insert(
+				items,
+				confirm_btn(st, "设为默认", "确认设为默认", `assign:{dv.id}`, {
+					key = "assign",
+					variant = "quiet",
+					busy = busy,
+					title = "它运行所有没单独指定设备的工作流;此后到达的事件按新的分配处理",
 				})
 			)
 		end
 		table.insert(rows, N("row", { key = `d{i}`, gap = "sm", align = "center" }, items))
 	end
-	if #rows == 0 then
-		table.insert(rows, keyed(muted("中继还没收到任何设备的请求"), "none"))
-	end
-	table.insert(body, N("col", { key = "list", gap = "xs" }, rows))
+	table.insert(body, N("col", { key = "list", gap = "sm" }, rows))
 	if c.config.relay.client_name == nil then
-		table.insert(body, keyed(muted("在 roost.toml [relay] 设置 client_name,设备列表会显示这个名字。"), "name-hint"))
+		table.insert(body, note_text("name-hint", "在 roost.toml [relay] 设置 client_name,其他设备会用这个名字称呼本机。"))
 	end
-	local sync: any = {}
-	if broken then
-		-- Nothing is synced until an executor is assigned again.
-	elseif role == "executor" then
-		table.insert(sync, pair("配置", if d.cfg_err
-			then { ui.span(d.cfg_err, "warning") }
-			elseif d.cfg_at then { ui.span(`已上传 · {util.ago(d.cfg_at, t)}`, "muted") }
-			else { ui.span("等待上传", "muted") }))
-		table.insert(sync, pair("运行", if d.runs_err
-			then { ui.span(d.runs_err, "warning") }
-			elseif d.runs_at then { ui.span(`已上传 · {util.ago(d.runs_at, t)}`, "muted") }
-			else { ui.span("等待上传", "muted") }))
-	elseif role == "observer" then
-		table.insert(sync, pair("配置", if d.mirror_err
-			then { ui.span(d.mirror_err, "warning") }
-			elseif d.mirror_busy then { ui.span("同步中…", "muted") }
-			elseif d.mirror_at then { ui.span(`已同步执行者的配置 · {util.ago(d.mirror_at, t)}`, "muted") }
-			else { ui.span("与执行者一致", "muted") }))
-		if #d.mirror_missing > 0 then
-			table.insert(sync, pair("本机路径", {
-				ui.span(`{table.concat(d.mirror_missing, "、")} 在本机没有 path`, "warning"),
-				ui.span("  在 workflows.toml 填上,接任执行者后才会在检出中运行(同步会保留本机路径)", "muted"),
-			}))
+	return settings_card(parent, "devices", "设备", "server", body, {
+		head = { keyed(ui.badge(`{#devices} 台`, "muted"), "count") },
+		tone = if broken then "error" else nil,
+	})
+end
+
+-- Which device runs each workflow: its own choice (the menu), else the default device.
+local function assign_card(st: State, parent: string): Node?
+	local c = st.core
+	local w = c.workflows
+	if w == nil or #w.list == 0 then
+		return nil
+	end
+	local rows: { Node } = {}
+	for _, wf in w.list do
+		local own = core.assigned(c, wf.id)
+		local name: { any } = { ui.span(wf.name, if wf.enabled then nil else "muted") }
+		if not wf.enabled then
+			table.insert(name, ui.span("  已停用", "muted"))
 		end
-		table.insert(sync, pair("运行", if d.remote_err
-			then { ui.span(d.remote_err, "warning") }
-			else { ui.span(`{#d.remote} 条{if d.remote_at then " · " .. util.ago(d.remote_at, t) .. "更新" else ""}`, "muted") }))
+		local items: { Node } = {
+			with(keyed(ui.text(name), "name"), { grow = 1 }),
+			keyed(muted(if own then "单独指定" else "跟随默认"), "how"),
+		}
+		local dm = device_menu(c, wf.id)
+		if dm then
+			table.insert(items, dm)
+		end
+		table.insert(rows, N("row", { key = `w_{wf.id}`, gap = "sm", align = "center" }, items))
 	end
-	if #sync > 0 then
-		table.insert(body, keyed(ui.kv(sync), "sync"))
+	return settings_card(parent, "assign", "工作流由谁运行", "flow", {
+		note_text("explain", "改派从中继此后收到的事件起生效;之前的事件仍由当时负责的设备处理(离线的设备上线后补跑)。"),
+		N("col", { key = "list", gap = "xs" }, rows),
+	})
+end
+
+-- What this machine shares through the relay: the configuration and its runs, and what it gets.
+local function sync_card(st: State, parent: string, t: number): Node
+	local c = st.core
+	local d = c.dev
+	local f = c.relay.state.fleet
+	local meta = if f and type(f.config) == "table" then f.config else nil
+	local items: any = {}
+	local cfg: { any }
+	if d.cfg_err then
+		cfg = { ui.span(d.cfg_err, "warning") }
+	elseif meta and type(meta.revision) == "string" then
+		local who = if type(meta.client) == "string" then core.device_name(c, meta.client) else "?"
+		cfg = {
+			ui.span(`版本 {meta.revision}`, "mono"),
+			ui.span(`  「{who}」{util.ago(util.rfc3339(meta.at), t)}上传`, "muted"),
+		}
+		if core.config_behind(c) then
+			table.insert(cfg, ui.span("  本机待同步", "warning"))
+		end
+	else
+		cfg = { ui.span("中继上还没有,本机连上后上传", "muted") }
 	end
-	return ui.card("设备", body, { key = "devices", icon = "server" })
+	table.insert(items, pair("工作流配置", cfg))
+	table.insert(items, pair("本机同步", if d.cfg_at then `{util.ago(d.cfg_at, t)}` else "还没同步"))
+	if #d.missing > 0 then
+		table.insert(items, pair("本机路径", {
+			ui.span(`{table.concat(d.missing, "、")} 在本机没有 path`, "warning"),
+			ui.span("  在 workflows.toml 填上,交给本机的工作流才会在检出中运行(同步保留本机路径)", "muted"),
+		}))
+	end
+	table.insert(items, pair("本机运行", if d.runs_err
+		then { ui.span(d.runs_err, "warning") }
+		elseif d.runs_at then { ui.span(`已上传 · {util.ago(d.runs_at, t)}`, "muted") }
+		else { ui.span("等待上传", "muted") }))
+	local n, runs = 0, 0
+	for _, rem in d.remote do
+		n += 1
+		runs += #rem.runs
+	end
+	table.insert(items, pair("其他设备", if d.remote_err
+		then { ui.span(d.remote_err, "warning") }
+		else { ui.span(if n > 0 then `{n} 台上传了 {runs} 条运行(见「活动 › 运行」)` else "还没有其他设备上传运行", "muted") }))
+	return settings_card(parent, "sync", "同步", "repeat", { kv_block("kv", items) })
 end
 
 local function relay_tab(st: State): Node
@@ -2854,24 +3069,24 @@ local function relay_tab(st: State): Node
 	end
 	local agent: { [string]: any } = rs.agent or {}
 	local busy = rs.busy
+	local at = settings_at("relay")
+	local top = `{at}.top`
 
 	-- Connection
 	local conn: any = {
 		pair("地址", { ui.span(c.config.relay.url or "—", "mono") }),
-		pair("状态", if rs.connected then { ui.span("已连接", "success") } else { ui.span(rs.error or "未连接", "error") }),
 	}
+	if not rs.connected then
+		table.insert(conn, pair("状态", { ui.span(rs.error or "未连接", "error") }))
+	end
 	if agent.version then
 		local started = util.rfc3339(agent.started_at)
-		table.insert(conn, { "中继", `roost-agent {agent.version} · 启动于 {util.ago(started, t)} · boot {agent.boot_id or "—"}` })
+		table.insert(conn, pair("中继", { ui.span(`roost-agent {agent.version}`, "mono"), ui.span(`  启动于 {util.ago(started, t)} · boot {agent.boot_id or "—"}`, "muted") }))
 	end
-
 	if type(agent.store) == "table" then
-		table.insert(conn, { "事件缓存", `{agent.store.count or 0} 条 · 头 {agent.store.head or 0} · 本机游标 {rs.head or "—"}` })
+		table.insert(conn, pair("事件缓存", { ui.span(`{agent.store.count or 0} 条`), ui.span(`  头 {agent.store.head or 0} · 本机游标 {rs.head or "—"}`, "muted") }))
 	end
-	if type(agent.clients) == "table" and #agent.clients > 0 then
-		table.insert(conn, { "客户端", `{#agent.clients} 台设备(见「设备」)` })
-	end
-	local conn_body: { Node } = { keyed(ui.kv(conn :: any), "kv") }
+	local conn_body: { Node } = { kv_block("kv", conn) }
 	if rs.gap_at then
 		table.insert(conn_body, keyed(ui.text({ ui.span(`{util.ago(rs.gap_at, t)}:有事件在本机读取前已被中继淘汰`, "warning") }), "gap"))
 	end
@@ -2880,8 +3095,19 @@ local function relay_tab(st: State): Node
 	end
 	table.insert(
 		conn_body,
-		N("row", { key = "ops", gap = "sm", align = "center" }, {
+		btn_row("ops", {
+			btn("发送测试事件", "test", { icon = "send", busy = busy.test == true, key = "test" }),
 			btn("重新加载订阅", "reload_remote", { icon = "repeat", busy = busy.reload == true, key = "reload", title = "让中继重新读取服务器上的 subscriptions.toml" }),
+			keyed(muted(if rs.last_test then `测试事件 {util.ago(rs.last_test, t)} 送达` else ""), "last_test"),
+		})
+	)
+	local conn_card = settings_card(`{top}.left`, "conn", "连接", "server", conn_body, {
+		head = { keyed(ui.badge(if rs.connected then "已连接" else "未连接", if rs.connected then "success" else "error"), "state") },
+		tone = if rs.connected then nil else "error",
+	})
+	local maint_card = settings_card(`{top}.left`, "maint", "维护", "wrench", {
+		note_text("note", "重启用于 agent.toml 或二进制更新之后;清空事件缓存会丢掉各设备还没读到的事件。"),
+		btn_row("actions", {
 			btn(if rs.restarting then "重启中…" else "重启中继", "restart_remote", {
 				icon = "power",
 				variant = "danger",
@@ -2889,31 +3115,29 @@ local function relay_tab(st: State): Node
 				key = "restart",
 				title = "agent.toml 或二进制更新后,原地重启服务器上的 roost-agent",
 			}),
-			btn("发送测试事件", "test", { icon = "send", busy = busy.test == true, key = "test" }),
 			confirm_btn(st, "清空中继事件缓存", "确认清空中继缓存", "clear-relay-events", {
 				key = "clear",
 				variant = "quiet",
 				icon = "trash",
 				busy = busy.clear_events == true,
-				title = "删除服务器上为客户端缓存的事件(自动按 agent.toml [store] 的数量/时长/字节上限淘汰);本机还没读到的事件会丢失",
+				title = "删除服务器上为客户端缓存的事件(自动按 agent.toml [store] 的数量/时长/字节上限淘汰);设备还没读到的事件会丢失",
 			}),
-			keyed(muted(if rs.last_test then `测试事件 {util.ago(rs.last_test, t)} 送达` else ""), "last_test"),
-		})
-	)
-	local conn_card = ui.card("连接", conn_body, { key = "conn", icon = "server", tone = if rs.connected then nil else "error" })
+		}),
+	}, { role = "roost.danger" })
 
 	-- Subscriptions
 	local sync = rs.sync
-	local sub_body: { Node } = {
-		N("row", { key = "state", gap = "sm", align = "center" }, {
-			keyed(ui.badge(SYNC_LABEL[sync.state] or sync.state, SYNC_TONE[sync.state] or "muted"), "badge"),
-			keyed(muted(`{if sync.revision then "版本 " .. sync.revision else ""}{if sync.at then " · " .. util.ago(sync.at, t) else ""}`), "meta"),
-		}),
-	}
+	local sub_body: { Node } = {}
+	local meta = `{if sync.revision then "版本 " .. sync.revision else ""}{if sync.at then " · " .. util.ago(sync.at, t) else ""}`
+	if meta ~= "" then
+		table.insert(sub_body, keyed(muted(meta), "meta"))
+	end
 	if sync.state == "idle" and not sync.error then
-		table.insert(sub_body, keyed(muted(if rs.connected then "等待中继状态以核对订阅…" else "连上中继后核对订阅"), "hint"))
+		table.insert(sub_body, note_text("hint", if rs.connected then "等待中继状态以核对订阅…" else "连上中继后核对订阅"))
 	elseif sync.state == "adopted" then
-		table.insert(sub_body, keyed(muted("中继使用服务器上的订阅,与本地工作流不同;修改工作流或点「推送订阅」会改为本地版本"), "hint"))
+		table.insert(sub_body, note_text("hint", "中继使用服务器上的订阅,与本地工作流不同;修改工作流或点「推送订阅」会改为本地版本"))
+	elseif sync.state == "behind" then
+		table.insert(sub_body, note_text("hint", "其他设备改了工作流配置,本机同步之后才会核对订阅"))
 	end
 	if sync.error then
 		table.insert(sub_body, keyed(ui.text({ ui.span(sync.error, "warning") }), "error"))
@@ -2924,14 +3148,14 @@ local function relay_tab(st: State): Node
 			busy = busy.push == true,
 			key = "push",
 			title = "把本地工作流算出的订阅推送到中继",
-			disabled = if core.role(c) == "observer" then "观察者不推送订阅:中继使用执行者的订阅" else false,
+			disabled = if core.config_behind(c) then "本机的工作流配置还没同步到最新,同步后再推送" else false,
 		}),
 	}
 	if sync.state == "conflict" then
 		table.insert(sub_actions, btn("以本地覆盖", "force_push", { variant = "danger", key = "force" }))
 		table.insert(sub_actions, btn("采用云端", "adopt", { key = "adopt", title = "保留服务器上的订阅,直到本地再次修改" }))
 	end
-	table.insert(sub_body, N("row", { key = "actions", gap = "sm" }, sub_actions))
+	table.insert(sub_body, btn_row("actions", sub_actions))
 	if sync.state == "conflict" and sync.remote_text then
 		table.insert(sub_body, keyed(ui.section("服务器上的版本", { ui.code(sync.remote_text, "toml") }), "remote"))
 	end
@@ -2954,14 +3178,20 @@ local function relay_tab(st: State): Node
 			)
 		end
 	end
-	local sub_card = ui.card("事件订阅", sub_body, { key = "subs", icon = "broadcast" })
-
-	return N("col", { key = "relay", role = "roost.relay", gap = "md" }, {
-		conn_card,
-		devices_card(st, t),
-		sub_card,
-		deliveries_view(st, t),
+	local sub_card = settings_card(`{top}.right`, "subs", "事件订阅", "broadcast", sub_body, {
+		head = { keyed(ui.badge(SYNC_LABEL[sync.state] or sync.state, SYNC_TONE[sync.state] or "muted"), "state") },
 	})
+
+	local nodes: { Node } = {
+		settings_pair(st, "top", settings_stack("left", { conn_card, maint_card }), settings_stack("right", { sub_card, sync_card(st, `{top}.right`, t) })),
+		devices_card(st, at, t),
+	}
+	local assign = assign_card(st, at)
+	if assign then
+		table.insert(nodes, assign)
+	end
+	table.insert(nodes, deliveries_view(st, t))
+	return settings_page("relay", "roost.relay", nodes)
 end
 
 -- The GitHub App the relay runs as: created here, then installed and managed on GitHub.
@@ -2976,21 +3206,21 @@ local function github_tab(st: State): Node
 		}, { btn("编辑 roost.toml", "open=config", { variant = "primary", size = "md" }) })
 	end
 	local info = core.app(c)
-	local app_body: { Node } = {}
+	local at = settings_at("github")
 	if info == nil then
-		table.insert(app_body, keyed(muted("中继未连接:连接后可在这里创建 GitHub App"), "state"))
-	elseif not info.configured then
-		table.insert(
-			app_body,
-			keyed(
-				muted("roost-agent 以 GitHub App 接收所装仓库的事件,运行也以它的身份评论、审查与推送(默认分支禁止强推);不需要个人令牌,也不用逐个仓库配置 webhook。"),
-				"explain"
-			)
-		)
+		return settings_page("github", "roost.github", {
+			settings_card(at, "app", "GitHub App", "plug", { keyed(muted("中继未连接:连接后可在这里创建 GitHub App"), "state") }),
+		})
+	end
+	if not info.configured then
 		local org = st.app_org or { text = "", cursor = 0 }
 		st.app_org = org
-		table.insert(
-			app_body,
+		-- The org input's id ends in `.app.org.input` (the event handlers route typing by it).
+		local create = settings_card(at, "app", "GitHub App", "plug", {
+			note_text(
+				"explain",
+				"roost-agent 以 GitHub App 接收所装仓库的事件,运行也以它的身份评论、审查与推送(默认分支禁止强推);不需要个人令牌,也不用逐个仓库配置 webhook。"
+			),
 			N("field", { key = "org", label = "组织", hint = "留空则建在你的个人账号下" }, {
 				N("input", {
 					key = "input",
@@ -2999,13 +3229,42 @@ local function github_tab(st: State): Node
 					placeholder = "my-org",
 					variant = "field",
 				}),
-			})
+			}),
+			btn_row("actions", {
+				btn("创建 GitHub App", "app-create", { key = "create", variant = "primary", icon = "plug", busy = st.app_busy }),
+			}),
+		})
+		return settings_page("github", "roost.github", { with(create, { max = { w = "96ch" } }) })
+	end
+
+	local nodes: { Node } = {}
+	local missing = info.missing
+	if missing and #missing > 0 then
+		table.insert(
+			nodes,
+			settings_card(at, "missing", "权限尚未生效", "warn", {
+				keyed(
+					ui.text({
+						ui.span(table.concat(missing, " "), "mono"),
+						ui.span("。在 App 设置的 Permissions 里开启后,到安装页接受新权限。", "muted"),
+					}),
+					"text"
+				),
+			}, { tone = "warning" })
 		)
-		table.insert(app_body, N("row", { key = "actions", gap = "sm" }, {
-			btn("创建 GitHub App", "app-create", { key = "create", variant = "primary", icon = "plug", busy = st.app_busy }),
-		}))
-	else
-		table.insert(app_body, ui.kv({
+	end
+
+	-- Left: who the App is. Right: what to do with it, and the one irreversible action apart.
+	local main = `{at}.main`
+	local installed: { Node } = {}
+	if info.installations then
+		table.insert(
+			installed,
+			keyed(ui.badge(if info.installations > 0 then "已安装" else "未安装", if info.installations > 0 then "success" else "warning"), "installed")
+		)
+	end
+	local identity = settings_card(`{main}.left`, "app", "GitHub App", "plug", {
+		kv_block("kv", {
 			pair("名称", { ui.span(info.name or "—", "strong"), ui.span(`  {info.slug or ""}`, "mono muted") }),
 			pair("所有者", { ui.span(info.owner or "—", "mono"), ui.span(`  {info.owner_type or ""}`, "muted") }),
 			pair("运行身份", {
@@ -3013,37 +3272,30 @@ local function github_tab(st: State): Node
 				ui.span(if c.config.github.identity == "app" then "  默认" else "  roost.toml 设为本机身份", "muted"),
 			}),
 			pair("已安装", if info.installations then `{info.installations} 个账号或组织` else "—"),
-		} :: any))
-		local missing = info.missing
-		if missing and #missing > 0 then
-			table.insert(
-				app_body,
-				keyed(
-					ui.text({
-						ui.span("权限尚未生效:", "warning"),
-						ui.span(table.concat(missing, " "), "mono"),
-						ui.span("。在 App 设置的 Permissions 里开启后,到安装页接受新权限。", "muted"),
-					}),
-					"missing"
-				)
-			)
-		end
-		table.insert(app_body, keyed(muted("头像只能在 GitHub 的 App 设置页上传(GitHub 没有对应的 API);Roost 自带的头像在插件目录 assets/app-logo.png。"), "logo"))
-		table.insert(app_body, N("row", { key = "actions", gap = "sm" }, {
+		}),
+	}, { head = installed })
+	local manage = settings_card(`{main}.right`, "manage", "管理", "wrench", {
+		btn_row("actions", {
 			btn("安装到仓库", "app-install", { key = "install", icon = "plus" }),
 			btn("在 GitHub 上管理", "app-manage", { key = "manage", icon = "open" }),
 			btn("权限设置", "app-permissions", { key = "permissions", icon = "open" }),
 			btn("设置头像", "app-logo", { key = "logo", icon = "open" }),
+		}),
+		note_text("logo", "头像只能在 GitHub 的 App 设置页上传(GitHub 没有对应的 API);Roost 自带的头像在插件目录 assets/app-logo.png。"),
+	})
+	local danger = settings_card(`{main}.right`, "danger", "危险操作", "trash", {
+		note_text("note", "只删除中继上的 App 凭据;App 本身要到 GitHub 设置里删除,删除后只能重新创建"),
+		btn_row("actions", {
 			confirm_btn(st, "忘记本地凭据", "确认删除本地凭据", "forget-app", {
 				variant = "danger",
 				key = "forget",
 				icon = "trash",
 				title = "只删除中继上的 App 凭据;App 本身要到 GitHub 设置里删除,删除后只能重新创建",
 			}),
-		}))
-	end
-	local app_card = ui.card("GitHub App", app_body, { key = "app", icon = "plug" })
-	return N("col", { key = "github", role = "roost.github", gap = "md" }, { app_card })
+		}),
+	}, { role = "roost.danger" })
+	table.insert(nodes, settings_pair(st, "main", settings_stack("left", { identity }), settings_stack("right", { manage, danger })))
+	return settings_page("github", "roost.github", nodes)
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -3071,8 +3323,99 @@ local function issues_nodes(list: { model.Issue }, path: string): { Node }
 	return out
 end
 
--- What Roost keeps on disk, the retention policy, the last cleanup, and manual cleanup.
-local function storage_card(st: State): Node
+-- The roost.toml environments: names only for variables (values stay in the file).
+local function environments_card(st: State, parent: string): Node
+	local envs = st.core.config.environments
+	local items: { any } = {}
+	for _, name in util.keys(envs) do
+		local e = envs[name]
+		local parts: { string } = {}
+		local vars = util.keys(e.vars)
+		table.insert(parts, if #vars > 0 then `变量 {table.concat(vars, " ")}` else "没有变量")
+		if #e.path > 0 then
+			table.insert(parts, `PATH 前加 {table.concat(e.path, ":")}`)
+		end
+		if e.setup then
+			table.insert(parts, `setup:{util.clip(util.first_line(e.setup), 60)}`)
+		end
+		table.insert(items, pair(name, { ui.span(table.concat(parts, " · "), "mono") }))
+	end
+	local body: { Node } = {
+		note_text("note", "在 roost.toml 的 [environments.<名>] 定义(vars、path、setup),只在本机,不同步、不导出;工作流的「环境」或首页任务选用它。变量 shell 与 omp 步骤都拿得到。"),
+	}
+	if #items > 0 then
+		table.insert(body, kv_block("kv", items))
+	else
+		table.insert(body, keyed(muted("还没有环境。"), "none"))
+	end
+	return settings_card(parent, "environments", "环境", "terminal", body, {
+		head = { btn("编辑 roost.toml", "open=config", { icon = "pen", key = "edit" }) },
+	})
+end
+
+local function config_tab(st: State): Node
+	local c = st.core
+	local p = c.paths
+	local r = c.config.runner
+	local at = settings_at("config")
+	local files = `{at}.files`
+	local prefs = `{at}.prefs`
+	-- One config file: its path, a status badge and Edit at the head's end, the problems below.
+	local function file_card(key: string, title: string, path: string, issues: { model.Issue }, ready: string, detail: string?): Node
+		local body: { Node } = { keyed(path_line(path), "path") }
+		local badge: Node
+		if #issues == 0 then
+			badge = keyed(ui.badge(ready, if ready == "有效" then "success" else "muted"), "badge")
+			if detail then
+				table.insert(body, keyed(muted(detail), "detail"))
+			end
+		else
+			badge = keyed(ui.badge(`{#issues} 个问题`, "error"), "badge")
+			table.insert(body, N("col", { key = "issues", gap = "xs" }, issues_nodes(issues, path)))
+		end
+		return settings_card(files, key, title, "file-code", body, {
+			tone = if #issues > 0 then "error" else nil,
+			head = { badge, btn("编辑", `open={key}`, { icon = "pen", key = "edit" }) },
+		})
+	end
+	local wf = c.workflows
+	local runner = settings_card(`{prefs}.left`, "runner", "运行设置", "sliders", {
+		kv_block("kv", {
+			pair("omp", { ui.span(r.omp .. " " .. table.concat(r.omp_args, " "), "mono") }),
+			{ "agent 会话", `Tern 会话「{r.session}」中的新标签页` },
+			{ "并发", tostring(r.max_concurrent) },
+			{ "默认超时", util.fmt_duration(r.default_timeout) },
+			pair("PATH 追加", { ui.span(if #r.extra_path > 0 then table.concat(r.extra_path, ":") else "—", "mono") }),
+		}),
+	})
+	local theme = settings_card(`{prefs}.right`, "theme", "外观", "palette", {
+		note_text("note", "theme.css 放在数据目录中,保存后实时注入,覆盖 roost.css 的样式(钩子:data-role = roost.*)。"),
+		keyed(path_line(p.theme), "path"),
+	}, {
+		head = { btn(if tern.fs.exists(p.theme) then "编辑 theme.css" else "创建 theme.css", "open=theme", { icon = "palette", key = "edit" }) },
+	})
+	return settings_page("config", "roost.config", {
+		settings_pair(
+			st,
+			"files",
+			file_card("config", "roost.toml", p.config, c.config_issues, "有效", nil),
+			file_card(
+				"workflows",
+				"workflows.toml",
+				p.workflows,
+				c.workflow_issues,
+				if wf then "有效" else "未加载",
+				if wf then `已加载 {#wf.list} 个工作流 · {#util.keys(wf.repos)} 个仓库` else nil
+			)
+		),
+		settings_pair(st, "prefs", settings_stack("left", { runner }), settings_stack("right", { environments_card(st, `{prefs}.right`), theme })),
+	})
+end
+
+-- What Roost keeps on disk, the retention policy, the last cleanup, and manual cleanup. The
+-- sizes are number tiles on the page itself (a stats strip never sits in a card); the policy,
+-- the by-policy cleanup and the deletions are the cards below, deletions apart from the rest.
+local function storage_tab(st: State): Node
 	local c = st.core
 	local k = c.config.retention
 	local t = now()
@@ -3093,36 +3436,58 @@ local function storage_card(st: State): Node
 	local last = if cl
 		then `{util.ago(cl.at, t)}{if cl.manual then "(手动)" else ""}:{cl.runs} 个运行、{cl.events} 条事件记录、{cl.exports} 个旧导出文件、{cl.orphans} 个遗留目录`
 		else "尚未执行"
-	local items: { any } = {
-		{ "运行", `{#c.store.runs} 条,{finished} 条已结束 · 保留 {k.runs} 条 / {fmt_age(k.run_age)} · {size({ "runs", "runs.json", "runs.json.bak" })}` },
-		{ "worktree", size({ "worktrees" }) },
-		{ "事件记录", `{#c.events} 条 · 保留 {k.events} 条 / {fmt_age(k.event_age)} · {size({ "events.json", "events.json.bak" })}` },
-		{ "脚本与文件", `文件库 {size({ "library" })} · 工作流文件 {size({ "workflows" })}` },
-		{ "状态目录", `{size({ "state" })} · 不会自动清理,在工作台「自动化 › 文件库」手动删除` },
-		{ "导出文件", `{exports_n} 个 · 保留最新 {core.MAX_EXPORTS} 个 · {size({ "exports" })}` },
-		{ "上次自动清理", last },
-	}
+	local at = settings_at("storage")
+	local main = `{at}.main`
+
+	local tiles = ui.stats({
+		{ label = "运行", value = `{#c.store.runs} 条`, sub = `{finished} 条已结束 · {size({ "runs", "runs.json", "runs.json.bak" })}` },
+		{ label = "事件记录", value = `{#c.events} 条`, sub = size({ "events.json", "events.json.bak" }) },
+		{ label = "导出文件", value = `{exports_n} 个`, sub = size({ "exports" }) },
+		{
+			label = "脚本与文件",
+			value = size({ "library", "workflows" }),
+			sub = `文件库 {size({ "library" })} · 工作流文件 {size({ "workflows" })}`,
+		},
+		{ label = "状态目录", value = size({ "state" }), sub = "不自动清理" },
+	})
+
+	local policy = settings_card(`{main}.left`, "policy", "保留与占用", "database", {
+		note_text(
+			"note",
+			"运行目录含日志、事件负载与 omp 会话。启动时、每小时以及修改 roost.toml [retention] 后按策略自动清理;只删除已结束的运行。中继侧的事件缓存与投递统计在「中继与设备」页清理。"
+		),
+		kv_block("kv", {
+			{ "运行", `保留 {k.runs} 条 / {fmt_age(k.run_age)}` },
+			{ "事件记录", `保留 {k.events} 条 / {fmt_age(k.event_age)}` },
+			{ "导出文件", `保留最新 {core.MAX_EXPORTS} 个` },
+			{ "状态目录", "不会自动清理,在工作台「自动化 › 文件库」手动删除" },
+			{ "worktree", size({ "worktrees" }) },
+		}),
+	}, {
+		head = { btn("", "refresh-disk", { icon = "repeat", variant = "quiet", key = "refresh", title = "重新统计占用", busy = d.loading }) },
+	})
+
+	local state_rows: { { any } } = { { "上次自动清理", last } }
 	if #c.store.trash > 0 then
-		table.insert(items, { "删除中", `{#c.store.trash} 个目录` })
+		table.insert(state_rows, { "删除中", `{#c.store.trash} 个目录` })
 	end
 	if not c.store.indexed then
-		table.insert(items, pair("无主目录", {
+		table.insert(state_rows, pair("无主目录", {
 			ui.span("runs.json 曾无法读取(副本 runs.json.unreadable):暂不自动删除无主目录;处理完后删除该副本即可恢复", "warning"),
 		}))
 	end
 	if d.error then
-		table.insert(items, pair("占用统计", { ui.span(d.error, "warning") }))
+		table.insert(state_rows, pair("占用统计", { ui.span(d.error, "warning") }))
 	end
-	return ui.card("存储与清理", {
-		keyed(
-			muted(
-				"运行目录含日志、事件负载与 omp 会话。启动时、每小时以及修改 roost.toml [retention] 后按策略自动清理;只删除已结束的运行。中继侧的事件缓存与投递统计在「中继与设备」页清理。"
-			),
-			"note"
-		),
-		keyed(ui.kv(items :: any), "kv"),
-		N("row", { key = "actions", gap = "sm", align = "center", wrap = true }, {
+	local cleanup = settings_card(`{main}.right`, "cleanup", "按策略清理", "clock", {
+		kv_block("kv", state_rows),
+		btn_row("actions", {
 			btn("按策略清理", "housekeep", { icon = "trash", key = "housekeep", title = "立即删除超出保留数量或时长的运行与事件记录,以及无主的遗留目录" }),
+			btn("调整保留策略", "open=config", { icon = "pen", variant = "quiet", key = "policy", title = "roost.toml 的 [retention]" }),
+		}),
+	})
+	local wipe = settings_card(`{main}.right`, "wipe", "删除", "trash", {
+		btn_row("actions", {
 			confirm_btn(st, "删除全部已结束运行", `确认删除 {finished} 个运行`, "clear-runs", {
 				key = "clear-runs",
 				icon = "trash",
@@ -3138,84 +3503,13 @@ local function storage_card(st: State): Node
 				icon = "trash",
 				disabled = if exports_n == 0 then "没有导出文件" else false,
 			}),
-			btn("调整保留策略", "open=config", { icon = "pen", variant = "quiet", key = "policy", title = "roost.toml 的 [retention]" }),
-			btn("", "refresh-disk", { icon = "repeat", variant = "quiet", key = "refresh", title = "重新统计占用", busy = d.loading }),
 		}),
-	}, { key = "storage", icon = "folder-open" })
-end
+	}, { meta = "再点一次确认", role = "roost.danger" })
 
--- The roost.toml environments: names only for variables (values stay in the file).
-local function environments_card(st: State): Node
-	local envs = st.core.config.environments
-	local items: { any } = {}
-	for _, name in util.keys(envs) do
-		local e = envs[name]
-		local parts: { string } = {}
-		local vars = util.keys(e.vars)
-		table.insert(parts, if #vars > 0 then `变量 {table.concat(vars, " ")}` else "没有变量")
-		if #e.path > 0 then
-			table.insert(parts, `PATH 前加 {table.concat(e.path, ":")}`)
-		end
-		if e.setup then
-			table.insert(parts, `setup:{util.clip(util.first_line(e.setup), 60)}`)
-		end
-		table.insert(items, pair(name, { ui.span(table.concat(parts, " · "), "mono") }))
-	end
-	local body: { Node } = {
-		keyed(muted("在 roost.toml 的 [environments.<名>] 定义(vars、path、setup),只在本机,不同步、不导出;工作流的「环境」或首页任务选用它。变量 shell 与 omp 步骤都拿得到。"), "note"),
-	}
-	if #items > 0 then
-		table.insert(body, keyed(ui.kv(items :: any), "kv"))
-	else
-		table.insert(body, keyed(muted("还没有环境。"), "none"))
-	end
-	table.insert(body, N("row", { key = "actions", gap = "sm" }, { btn("编辑 roost.toml", "open=config", { icon = "pen", key = "edit" }) }))
-	return ui.card("环境", body, { key = "environments", icon = "terminal" })
-end
-
-local function config_tab(st: State): Node
-	local c = st.core
-	local p = c.paths
-	local r = c.config.runner
-	local function file_card(key: string, title: string, path: string, issues: { model.Issue }, ok_text: string): Node
-		local body: { Node } = {
-			keyed(ui.text({ ui.path(path) }), "path"),
-		}
-		if #issues == 0 then
-			table.insert(body, keyed(ui.text({ ui.span(ok_text, "success") }), "ok"))
-		else
-			table.insert(body, N("col", { key = "issues", gap = "xs" }, issues_nodes(issues, path)))
-		end
-		table.insert(body, N("row", { key = "actions", gap = "sm" }, {
-			btn("编辑", `open={key}`, { icon = "pen", key = "edit" }),
-		}))
-		return ui.card(title, body, { key = key, icon = "file-code", tone = if #issues > 0 then "error" else nil })
-	end
-	local wf_ok = if c.workflows then `已加载 {#c.workflows.list} 个工作流 · {#util.keys(c.workflows.repos)} 个仓库` else "未加载"
-	local runner_kv = ui.kv({
-		pair("omp", { ui.span(r.omp .. " " .. table.concat(r.omp_args, " "), "mono") }),
-		{ "agent 会话", `Tern 会话「{r.session}」中的新标签页` },
-		{ "并发", tostring(r.max_concurrent) },
-		{ "默认超时", util.fmt_duration(r.default_timeout) },
-		pair("PATH 追加", { ui.span(table.concat(r.extra_path, ":"), "mono") }),
-	} :: any)
-	return N("col", { key = "config", role = "roost.config", gap = "md" }, {
-		file_card("config", "roost.toml", p.config, c.config_issues, "有效"),
-		file_card("workflows", "workflows.toml", p.workflows, c.workflow_issues, wf_ok),
-		ui.card("运行设置", { keyed(runner_kv, "kv") }, { key = "runner", icon = "sliders" }),
-		environments_card(st),
-		ui.card("外观", {
-			keyed(muted("theme.css 放在数据目录中,保存后实时注入,覆盖 roost.css 的样式(钩子:data-role = roost.*)。"), "note"),
-			keyed(ui.text({ ui.path(p.theme) }), "path"),
-			N("row", { key = "actions", gap = "sm" }, {
-				btn(if tern.fs.exists(p.theme) then "编辑 theme.css" else "创建 theme.css", "open=theme", { icon = "palette", key = "edit" }),
-			}),
-		}, { key = "theme", icon = "palette" }),
+	return settings_page("storage", "roost.storage", {
+		keyed(tiles, "stats"),
+		settings_pair(st, "main", settings_stack("left", { policy }), settings_stack("right", { cleanup, wipe })),
 	})
-end
-
-local function storage_tab(st: State): Node
-	return N("col", { key = "storage", role = "roost.storage", gap = "md" }, { storage_card(st) })
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -3936,7 +4230,9 @@ local function confirmed(st: State, what: string)
 			reset_log(st, nil)
 		end
 	elseif string.sub(what, 1, 7) == "assign:" then
-		core.assign_executor(c, string.sub(what, 8))
+		-- `assign:<device>` makes it the default device; `assign:` alone clears it.
+		local dev = string.sub(what, 8)
+		core.assign_default(c, if dev == "" then nil else dev)
 	elseif what == "forget-app" then
 		core.forget_app(c)
 	elseif what == "clear-runs" then
@@ -4050,10 +4346,10 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		elseif #wf.inputs > 0 or model.pr_target(wf) then
 			open_form(st, wf)
 		else
-			local err = core.dispatch(c, value)
+			local err, other = core.dispatch(c, value)
 			if err then
 				toast_err(st, err)
-			else
+			elseif other == nil then
 				local newest = store.list(c.store, 1, value)[1]
 				go(st, "runs")
 				if newest then
@@ -4254,6 +4550,12 @@ local function do_action(st: State, act: string, value: string?, item: string?)
 		if wf and gid then
 			toast_err(st, core.group_assign(c, wf, if gid == "" then nil else gid))
 		end
+	elseif string.sub(act, 1, 4) == "dev:" then
+		-- A row of a card's device menu: `dev:<workflow>:<device>` (empty: the default device).
+		local wf, dev = string.match(act, "^dev:([^:]+):(.*)$")
+		if wf and dev then
+			core.assign_workflow(c, wf, if dev == "" then nil else dev)
+		end
 	elseif act == "imp-open" then
 		imp_open(st)
 	elseif act == "imp-cancel" then
@@ -4403,7 +4705,7 @@ function M.event(st: State, ev: UiEvent)
 		elseif ev.id == TASK_ID then
 			st.task.focus = true
 			st.cx:frame({ pair("focus", TASK_ID) })
-		elseif string.match(ev.id or "", "github%.app%.org%.input$") then
+		elseif string.match(ev.id or "", "github%.page%.app%.org%.input$") then
 			st.app_focus = true
 			st.cx:frame({ pair("focus", ev.id) })
 		else
@@ -4444,7 +4746,7 @@ function M.event(st: State, ev: UiEvent)
 			field.edit(st.task.text, ev)
 		elseif st.tab == "files" and st.fp.focus and id == FP_IDS[st.fp.focus] then
 			field.edit(st.fp.fields[st.fp.focus], ev)
-		elseif st.app_org and string.match(id, "github%.app%.org%.input$") then
+		elseif st.app_org and string.match(id, "github%.page%.app%.org%.input$") then
 			field.edit(st.app_org, ev)
 		end
 	end

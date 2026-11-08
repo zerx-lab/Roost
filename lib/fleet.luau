@@ -1,14 +1,15 @@
 --!strict
--- Devices sharing one relay (agent/src/fleet.rs): at most one is the executor, which runs the
--- workflows; the others observe. Pure helpers for lib/core.luau:
+-- Devices sharing one relay (agent/src/fleet.rs): which device runs which workflow, each device's
+-- runs and the shared configuration. Pure helpers for lib/core.luau:
 --
---   role          what this machine is, from the relay's device record
---   summaries     the executor's recent runs as uploaded for observers (no inputs, payloads or
+--   owner         the device that runs a workflow: its own assignment, else the default device;
+--                 for an event, the assignment that held when the relay received it
+--   summaries     a device's recent runs as uploaded for the others (no inputs, payloads or
 --                 local paths; log tails for the newest few), bounded by MAX_BODY
 --   decode_runs   an uploaded list back into run records the runs page can show (read-only)
---   mirror_text   an observer's workflows.toml from the executor's configuration (export format):
---                 the executor's workflows and repos, with this machine's repo paths and env
---                 values (the upload carries neither)
+--   mirror_text   this machine's workflows.toml from the shared configuration (export format):
+--                 its workflows and repos, with this machine's repo paths and env values (the
+--                 upload carries neither)
 
 local toml = require("./toml")
 local model = require("./model")
@@ -23,15 +24,19 @@ local M = {}
 M.MAX_RUNS = 100
 M.TAILS = 20
 M.TAIL_BYTES = 4096
--- The relay takes up to 512 KiB (fleet::MAX_RUNS); stay under it.
+-- The relay takes up to 512 KiB per device (fleet::MAX_RUNS); stay under it.
 M.MAX_BODY = 480 * 1024
 M.FORMAT = 1
+-- The `owners` key of the default device (fleet::DEFAULT).
+M.DEFAULT = "*"
 
-export type Role = "solo" | "executor" | "observer"
--- The relay's device record (fleet.rs State), as decoded JSON.
-export type Executor = { id: string, name: string?, since: string?, handover: number? }
+-- The default device as the relay's record names it.
+export type Executor = { id: string, name: string?, since: string? }
+-- One entry of an assignment's history: events after `seq` are `client`'s (nil: a workflow
+-- follows the default device; the default itself: every device runs).
+export type Owner = { client: string?, name: string?, seq: number }
 
--- The executor in a device record, when one is assigned.
+-- The default device in a device record, when one is assigned.
 function M.executor(f: any): Executor?
 	if type(f) ~= "table" or type(f.executor) ~= "table" or type(f.executor.id) ~= "string" then
 		return nil
@@ -41,26 +46,117 @@ function M.executor(f: any): Executor?
 		id = ex.id,
 		name = if type(ex.name) == "string" and ex.name ~= "" then ex.name else nil,
 		since = if type(ex.since) == "string" then ex.since else nil,
-		handover = if type(ex.handover) == "number" then ex.handover else nil,
 	}
 end
 
--- Why the relay can't say who the executor is (its device record is unreadable), or nil.
+-- Why the relay can't say who runs what (its device record is unreadable), or nil.
 function M.error(f: any): string?
 	return if type(f) == "table" and type(f.error) == "string" then f.error else nil
 end
 
--- solo: no executor assigned (every device runs, as before devices existed) or no relay. An
--- unreadable record on the relay makes every device an observer until one is assigned again.
-function M.role(f: any, me: string): Role
+-- The history of `key` (a workflow id or DEFAULT), oldest first; malformed entries dropped. A
+-- relay from before per-workflow assignments has no `owners`: its executor is the default device
+-- for every event (so this machine runs nothing there unless it is that executor).
+function M.owners(f: any, key: string): { Owner }
+	local out: { Owner } = {}
+	if type(f) == "table" and f.owners == nil then
+		local ex = M.executor(f)
+		if ex and key == M.DEFAULT then
+			table.insert(out, { client = ex.id, name = ex.name, seq = 0 })
+		end
+		return out
+	end
+	local list = if type(f) == "table" and type(f.owners) == "table" then f.owners[key] else nil
+	if type(list) ~= "table" then
+		return out
+	end
+	for _, o in list do
+		if type(o) == "table" and type(o.seq) == "number" then
+			table.insert(out, {
+				client = if type(o.client) == "string" then o.client else nil,
+				name = if type(o.name) == "string" and o.name ~= "" then o.name else nil,
+				seq = o.seq,
+			})
+		end
+	end
+	return out
+end
+
+-- The entry that held for event `seq` (the last one assigned before it), or now when nil.
+local function holding(list: { Owner }, seq: number?): Owner?
+	if seq == nil then
+		return list[#list]
+	end
+	local best: Owner? = nil
+	for _, o in list do
+		if o.seq < seq then
+			best = o
+		end
+	end
+	return best
+end
+
+-- The device workflow `wf` has of its own now (nil: it follows the default device).
+function M.assigned(f: any, wf: string): string?
+	local o = holding(M.owners(f, wf), nil)
+	return if o then o.client else nil
+end
+
+-- The device that runs `wf`, for event `seq` or else now: its own assignment, else the default
+-- device. Nil: every device runs it (nothing assigned).
+function M.owner(f: any, wf: string, seq: number?): string?
+	local o = holding(M.owners(f, wf), seq)
+	if o and o.client then
+		return o.client
+	end
+	local d = holding(M.owners(f, M.DEFAULT), seq)
+	return if d then d.client else nil
+end
+
+-- Whether device `me` runs `wf` (for event `seq`, else now). Nobody does while the record is
+-- unreadable.
+function M.runs_here(f: any, me: string, wf: string, seq: number?): boolean
 	if M.error(f) then
-		return "observer"
+		return false
 	end
+	local o = M.owner(f, wf, seq)
+	return o == nil or o == me
+end
+
+-- The workflows with a device of their own now: workflow id → client id.
+function M.assignments(f: any): { [string]: string }
+	local out: { [string]: string } = {}
+	if type(f) == "table" and type(f.owners) == "table" then
+		for key in f.owners do
+			if type(key) == "string" and key ~= M.DEFAULT then
+				local c = M.assigned(f, key)
+				if c then
+					out[key] = c
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- The name the record has for device `id` (from its assignments), or nil.
+function M.name_of(f: any, id: string): string?
 	local ex = M.executor(f)
-	if ex == nil then
-		return "solo"
+	if ex and ex.id == id and ex.name then
+		return ex.name
 	end
-	return if ex.id == me then "executor" else "observer"
+	if type(f) == "table" and type(f.owners) == "table" then
+		for key in f.owners do
+			if type(key) == "string" then
+				for _, o in M.owners(f, key) do
+					if o.client == id and o.name then
+						return o.name
+					end
+				end
+			end
+		end
+	end
+	return nil
 end
 
 -- How a device is called: its client_name, else its id.
@@ -117,7 +213,7 @@ local function run_summary(r: store.Run, tail: string?): { [string]: any }
 		finished_at = r.finished_at,
 		workspace = r.workspace,
 		rerun_of = r.rerun_of,
-		-- Built-in runs: only the kind (a task's text stays on the executor) and how they relate.
+		-- Built-in runs: only the kind (a task's text stays on its device) and how they relate.
 		task = if r.task then { kind = r.task.kind } else nil,
 		parent = r.parent,
 		changes = r.changes,
@@ -203,7 +299,7 @@ local function uses_of(v: any): { store.ModelUse }?
 end
 
 -- An uploaded run list back into run records (only what the runs page shows), each run's log
--- tail, and the executor's inbox. Malformed entries are dropped.
+-- tail, and the uploading device's inbox. Malformed entries are dropped.
 function M.decode_runs(body: any): ({ store.Run }, { [string]: string }, { [string]: inbox.Box })
 	local out: { store.Run } = {}
 	local tails: { [string]: string } = {}
@@ -214,7 +310,7 @@ function M.decode_runs(body: any): ({ store.Run }, { [string]: string }, { [stri
 		if #out >= M.MAX_RUNS then
 			break
 		end
-		-- Ids are hex on the executor; anything else (a path, say) is not a run of Roost's.
+		-- Ids are hex on every device; anything else (a path, say) is not a run of Roost's.
 		local okid = type(v) == "table" and type(v.id) == "string" and #v.id <= 64 and string.match(v.id, "^%x+$") ~= nil
 		if not okid or type(v.state) ~= "string" then
 			continue
@@ -295,42 +391,32 @@ local function local_parts(old: string): ({ [string]: any }, { [string]: { [stri
 	return repos, wfs
 end
 
--- An observer's workflows.toml: the executor's repos and workflows (`b`), keeping from the local
--- text `old` each repo's path and each env value the upload left blank. Repos only declared here
--- stay (their paths would otherwise be lost). Returns the text and the repos still without a path.
-function M.mirror_text(b: bundle.Bundle, old: string, who: string): (string, { string })
+-- This machine's workflows.toml from the shared configuration `b`: its repos and workflows,
+-- keeping from the local text `old` each repo's path and each env value the upload left blank.
+-- Repos the configuration no longer has go (it is the truth everywhere). Returns the text and
+-- the repos without a path here.
+function M.mirror_text(b: bundle.Bundle, old: string): (string, { string })
 	local lrepos, lwfs = local_parts(old)
 	local out: { string } = {
-		`# 由 Roost 设备同步写入:本机是观察者,工作流以执行者「{who}」为准,本机修改会被下次同步覆盖。`,
-		"# 保留本机的内容:各仓库的本机路径 path、工作流 env 的值(同步不上传这两项)。",
+		"# 由 Roost 设备同步写入:工作流配置在共用同一中继的设备间同步,本机的修改也会同步给其他设备。",
+		"# 只留在本机的内容:各仓库的本机路径 path、工作流 env 的值(同步不上传这两项)。",
 	}
-	local names: { [string]: boolean } = {}
-	for name in b.repos do
-		names[name] = true
-	end
-	for name, r in lrepos do
-		if type(name) == "string" and type(r) == "table" then
-			names[name] = true
-		end
-	end
 	local missing: { string } = {}
-	for _, name in util.keys(names) do
+	for _, name in util.keys(b.repos) do
 		local lr = if type(lrepos[name]) == "table" then lrepos[name] else {}
 		local br = b.repos[name]
 		table.insert(out, "")
 		table.insert(out, `[repos.{toml.quote(name)}]`)
 		if type(lr.path) == "string" and lr.path ~= "" then
 			table.insert(out, `path = {toml.quote(lr.path)}`)
-		elseif br then
+		else
 			table.insert(missing, name)
 		end
-		local branch = if br then br.branch else str(lr.branch)
-		if branch then
-			table.insert(out, `branch = {toml.quote(branch)}`)
+		if br.branch then
+			table.insert(out, `branch = {toml.quote(br.branch)}`)
 		end
-		local worktree: boolean? = if br then br.worktree elseif type(lr.worktree) == "boolean" then lr.worktree else nil
-		if worktree ~= nil then
-			table.insert(out, `worktree = {if worktree then "true" else "false"}`)
+		if br.worktree ~= nil then
+			table.insert(out, `worktree = {if br.worktree then "true" else "false"}`)
 		end
 	end
 	for _, raw in b.workflows do

@@ -230,6 +230,7 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
     })?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(None);
     let listen = cfg.listen;
+    let fleet = Arc::new(fleet::Fleet::open(data_dir, store.store_id()));
     let state = Arc::new(AppState {
         cfg: Arc::new(cfg),
         subs: RwLock::new(Arc::new(subs)),
@@ -238,7 +239,7 @@ async fn serve(path: &std::path::Path) -> Result<Shutdown, ExitCode> {
         deliveries: Mutex::new(VecDeque::new()),
         delivery_stats: Mutex::new(api::DeliveryStats::new(started_at)),
         clients: Mutex::new(BTreeMap::new()),
-        fleet: Arc::new(fleet::Fleet::open(data_dir)),
+        fleet,
         boot_id: boot_id.clone(),
         started_at,
         shutdown: shutdown_tx.clone(),

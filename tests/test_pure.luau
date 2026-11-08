@@ -623,7 +623,7 @@ do -- device sync: run summaries stay under the relay's limit, tails first, and 
 	eq(#back, fleet.MAX_RUNS)
 	eq(back[1].steps[1].exit_code, 0)
 	local a = back[1].steps[2]
-	eq(a.model, "@smol", "an agent step's model setting reaches observers")
+	eq(a.model, "@smol", "an agent step's model setting reaches the other devices")
 	eq(a.models and #a.models, 1, "and the models it used, malformed ones dropped")
 	eq(a.models and a.models[1].agent, "Sub")
 	eq(#back_tails["0001"], fleet.TAIL_BYTES, "the newest carry tails")
@@ -643,6 +643,32 @@ do -- device sync: run summaries stay under the relay's limit, tails first, and 
 	eq(fleet.clean_tail("ial line\nnext\n", false), "next\n", "a cut line is dropped")
 	eq(fleet.clean_tail("\128\129abc", false), "abc", "a cut UTF-8 sequence is dropped")
 	eq(fleet.clean_tail("whole\n", true), "whole\n")
+end
+
+do -- fleet: who runs a workflow for an event is the assignment that held when the relay got it
+	local fleet = require("../lib/fleet")
+	local f: any = {
+		owners = {
+			["*"] = { { client = "a", seq = 5 }, { client = "b", seq = 20 } },
+			wf = { { client = "c", seq = 10 } :: any, { seq = 15 } },
+		},
+	}
+	eq(fleet.owner({}, "wf", 3), nil, "nothing assigned: every device")
+	eq(fleet.owner(f, "wf", 5), nil, "before the first default: every device")
+	eq(fleet.owner(f, "wf", 6), "a", "the default device then")
+	eq(fleet.owner(f, "wf", 10), "a", "an event at the head when assigned is the previous owner's")
+	eq(fleet.owner(f, "wf", 11), "c", "the next one is the new owner's")
+	eq(fleet.owner(f, "wf", 16), "a", "following the default again")
+	eq(fleet.owner(f, "wf", 21), "b", "the default that holds by then")
+	eq(fleet.owner(f, "wf", nil), "b", "now")
+	eq(fleet.owner(f, "other", 12), "a", "unassigned workflows follow the default")
+	eq(fleet.assigned(f, "wf"), nil, "its own assignment now: none")
+	eq(fleet.runs_here(f, "b", "wf", nil), true)
+	eq(fleet.runs_here(f, "c", "wf", 11), true)
+	eq(fleet.runs_here({ error = "unreadable" }, "b", "wf", nil), false, "nobody runs while the record is unreadable")
+	local old: any = { revision = 3, executor = { id = "w" } }
+	eq(fleet.owner(old, "wf", 5), "w", "a relay without assignments: its executor runs everything")
+	eq(fleet.runs_here(old, "m", "wf", nil), false)
 end
 
 do -- inbox: snapshots replace a workflow's items, increments add and resolve, dismissals hold until an item changes
@@ -691,7 +717,7 @@ do -- inbox: snapshots replace a workflow's items, increments add and resolve, d
 	local bad, why = inbox.parse("[1,2]", 0)
 	eq(bad, nil)
 	assert(why, "not an object")
-	-- Round trip through what observers get.
+	-- Round trip through what the other devices get.
 	inbox.apply(b, "gate", inbox.parse('{"items":[{"id":"y","title":"t","kind":"decide"}]}', 700) :: any, "r7", 700)
 	local back = inbox.decode_boxes(F.decode(tern.json.encode(inbox.encode_boxes(b.boxes))))
 	eq(back.gate.items[1].kind, "decide")

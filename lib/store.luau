@@ -109,6 +109,8 @@ export type Run = {
 	changes: Changes?,
 	branch: string?, -- the local branch made from its changes
 	pr: string?, -- the pull request opened from its changes
+	-- Another device's run, as uploaded (that device's client id); never saved here.
+	device: string?,
 }
 
 export type Store = {

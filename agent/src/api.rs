@@ -169,7 +169,7 @@ pub struct AppState {
     /// Lock order: `delivery_stats` before `deliveries`.
     pub delivery_stats: Mutex<DeliveryStats>,
     pub clients: Mutex<BTreeMap<String, ClientSeen>>,
-    /// Which client is the executor; the executor's configuration and runs for observers.
+    /// Which device runs which workflow, the shared configuration and each device's runs.
     pub fleet: Arc<Fleet>,
     pub boot_id: String,
     pub started_at: DateTime<Utc>,
@@ -251,13 +251,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/events/test", post(test_event))
         .route("/deliveries", get(deliveries).delete(clear_deliveries))
         .route("/fleet/executor", put(put_executor))
+        .route("/fleet/assign", put(put_assign))
         .route(
             "/fleet/config",
             get(get_config)
                 .put(put_config)
                 .layer(DefaultBodyLimit::max(CONFIG_BODY_LIMIT)),
         )
-        .route("/fleet/runs", get(get_runs).put(put_runs))
+        .route("/fleet/runs", put(put_runs))
+        .route("/fleet/runs/{client}", get(get_runs))
+        .route("/fleet/run", post(post_run))
         .layer(DefaultBodyLimit::max(ADMIN_BODY_LIMIT))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
@@ -309,7 +312,7 @@ fn valid_input_name(k: &str) -> bool {
 
 /// Starts workflow `id` from outside: the bearer token's SHA-256 must be the one the plugin pushed
 /// for it (subscriptions `dispatch`). Unknown ids and wrong tokens get the same answer. The run
-/// reaches the executor as a `roost_dispatch` event; the plugin checks the inputs again.
+/// reaches the devices as a `roost_dispatch` event; the plugin checks the inputs again.
 async fn dispatch(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -588,12 +591,8 @@ struct PutSubs {
     dispatch: BTreeMap<String, String>,
 }
 
-async fn put_subs(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<PutSubs>,
-) -> Response {
-    if let Some(denied) = executor_only(&st, &headers) {
+async fn put_subs(State(st): State<Arc<AppState>>, Json(body): Json<PutSubs>) -> Response {
+    if let Some(denied) = fleet_usable(&st) {
         return denied;
     }
     let _w = st.subs_write.lock().await;
@@ -606,6 +605,15 @@ async fn put_subs(
         Ok(Err(_)) => true,
         Err(_) => false,
     };
+    let next = match Subscriptions::from_parts(body.repos, body.dispatch) {
+        Ok(s) => s,
+        Err(list) => return issues(StatusCode::UNPROCESSABLE_ENTITY, list),
+    };
+    // What the relay already runs is accepted whatever base it comes with: devices on the same
+    // configuration push the same subscriptions.
+    if !disk_changed && next.repos == cur.repos && next.dispatch == cur.dispatch {
+        return Json(json!({ "revision": cur.revision, "changed": false })).into_response();
+    }
     let stale_base = body
         .base_revision
         .as_ref()
@@ -629,13 +637,6 @@ async fn put_subs(
             })),
         )
             .into_response();
-    }
-    let next = match Subscriptions::from_parts(body.repos, body.dispatch) {
-        Ok(s) => s,
-        Err(list) => return issues(StatusCode::UNPROCESSABLE_ENTITY, list),
-    };
-    if next.repos == cur.repos && next.dispatch == cur.dispatch {
-        return Json(json!({ "revision": cur.revision, "changed": false })).into_response();
     }
     let path = &st.cfg.subscriptions_path;
     if path.exists() {
@@ -792,12 +793,8 @@ struct TokenBody {
 }
 
 /// A token for one run on `repo`, acting as the App (see `Github::app_token`).
-async fn gh_token(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(b): Json<TokenBody>,
-) -> Response {
-    if let Some(denied) = executor_only(&st, &headers) {
+async fn gh_token(State(st): State<Arc<AppState>>, Json(b): Json<TokenBody>) -> Response {
+    if let Some(denied) = fleet_usable(&st) {
         return denied;
     }
     match st.gh.app_token(&b.repo).await {
@@ -815,11 +812,6 @@ struct EventsQuery {
     limit: Option<usize>,
     wait: Option<u64>,
     payload: Option<bool>,
-    /// Sent by the executor's own polls (not its history reads): the assignment revision it acts
-    /// under. Its `after` is then what it has handled.
-    ack: Option<u64>,
-    /// The store the acked cursor belongs to: an ack for another (wiped) store is ignored.
-    store: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -869,46 +861,52 @@ fn client_id(h: &HeaderMap) -> Option<(String, Option<String>)> {
     Some((id.to_string(), name))
 }
 
-/// Refuses a request only the executor may make, when it comes from another client.
-fn executor_only(st: &AppState, h: &HeaderMap) -> Option<Response> {
-    let id = client_id(h).map(|(id, _)| id);
-    if st.fleet.allows(id.as_deref()) {
+/// Refuses what a device does on its own behalf while the device record is unreadable (nobody
+/// knows what is whose then).
+fn fleet_usable(st: &AppState) -> Option<Response> {
+    if st.fleet.usable() {
         None
     } else {
-        Some(fleet_failure(FleetError::NotExecutor, st))
+        Some(fleet_failure(FleetError::Broken, st))
     }
 }
 
 fn fleet_failure(e: FleetError, st: &AppState) -> Response {
     match e {
-        FleetError::NotExecutor => {
-            let s = st.fleet.state();
-            let who = s
-                .executor
-                .as_ref()
-                .map(|ex| ex.name.clone().unwrap_or_else(|| ex.id.clone()))
-                .unwrap_or_else(|| "none assigned".into());
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": format!("only the executor may do this (executor: {who})"),
-                    "code": "not_executor",
-                    "fleet": s,
-                })),
-            )
-                .into_response()
-        }
+        FleetError::Broken => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "the relay cannot read its device record: assign the default device again",
+                "code": "fleet_broken",
+                "fleet": st.fleet.state(),
+            })),
+        )
+            .into_response(),
         FleetError::Conflict(s) => (
             StatusCode::CONFLICT,
             Json(json!({
-                "error": "the executor changed since you looked",
+                "error": "the device assignments changed since you looked",
+                "code": "fleet_conflict",
                 "fleet": s,
+            })),
+        )
+            .into_response(),
+        FleetError::ConfigConflict(cur) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "the configuration changed since you last had it",
+                "code": "config_conflict",
+                "config": cur,
             })),
         )
             .into_response(),
         FleetError::TooLarge(n) => err(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("larger than {n} bytes"),
+        ),
+        FleetError::TooMany(n) => err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("at most {n} workflows can have a device of their own"),
         ),
         FleetError::Io(m) => err(StatusCode::INTERNAL_SERVER_ERROR, m),
     }
@@ -950,12 +948,6 @@ async fn events(
             },
         );
     }
-    if let (Some((id, _)), Some(rev), Some(a)) = (&client, q.ack, q.after)
-        && wait_ok
-        && q.store.as_deref() == Some(st.store.store_id())
-    {
-        st.fleet.ack(id, rev, st.store.store_id(), a).await;
-    }
     let wait = Duration::from_secs(q.wait.unwrap_or(0)).min(MAX_WAIT);
     // Subscribed before looking, so a change in between still ends the wait.
     let mut fleet_rx = st.fleet.subscribe();
@@ -996,39 +988,71 @@ async fn events(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Devices: the executor, its configuration and its runs
+// Devices: who runs what, the shared configuration, each device's runs
 
 #[derive(Deserialize)]
 struct ExecutorBody {
-    client: String,
+    client: Option<String>,
     base_revision: u64,
 }
 
-/// Makes a client the relay has heard from the executor (compare-and-set on the fleet revision).
-async fn put_executor(State(st): State<Arc<AppState>>, Json(b): Json<ExecutorBody>) -> Response {
-    if !valid_client(&b.client) {
-        return err(StatusCode::BAD_REQUEST, "invalid client id");
+#[derive(Deserialize)]
+struct AssignBody {
+    workflow: String,
+    client: Option<String>,
+    base_revision: u64,
+}
+
+fn valid_workflow(id: &str) -> bool {
+    id != fleet::DEFAULT && valid_client(id)
+}
+
+/// A device's name, when the relay has heard from it since it started or has it on record.
+/// `Err`: neither (or not a client id), with the answer to give.
+fn device_name(st: &AppState, client: &str) -> Result<Option<String>, (StatusCode, &'static str)> {
+    if !valid_client(client) {
+        return Err((StatusCode::BAD_REQUEST, "invalid client id"));
     }
-    let Some(seen) = lock(&st.clients).get(&b.client).cloned() else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "the relay hasn't heard from that client since it started",
-        );
+    if let Some(seen) = lock(&st.clients).get(client) {
+        return Ok(seen.name.clone());
+    }
+    st.fleet.known(client).ok_or((
+        StatusCode::NOT_FOUND,
+        "the relay hasn't heard from that client since it started",
+    ))
+}
+
+/// Assigns `key` from the events after the current head on (compare-and-set on the revision).
+async fn assign(st: &AppState, key: &str, client: Option<String>, base: u64) -> Response {
+    let name = match client.as_deref().map(|c| device_name(st, c)) {
+        Some(Err((code, msg))) => return err(code, msg),
+        Some(Ok(n)) => n,
+        None => None,
     };
     match st
         .fleet
-        .assign(
-            &b.client,
-            seen.name,
-            b.base_revision,
-            st.store.store_id(),
-            Some(seen.cursor),
-        )
+        .assign(key, client.as_deref(), name, base, || {
+            let (head, oldest, ..) = st.store.stats();
+            (head, oldest)
+        })
         .await
     {
         Ok(s) => Json(json!({ "fleet": s })).into_response(),
-        Err(e) => fleet_failure(e, &st),
+        Err(e) => fleet_failure(e, st),
     }
+}
+
+/// Makes a device the default one (none: every device runs every workflow not assigned elsewhere).
+async fn put_executor(State(st): State<Arc<AppState>>, Json(b): Json<ExecutorBody>) -> Response {
+    assign(&st, fleet::DEFAULT, b.client, b.base_revision).await
+}
+
+/// Gives one workflow to a device (none: it follows the default device again).
+async fn put_assign(State(st): State<Arc<AppState>>, Json(b): Json<AssignBody>) -> Response {
+    if !valid_workflow(&b.workflow) {
+        return err(StatusCode::BAD_REQUEST, "invalid workflow id");
+    }
+    assign(&st, &b.workflow, b.client, b.base_revision).await
 }
 
 #[derive(Deserialize)]
@@ -1049,6 +1073,9 @@ async fn get_config(State(st): State<Arc<AppState>>, Query(q): Query<HaveQuery>)
 #[derive(Deserialize)]
 struct ConfigBody {
     text: String,
+    /// The revision the uploader last had (none: it never had one).
+    #[serde(default)]
+    base: Option<String>,
 }
 
 async fn put_config(
@@ -1056,15 +1083,21 @@ async fn put_config(
     headers: HeaderMap,
     Json(b): Json<ConfigBody>,
 ) -> Response {
-    let id = client_id(&headers).map(|(id, _)| id).unwrap_or_default();
-    match st.fleet.put_config(&id, b.text).await {
+    let Some((id, _)) = client_id(&headers) else {
+        return err(StatusCode::BAD_REQUEST, "X-Roost-Client is required");
+    };
+    match st.fleet.put_config(&id, b.text, b.base.as_deref()).await {
         Ok(m) => Json(json!({ "config": m })).into_response(),
         Err(e) => fleet_failure(e, &st),
     }
 }
 
-async fn get_runs(State(st): State<Arc<AppState>>, Query(q): Query<HaveQuery>) -> Response {
-    let (meta, body) = st.fleet.runs();
+async fn get_runs(
+    State(st): State<Arc<AppState>>,
+    Path(client): Path<String>,
+    Query(q): Query<HaveQuery>,
+) -> Response {
+    let (meta, body) = st.fleet.runs(&client);
     match (meta, body) {
         (Some(m), Some(b)) if q.have.as_deref() != Some(m.revision.as_str()) => {
             Json(json!({ "runs": m, "body": &*b })).into_response()
@@ -1078,10 +1111,95 @@ async fn put_runs(
     headers: HeaderMap,
     Json(b): Json<Box<RawValue>>,
 ) -> Response {
-    let id = client_id(&headers).map(|(id, _)| id).unwrap_or_default();
+    let Some((id, _)) = client_id(&headers) else {
+        return err(StatusCode::BAD_REQUEST, "X-Roost-Client is required");
+    };
     match st.fleet.put_runs(&id, b).await {
         Ok(m) => Json(json!({ "runs": m })).into_response(),
         Err(e) => fleet_failure(e, &st),
+    }
+}
+
+#[derive(Deserialize)]
+struct RunBody {
+    workflow: String,
+    /// The device that is to run it.
+    target: String,
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
+    /// The pull request to run on, as typed (`owner/name#12`, a link or a number).
+    #[serde(default)]
+    pr: Option<String>,
+}
+
+/// A manual run asked for on one device for another: stored as a `roost_run` event naming its
+/// target, which runs it when it reads the event (later, if it is offline now).
+async fn post_run(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(b): Json<RunBody>,
+) -> Response {
+    if let Some(denied) = fleet_usable(&st) {
+        return denied;
+    }
+    let Some((from, from_name)) = client_id(&headers) else {
+        return err(StatusCode::BAD_REQUEST, "X-Roost-Client is required");
+    };
+    if !valid_workflow(&b.workflow) || !valid_client(&b.target) {
+        return err(StatusCode::BAD_REQUEST, "invalid workflow or device id");
+    }
+    if b.pr.as_ref().is_some_and(|p| p.len() > 300)
+        || b.inputs.len() > MAX_DISPATCH_INPUTS
+        || b.inputs
+            .iter()
+            .any(|(k, v)| !valid_input_name(k) || v.len() > MAX_INPUT_VALUE)
+    {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "at most {MAX_DISPATCH_INPUTS} inputs, names [A-Za-z0-9_-]{{1,64}}, values up to {MAX_INPUT_VALUE} bytes"
+            ),
+        );
+    }
+    let payload = match serde_json::to_string(&json!({
+        "workflow": b.workflow,
+        "target": b.target,
+        "inputs": b.inputs,
+        "pr": b.pr,
+        "from": from,
+        "from_name": from_name,
+    }))
+    .ok()
+    .and_then(|s| RawValue::from_string(s).ok())
+    {
+        Some(p) => p,
+        None => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot encode the request",
+            );
+        }
+    };
+    let info = EventInfo {
+        event: "roost_run".into(),
+        action: Some("run".into()),
+        title: Some(b.workflow.clone()),
+        sender: Some("device".into()),
+        ..Default::default()
+    };
+    static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+    let delivery = format!(
+        "run-{}-{}-{}",
+        b.workflow,
+        Utc::now().timestamp_millis(),
+        RUN_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    match st.store.push(delivery, info, Some(payload), false).await {
+        Ok(ev) => (StatusCode::ACCEPTED, Json(json!({ "seq": ev.seq }))).into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot store: {e}"),
+        ),
     }
 }
 
@@ -1217,6 +1335,7 @@ mod tests {
             },
         )
         .unwrap();
+        let fleet = Fleet::open(dir.to_path_buf(), store.store_id());
         let subs_text = "[repos.\"acme/web\"]\nevents=[\"issues\"]\n";
         std::fs::write(&cfg.subscriptions_path, subs_text).unwrap();
         Arc::new(AppState {
@@ -1227,7 +1346,7 @@ mod tests {
             deliveries: Mutex::new(VecDeque::new()),
             delivery_stats: Mutex::new(DeliveryStats::new(Utc::now())),
             clients: Mutex::new(BTreeMap::new()),
-            fleet: Arc::new(Fleet::open(dir.to_path_buf())),
+            fleet: Arc::new(fleet),
             boot_id: "boot".into(),
             started_at: Utc::now(),
             shutdown: watch::channel(None).0,
@@ -2065,21 +2184,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_executor_alone_runs_and_hands_over_at_its_cursor() {
+    async fn devices_get_workflows_from_the_head_on_and_share_the_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let st = state(dir.path());
         let app = router(st.clone());
         let subs = || Some(json!({"repos": {"acme/web": {"events": ["issues"]}}}));
-        let token = || Some(json!({"repo": "acme/web"}));
 
-        // Both devices poll; nobody is the executor yet, so either may push subscriptions.
         let (_, v) = call(&app, from("mac-1", "GET", "/api/v1/events", None)).await;
         assert_eq!(v["fleet"]["executor"], Value::Null);
         call(&app, from("mac-2", "GET", "/api/v1/events", None)).await;
-        let (c, _) = call(&app, from("mac-2", "PUT", "/api/v1/subscriptions", subs())).await;
-        assert_eq!(c, StatusCode::OK);
+        call(&app, signed("issues", "d1", ISSUE, "hush")).await;
 
-        let assign = |client: &str, base: u64| {
+        let default = |client: Value, base: u64| {
             from(
                 "mac-2",
                 "PUT",
@@ -2087,104 +2203,191 @@ mod tests {
                 Some(json!({"client": client, "base_revision": base})),
             )
         };
-        let (c, _) = call(&app, assign("ghost", 0)).await;
-        assert_eq!(c, StatusCode::NOT_FOUND, "only clients the relay has seen");
-        let (c, v) = call(&app, assign("mac-1", 0)).await;
+        let assign = |wf: &str, client: Value, base: u64| {
+            from(
+                "mac-2",
+                "PUT",
+                "/api/v1/fleet/assign",
+                Some(json!({"workflow": wf, "client": client, "base_revision": base})),
+            )
+        };
+        let (c, _) = call(&app, default(json!("ghost"), 0)).await;
+        assert_eq!(c, StatusCode::NOT_FOUND, "only clients the relay knows");
+        let (c, v) = call(&app, default(json!("mac-1"), 0)).await;
         assert_eq!(c, StatusCode::OK, "{v}");
         assert_eq!(v["fleet"]["executor"]["id"], "mac-1");
-        let (c, v) = call(&app, assign("mac-2", 0)).await;
-        assert_eq!(c, StatusCode::CONFLICT);
-        assert_eq!(v["fleet"]["revision"], 1);
-
-        let (c, v) = call(&app, from("mac-2", "PUT", "/api/v1/subscriptions", subs())).await;
+        assert_eq!(v["fleet"]["owners"]["*"][0]["seq"], 1, "from the head on");
+        let (c, v) = call(&app, assign("triage", json!("mac-2"), 0)).await;
         assert_eq!(
             (c, v["code"].clone()),
-            (StatusCode::FORBIDDEN, json!("not_executor"))
+            (StatusCode::CONFLICT, json!("fleet_conflict"))
         );
-        let (c, _) = call(&app, from("mac-2", "POST", "/api/v1/github/token", token())).await;
-        assert_eq!(c, StatusCode::FORBIDDEN, "observers get no App token");
-        let (c, _) = call(&app, from("mac-1", "POST", "/api/v1/github/token", token())).await;
-        assert_ne!(
-            c,
-            StatusCode::FORBIDDEN,
-            "the executor does (GitHub is unreachable here)"
-        );
-        let (c, _) = call(&app, from("mac-1", "PUT", "/api/v1/subscriptions", subs())).await;
-        assert_eq!(c, StatusCode::OK);
+        let (c, _) = call(&app, assign("*", json!("mac-2"), 1)).await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        call(&app, signed("issues", "d2", ISSUE, "hush")).await;
+        let (c, v) = call(&app, assign("triage", json!("mac-2"), 1)).await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["fleet"]["owners"]["triage"][0]["client"], "mac-2");
+        assert_eq!(v["fleet"]["owners"]["triage"][0]["seq"], 2);
 
-        // Configuration and runs: written by the executor, read by anyone.
-        let cfg = || Some(json!({"text": "[roost]\nformat = 1\n"}));
-        let (c, _) = call(&app, from("mac-2", "PUT", "/api/v1/fleet/config", cfg())).await;
-        assert_eq!(c, StatusCode::FORBIDDEN);
-        let (c, v) = call(&app, from("mac-1", "PUT", "/api/v1/fleet/config", cfg())).await;
+        // Any device pushes subscriptions; the same ones again are fine on a stale base (devices on
+        // the same configuration push the same), different ones are a conflict.
+        let (c, v) = call(&app, from("mac-2", "PUT", "/api/v1/subscriptions", subs())).await;
+        assert_eq!(c, StatusCode::OK);
+        let old = json!("0000");
+        let with_base = |repos: Value| Some(json!({"repos": repos, "base_revision": old}));
+        let (c, w) = call(
+            &app,
+            from(
+                "mac-1",
+                "PUT",
+                "/api/v1/subscriptions",
+                with_base(json!({"acme/web": {"events": ["issues"]}})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (c, w["revision"].clone()),
+            (StatusCode::OK, v["revision"].clone())
+        );
+        let (c, _) = call(
+            &app,
+            from(
+                "mac-1",
+                "PUT",
+                "/api/v1/subscriptions",
+                with_base(json!({"acme/api": {"events": ["issues"]}})),
+            ),
+        )
+        .await;
+        assert_eq!(c, StatusCode::CONFLICT);
+
+        // The configuration: compare-and-set on the revision the uploader had.
+        let cfg = |text: &str, base: Value| Some(json!({"text": text, "base": base}));
+        let (c, v) = call(
+            &app,
+            from(
+                "mac-1",
+                "PUT",
+                "/api/v1/fleet/config",
+                cfg("one", Value::Null),
+            ),
+        )
+        .await;
         assert_eq!(c, StatusCode::OK, "{v}");
         let rev = v["config"]["revision"].as_str().unwrap().to_string();
-        let (_, v) = call(&app, from("mac-2", "GET", "/api/v1/fleet/config", None)).await;
-        assert_eq!(v["text"], "[roost]\nformat = 1\n");
-        let uri = format!("/api/v1/fleet/config?have={rev}");
-        let (_, v) = call(&app, from("mac-2", "GET", &uri, None)).await;
+        let (c, v) = call(
+            &app,
+            from(
+                "mac-2",
+                "PUT",
+                "/api/v1/fleet/config",
+                cfg("two", Value::Null),
+            ),
+        )
+        .await;
         assert_eq!(
-            (v["unchanged"].clone(), v["text"].clone()),
-            (json!(true), Value::Null)
+            (c, v["code"].clone()),
+            (StatusCode::CONFLICT, json!("config_conflict"))
         );
-        let runs = Some(json!({"runs": [{"id": "r1", "status": "ok"}]}));
-        let (c, _) = call(&app, from("mac-1", "PUT", "/api/v1/fleet/runs", runs)).await;
+        assert_eq!(v["config"]["revision"], rev.as_str());
+        let (c, _) = call(
+            &app,
+            from(
+                "mac-2",
+                "PUT",
+                "/api/v1/fleet/config",
+                cfg("two", json!(rev)),
+            ),
+        )
+        .await;
         assert_eq!(c, StatusCode::OK);
-        let (_, v) = call(&app, from("mac-2", "GET", "/api/v1/fleet/runs", None)).await;
+        let (_, v) = call(&app, from("mac-1", "GET", "/api/v1/fleet/config", None)).await;
+        assert_eq!(
+            (v["text"].clone(), v["config"]["client"].clone()),
+            (json!("two"), json!("mac-2"))
+        );
+
+        // Runs: each device its own.
+        let runs = |id: &str| Some(json!({"runs": [{"id": id}]}));
+        call(&app, from("mac-1", "PUT", "/api/v1/fleet/runs", runs("r1"))).await;
+        call(&app, from("mac-2", "PUT", "/api/v1/fleet/runs", runs("r2"))).await;
+        let (_, v) = call(&app, from("mac-2", "GET", "/api/v1/fleet/runs/mac-1", None)).await;
         assert_eq!(v["body"]["runs"][0]["id"], "r1");
-        assert_eq!(v["runs"]["client"], "mac-1");
+        let have = v["runs"]["revision"].as_str().unwrap().to_string();
+        let (_, v) = call(
+            &app,
+            from(
+                "mac-2",
+                "GET",
+                &format!("/api/v1/fleet/runs/mac-1?have={have}"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(v["unchanged"], true);
+        let (_, v) = call(&app, from("mac-2", "GET", "/api/v1/status", None)).await;
+        assert!(v["fleet"]["uploads"]["mac-2"]["revision"].is_string());
 
-        // mac-1 has handled event 1 of 2 (it polls after it, acting under revision 1 on this
-        // store); a poll without `ack`, an old revision or another store say nothing. mac-2 takes
-        // over right after 1.
-        call(&app, signed("issues", "d1", ISSUE, "hush")).await;
-        call(&app, signed("issues", "d2", ISSUE, "hush")).await;
-        let store = st.store.store_id().to_string();
-        let poll =
-            |client: &str, q: &str| from(client, "GET", &format!("/api/v1/events?{q}"), None);
-        call(&app, poll("mac-1", &format!("after=1&ack=1&store={store}"))).await;
-        call(&app, poll("mac-1", "after=2")).await;
-        call(&app, poll("mac-1", &format!("after=2&ack=0&store={store}"))).await;
-        call(&app, poll("mac-1", "after=2&ack=1&store=gone")).await;
-        call(&app, poll("mac-2", "after=2")).await;
-        let (_, v) = call(&app, assign("mac-2", 1)).await;
-        assert_eq!(v["fleet"]["executor"]["id"], "mac-2");
-        assert_eq!(v["fleet"]["executor"]["handover"], 1);
-        let (_, v) = call(&app, poll("mac-1", &format!("after=1&ack=1&store={store}"))).await;
-        assert_eq!(v["events"][0]["seq"], 2);
+        // A manual run for another device reaches it as an event naming it.
+        let (c, v) = call(
+            &app,
+            from(
+                "mac-1",
+                "POST",
+                "/api/v1/fleet/run",
+                Some(
+                    json!({"workflow": "triage", "target": "mac-2", "inputs": {"n": "1"}, "pr": "acme/web#7"}),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(c, StatusCode::ACCEPTED, "{v}");
+        let seq = v["seq"].as_u64().unwrap();
+        let (_, v) = call(
+            &app,
+            from(
+                "mac-2",
+                "GET",
+                &format!("/api/v1/events?after={}", seq - 1),
+                None,
+            ),
+        )
+        .await;
+        let e = &v["events"][0];
         assert_eq!(
-            v["fleet"]["executor"]["id"], "mac-2",
-            "told it no longer runs them"
+            (e["event"].clone(), e["payload"]["target"].clone()),
+            (json!("roost_run"), json!("mac-2"))
         );
         assert_eq!(
-            v["fleet"]["executor"]["acked"]["seq"], 1,
-            "the old executor's ack no longer counts"
-        );
-        let (c, _) = call(&app, from("mac-1", "PUT", "/api/v1/fleet/config", cfg())).await;
-        assert_eq!(
-            c,
-            StatusCode::FORBIDDEN,
-            "the old executor is an observer now"
+            (e["payload"]["from"].clone(), e["payload"]["pr"].clone()),
+            (json!("mac-1"), json!("acme/web#7"))
         );
 
-        // A long-poll answers as soon as the executor changes.
+        // A long-poll answers as soon as an assignment changes.
+        let after = v["head"].as_u64().unwrap();
         let waiting = tokio::spawn({
             let app = app.clone();
             async move {
                 call(
                     &app,
-                    from("mac-1", "GET", "/api/v1/events?after=2&wait=20", None),
+                    from(
+                        "mac-1",
+                        "GET",
+                        &format!("/api/v1/events?after={after}&wait=20"),
+                        None,
+                    ),
                 )
                 .await
             }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        call(&app, assign("mac-1", 2)).await;
+        call(&app, assign("triage", Value::Null, 2)).await;
         let (_, v) = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(v["fleet"]["executor"]["id"], "mac-1");
         assert_eq!(v["fleet"]["revision"], 3);
+        assert_eq!(v["fleet"]["owners"]["triage"][1]["client"], Value::Null);
     }
 }

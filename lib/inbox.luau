@@ -347,7 +347,7 @@ local function decode_boxes(v: any): { [string]: Box }
 	return boxes
 end
 
--- The boxes as JSON-ready data (also what the executor uploads for observers).
+-- The boxes as JSON-ready data (also what a device uploads for the others).
 function M.encode_boxes(boxes: { [string]: Box }): { [string]: any }
 	local out: { [string]: any } = {}
 	for wf, box in boxes do

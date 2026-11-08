@@ -19,9 +19,6 @@ export type Row = {
 	runs: { string },
 	reasons: { [string]: string }, -- workflow id ("*": all) -> why it didn't fire
 	history: boolean?, -- arrived before this machine was bound to the relay: shown, never run
-	-- Read while this machine was an observer: the executor named here ran it. Not "handled" here,
-	-- so this machine still runs it if it takes over before the event (lib/relay.luau takeover).
-	observed: string?,
 }
 
 local MAX_BYTES = 8 * 1024 * 1024
@@ -61,7 +58,6 @@ local function row_of(v: any): Row?
 		runs = runs,
 		reasons = reasons,
 		history = if v.history == true then true else nil,
-		observed = str(v.observed),
 	}
 end
 
@@ -104,7 +100,6 @@ function M.save(path: string, rows: { Row }): string?
 			runs = tern.json.array(table.move(r.runs, 1, #r.runs, 1, {})),
 			reasons = r.reasons,
 			history = r.history,
-			observed = r.observed,
 		})
 	end
 	local text = tern.json.encode(tern.json.array(list))

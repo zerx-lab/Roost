@@ -77,19 +77,28 @@ export type AppInfo = {
 	installations: number?,
 	missing: { string }?, -- wanted permissions (`name:level`) some installation hasn't granted
 }
--- Devices (lib/fleet.luau): what this machine uploads as the executor, or mirrors and shows as
--- an observer.
+-- Devices (lib/fleet.luau): the shared configuration this machine uploads or applies, its run
+-- summaries, and the other devices' runs.
+export type Remote = {
+	runs: { store.Run },
+	tails: { [string]: string },
+	inbox: { [string]: inbox.Box }, -- that device's inbox, uploaded with its runs
+	rev: string?,
+	at: number?, -- when it uploaded them
+}
 export type Dev = {
-	role: string, -- the role the last device tick saw (a change resets the upload state)
-	-- executor: the configuration (export format) and run summaries last uploaded
-	cfg_text: string?,
+	-- the shared configuration
+	cfg_text: string?, -- this machine's configuration (export format) as last built
 	cfg_built: number?,
 	cfg_dirty: boolean, -- something it holds changed: build it again on the next tick
-	cfg_busy: boolean,
+	cfg_busy: boolean, -- an upload or a fetch is in flight
 	cfg_err: string?,
-	cfg_at: number?,
-	cfg_rev: string?, -- the relay's revision of the configuration last uploaded
-	exec_noted: boolean, -- kv `mirror_exec` says this machine has been the executor since its last mirror
+	cfg_at: number?, -- when this machine last uploaded or applied it
+	cfg_failed: { rev: string, at: number }?, -- the last revision that failed to apply
+	missing: { string }, -- repos of the configuration without a local path (runs use a temp dir)
+	base_rev: string?, -- the revision `base_text` (SYNC_BASE as read) belongs to
+	base_text: string?,
+	-- this machine's runs
 	runs_json: string?,
 	runs_busy: boolean,
 	runs_err: string?,
@@ -97,20 +106,10 @@ export type Dev = {
 	-- log tails of recent runs; `failed`: the read failed (tried again after TAIL_RETRY)
 	tails: { [string]: { text: string, at: number, state: string, failed: boolean? } },
 	tailing: { [string]: boolean }, -- tail reads in flight
-	-- observer: the executor's configuration applied here, and its runs
-	mirror_busy: boolean,
-	mirror_err: string?,
-	mirror_at: number?,
-	mirror_failed: { rev: string, at: number }?, -- the last revision that failed to apply
-	mirror_missing: { string }, -- mirrored repos without a local path (runs there use a temp dir)
-	remote: { store.Run },
-	remote_tails: { [string]: string },
-	remote_inbox: { [string]: inbox.Box }, -- the executor's inbox, uploaded with its runs
-	remote_rev: string?,
-	remote_at: number?, -- when the executor uploaded them
-	remote_from: string?, -- the client that uploaded them
-	remote_exec: string?, -- the executor whose runs these are
-	remote_busy: boolean,
+	-- the other devices' runs, by client id
+	remote: { [string]: Remote },
+	remote_list: { store.Run }?, -- their runs merged, newest first (rebuilt after a change)
+	remote_busy: { [string]: boolean },
 	remote_err: string?,
 	timer: any?, -- the next device tick
 }
@@ -541,6 +540,29 @@ end
 
 -- Defined with manual runs below.
 local default_repo: (w: model.Workflows, wf: model.Workflow) -> string?
+local run_forwarded: (c: Core, payload: any, row: eventlog.Row) -> ()
+
+-- What a device is called: the name it gave the relay, else the one on record, else its id.
+function M.device_name(c: Core, id: string): string
+	local agent = c.relay.state.agent
+	if agent and type(agent.clients) == "table" then
+		for _, x in agent.clients do
+			if type(x) == "table" and x.id == id and type(x.name) == "string" and x.name ~= "" then
+				return x.name
+			end
+		end
+	end
+	return fleet.name_of(relay.fleet(c.relay), id) or id
+end
+
+-- The device that runs workflow `id` for event `seq` (else now) when that is not this machine.
+local function elsewhere(c: Core, id: string, seq: number?): string?
+	if relay.runs_here(c.relay, id, seq) then
+		return nil
+	end
+	local o = fleet.owner(relay.fleet(c.relay), id, seq)
+	return if o then M.device_name(c, o) else "?"
+end
 
 -- A `roost_dispatch` event (the relay's POST /hooks/dispatch/<id>): starts that workflow when it
 -- is enabled and has an api trigger, with the inputs it declares (defaults filled, required
@@ -583,8 +605,9 @@ local function dispatch_event(c: Core, w: model.Workflows, payload: any, summary
 	return if run then run.id else nil, err
 end
 
--- Relayed events: match every enabled workflow's GitHub triggers; a workflow fires once per event.
--- Repos declared in [repos] run in their checkout; any other repo runs in a temporary directory.
+-- Relayed events: match every enabled workflow's GitHub triggers; a workflow fires once per event,
+-- on the device that ran it when the relay received the event (lib/fleet.luau owner). Repos
+-- declared in [repos] run in their checkout; any other repo runs in a temporary directory.
 function M.on_events(c: Core, list: { { [string]: any } })
 	local w = c.workflows
 	local app = M.app(c)
@@ -595,18 +618,33 @@ function M.on_events(c: Core, list: { { [string]: any } })
 		if not remember(c, delivery) then
 			continue
 		end
+		local seq: number? = if type(e.seq) == "number" then e.seq else nil
 		local row = event_row(e, info, delivery)
+		local p = e.payload
+		local pwf = if type(p) == "table" and type(p.workflow) == "string" then p.workflow else "?"
 		if row.event == "roost_test" then
 			c.relay.state.last_test = now()
 			M.notice(c, "success", "中继测试事件已送达本机")
+		elseif row.event == "roost_run" and w and info.sender == "device" and info.repo == nil then
+			-- Only the relay's POST /fleet/run makes these: a manual run asked for on another device.
+			local target = if type(p) == "table" and type(p.target) == "string" then p.target else nil
+			if target == c.relay.h.client_id then
+				run_forwarded(c, p, row)
+			else
+				row.reasons[pwf] = `手动运行:转发给「{if target then M.device_name(c, target) else "?"}」`
+			end
 		elseif row.event == "roost_dispatch" and w and info.sender == "api" and info.repo == nil then
 			-- Only the relay's own /hooks/dispatch makes these (no repository, sender "api").
-			local id, err = dispatch_event(c, w, e.payload, row.summary, delivery)
-			if id then
-				table.insert(row.runs, id)
+			local other = elsewhere(c, pwf, seq)
+			if other then
+				row.reasons[pwf] = `由「{other}」运行`
 			else
-				local p = e.payload
-				row.reasons[if type(p) == "table" and type(p.workflow) == "string" then p.workflow else "?"] = err or "未能排队"
+				local id, err = dispatch_event(c, w, p, row.summary, delivery)
+				if id then
+					table.insert(row.runs, id)
+				else
+					row.reasons[pwf] = err or "未能排队"
+				end
 			end
 		elseif w and info.repo then
 			local key = util.ifind(w.repos, info.repo) or info.repo
@@ -626,8 +664,11 @@ function M.on_events(c: Core, list: { { [string]: any } })
 						why = why or miss
 					end
 				end
-				if fired then
-					local payload = if e.payload ~= nil then tern.json.encode(e.payload) else nil
+				local other = if fired then elsewhere(c, wf.id, seq) else nil
+				if fired and other then
+					row.reasons[wf.id] = `由「{other}」运行`
+				elseif fired then
+					local payload = if p ~= nil then tern.json.encode(p) else nil
 					local ev = info
 					if fired.on == "mention" then
 						-- What was asked, without the mentions ({{request}}).
@@ -657,39 +698,12 @@ function M.on_events(c: Core, list: { { [string]: any } })
 				end
 			end
 		end
-		-- Listed before without a run here (observed for the executor, or history), then handed
-		-- over to this machine: its row becomes this one.
+		-- Listed before as history without a run here: this row replaces it.
 		for i, x in c.events do
-			if x.delivery == delivery and (x.observed or (x.history and #x.runs == 0)) then
+			if x.delivery == delivery and x.history and #x.runs == 0 then
 				table.remove(c.events, i)
 				break
 			end
-		end
-		add_event(c, row)
-	end
-	M.changed(c)
-end
-
--- Events read while another device is the executor: listed with who runs them, never run here
--- and not marked handled (this machine runs them if it takes over before them).
-function M.on_observed(c: Core, list: { { [string]: any } })
-	local who = fleet.label(relay.executor(c.relay))
-	for _, e in list do
-		local info: { [string]: any } = if type(e.info) == "table" then e.info else {}
-		local delivery = tostring(e.delivery or e.seq)
-		local listed = c.seen[delivery] == true
-		for _, x in c.events do
-			listed = listed or x.delivery == delivery
-		end
-		if listed then
-			continue
-		end
-		local row = event_row(e, info, delivery)
-		row.observed = who
-		row.reasons["*"] = `本机是观察者:由执行者「{who}」运行`
-		if row.event == "roost_test" then
-			c.relay.state.last_test = now()
-			M.notice(c, "success", "中继测试事件已送达本机(观察者,不运行)")
 		end
 		add_event(c, row)
 	end
@@ -709,9 +723,8 @@ function M.on_history(c: Core, list: { { [string]: any } })
 			table.insert(started[d], r.id)
 		end
 	end
-	-- Not marked handled: they come before the cursor, so they come back only when this machine
-	-- takes over as executor at an earlier point (lib/relay.luau takeover), and then they are its
-	-- to run. Those that started runs here are marked through runs.json anyway.
+	-- Not marked handled: they come before the cursor and never come back. Those that started
+	-- runs here are marked through runs.json anyway.
 	local listed: { [string]: boolean } = {}
 	for _, x in c.events do
 		listed[x.delivery] = true
@@ -751,9 +764,8 @@ local function cron_tick(c: Core)
 	local t = now()
 	local minute = t - t % 60
 	local w = c.workflows
-	local observer = relay.role(c.relay) == "observer"
-	-- The relay can't say who the executor is: nobody fires, and nothing counts as fired (the
-	-- executor assigned next still finds a `once` schedule within its grace).
+	-- The relay can't say who runs what: nobody fires, and nothing counts as fired (a `once`
+	-- schedule still fires within its grace once the record is repaired).
 	local paused = relay.fleet_error(c.relay) ~= nil
 	if w then
 		local last = (function(): { [string]: number }
@@ -783,9 +795,9 @@ local function cron_tick(c: Core)
 				if wf.enabled and due and not paused then
 					keep[key] = minute
 					fired_any = true
-					-- An observer counts the schedule as fired (the executor ran it), so a takeover
-					-- within the `once` grace doesn't run it again.
-					if not observer then
+					-- Counted as fired on every device (the owner ran it), so one that gets the
+					-- workflow within the `once` grace doesn't run it again.
+					if relay.runs_here(c.relay, wf.id) then
 						local repo = ct.repo
 						local ref = ct.ref or (if repo and w.repos[repo] then w.repos[repo].branch else nil)
 						local run, err = runner.submit(c.runner, wf, {
@@ -833,6 +845,7 @@ local watch_upgrades: (c: Core, run: string?) -> ()
 local check_daemon: (c: Core, done: () -> ()) -> ()
 -- Defined with the device functions at the end.
 local dev_loop: (c: Core) -> ()
+local config_behind: (c: Core) -> boolean
 
 function M.housekeep(c: Core, manual: boolean)
 	if manual and not c.store.policy then
@@ -948,19 +961,14 @@ function M.new(data: string): Core
 		groups_err = nil,
 		inbox = inbox.load(data),
 		dev = {
-			role = "solo",
 			cfg_dirty = true,
 			cfg_busy = false,
-			exec_noted = false,
+			missing = {},
 			runs_busy = false,
 			tails = {},
 			tailing = {},
-			mirror_busy = false,
-			mirror_missing = {},
 			remote = {},
-			remote_tails = {},
-			remote_inbox = {},
-			remote_busy = false,
+			remote_busy = {},
 		},
 	}
 	c.runner = runner.new({
@@ -1025,9 +1033,6 @@ function M.new(data: string): Core
 		event = function(e)
 			M.on_events(c, { e })
 		end,
-		observe = function(e)
-			M.on_observed(c, { e })
-		end,
 		history = function(list)
 			M.on_history(c, list)
 		end,
@@ -1051,6 +1056,15 @@ function M.new(data: string): Core
 		dispatch = function()
 			local w = c.workflows
 			return if w then model.dispatch(w) else {}
+		end,
+		behind = function()
+			return config_behind(c)
+		end,
+		config_changed = function()
+			-- Outside the relay's callback: a sync may apply files and push again.
+			tern.timer(0, function()
+				dev_loop(c)
+			end)
 		end,
 	})
 	return c
@@ -1086,10 +1100,9 @@ function M.start(c: Core)
 	end
 	local saved = eventlog.load(c.events_path)
 	for i = #saved, 1, -1 do
-		-- Rows that never ran here (observed for the executor, or history listed without a run)
-		-- are not "handled": see on_observed and on_history.
+		-- History rows listed without a run never ran here and are not "handled" (on_history).
 		local row = saved[i]
-		if not (row.observed or (row.history and #row.runs == 0)) then
+		if not (row.history and #row.runs == 0) then
 			remember(c, row.delivery)
 		end
 	end
@@ -1175,27 +1188,21 @@ local function pr_repo(wf: model.Workflow): string?
 	return only
 end
 
--- Why this machine may not start runs: another device is the executor. Nil when it may.
+-- Why this machine may not start runs: the relay can't say who runs what. Nil when it may.
 function M.run_block(c: Core): string?
-	if relay.role(c.relay) == "observer" then
-		local broken = relay.fleet_error(c.relay)
-		if broken then
-			return `中继读不出设备记录({broken}):在设置的「中继与设备」页重新指定执行者之前,任何设备都不运行`
-		end
-		return `本机是观察者:运行只在执行者「{fleet.label(relay.executor(c.relay))}」上进行`
+	local broken = relay.fleet_error(c.relay)
+	if broken then
+		return `中继读不出设备记录({broken}):在设置的「中继与设备」页重新指定默认设备之前,任何设备都不运行`
 	end
 	return nil
 end
 
--- Why this machine may not change the workflow configuration: it mirrors the executor's (files,
--- libraries and groups included). Nil when it may.
+-- Why this machine may not change the workflow configuration (shared by every device). Nil when
+-- it may.
 function M.config_block(c: Core): string?
-	if relay.role(c.relay) == "observer" then
-		local broken = relay.fleet_error(c.relay)
-		if broken then
-			return `中继读不出设备记录({broken}):在设置的「中继与设备」页重新指定执行者之前不能修改工作流配置`
-		end
-		return `本机是观察者:工作流配置以执行者「{fleet.label(relay.executor(c.relay))}」为准,请在执行者上修改`
+	local broken = relay.fleet_error(c.relay)
+	if broken then
+		return `中继读不出设备记录({broken}):在设置的「中继与设备」页重新指定默认设备之前不能修改工作流配置`
 	end
 	return nil
 end
@@ -1228,30 +1235,64 @@ local function manual(c: Core, id: string, inputs: { [string]: string }?): (mode
 	return wf, final, nil
 end
 
-function M.dispatch(c: Core, id: string, inputs: { [string]: string }?, repo: string?, ref: string?): string?
-	local wf, final, why = manual(c, id, inputs)
+-- Queues manual run of `wf` here. Returns the run's id, or why not.
+local function run_here(
+	c: Core,
+	wf: model.Workflow,
+	inputs: { [string]: string },
+	repo: string?,
+	ref: string?,
+	detail: string,
+	delivery: string?
+): (string?, string?)
 	local w = c.workflows
-	if not wf or not w then
-		return why
+	if not w then
+		return nil, "没有有效的 workflows.toml"
 	end
 	repo = repo or default_repo(w, wf)
 	local r = if repo then w.repos[repo] else nil
 	if (wf.workspace == "worktree" or wf.workspace == "repo") and not (r and r.path) then
-		return `{wf.name} 要在仓库检出中运行(workspace = {wf.workspace}),但无法确定用哪个仓库:请在触发器上设置 repo`
+		return nil, `{wf.name} 要在仓库检出中运行(workspace = {wf.workspace}),但本机无法确定用哪个仓库:请在触发器上设置 repo,并在本机填写该仓库的 path`
 	end
 	if r and not ref then
 		ref = r.branch
 	end
 	local run, err = runner.submit(c.runner, wf, {
-		trigger = { kind = "manual", detail = "Roost 面板" },
+		trigger = { kind = "manual", detail = detail, delivery = delivery },
 		repo = repo,
 		ref = ref,
-		inputs = final,
+		inputs = inputs,
 	})
-	if not run then
-		return err
+	return if run then run.id else nil, err
+end
+
+-- Asks `device`, which runs `wf`, to run it (the relay hands it a `roost_run` event; a device that
+-- is offline runs it when it is back). The outcome comes as a notice.
+local function forward(c: Core, wf: model.Workflow, device: string, inputs: { [string]: string }, pr: string?)
+	local name = M.device_name(c, device)
+	relay.post_run(c.relay, wf.id, device, inputs, pr, function(ok, _body, err)
+		if ok then
+			M.notice(c, "success", `已请「{name}」运行 {wf.name}:运行记录会出现在「运行」页(它离线时,上线后补跑;中继先淘汰了这条请求就不会再跑)`)
+		else
+			M.notice(c, "error", `无法让「{name}」运行 {wf.name}:{err or "中继没有回应"}`)
+		end
+	end)
+end
+
+-- A manual run of `id`: here when this machine runs it, else on the device that does (forwarded
+-- through the relay). Returns why not, and when forwarded the device's name.
+function M.dispatch(c: Core, id: string, inputs: { [string]: string }?, repo: string?, ref: string?): (string?, string?)
+	local wf, final, why = manual(c, id, inputs)
+	if not wf then
+		return why, nil
 	end
-	return nil
+	local owner = if relay.runs_here(c.relay, id) then nil else fleet.owner(relay.fleet(c.relay), id)
+	if owner then
+		forward(c, wf, owner, final, nil)
+		return nil, M.device_name(c, owner)
+	end
+	local _, err = run_here(c, wf, final, repo, ref, "Roost 面板", nil)
+	return err, nil
 end
 
 -- The environment for local tools (gh, omp): the login environment and `[runner] env`, PATH being
@@ -1272,16 +1313,19 @@ local MAX_LOGIN_WAITERS = 32
 -- workflow names one repository) the way a PR event would: the same event fields and payload
 -- shape, the PR head checked out. The PR is read with the local gh (the relay serves no PR
 -- reads); `cb` gets nil once the run is queued, else why not. When `wanted` says no by the time
--- the PR has been read, nothing is queued.
+-- the PR has been read, nothing is queued. A workflow another device runs is forwarded to it
+-- (`cb` then gets that device's name second); `from` names the device a forwarded run came from,
+-- and it runs here.
 function M.dispatch_pr(
 	c: Core,
 	id: string,
 	inputs: { [string]: string }?,
 	pr: string,
-	cb: (string?) -> (),
-	wanted: (() -> boolean)?
+	cb: (string?, string?) -> (),
+	wanted: (() -> boolean)?,
+	from: string?
 )
-	local wf, _, why = manual(c, id, inputs)
+	local wf, given, why = manual(c, id, inputs)
 	local w = c.workflows
 	if not wf or not w then
 		cb(why)
@@ -1297,6 +1341,12 @@ function M.dispatch_pr(
 		cb(`{wf.name} 不只一个仓库:写 owner/name#{number} 或 PR 链接`)
 		return
 	end
+	local owner = if from or relay.runs_here(c.relay, id) then nil else fleet.owner(relay.fleet(c.relay), id)
+	if owner then
+		forward(c, wf, owner, given, pr)
+		cb(nil, M.device_name(c, owner))
+		return
+	end
 	if c.login.pending then
 		-- gh may only be on the login shell's PATH: go on once the first capture ends.
 		if #c.login_waiters >= MAX_LOGIN_WAITERS then
@@ -1304,7 +1354,7 @@ function M.dispatch_pr(
 			return
 		end
 		table.insert(c.login_waiters, function()
-			M.dispatch_pr(c, id, inputs, pr, cb, wanted)
+			M.dispatch_pr(c, id, inputs, pr, cb, wanted, from)
 		end)
 		return
 	end
@@ -1343,7 +1393,7 @@ function M.dispatch_pr(
 				info.sender = M.me(c)
 				local base = if type(body.base) == "table" then body.base else {}
 				local run, serr = runner.submit(c.runner, cur, {
-					trigger = { kind = "manual", detail = `Roost 面板 · {info.repo}#{number}` },
+					trigger = { kind = "manual", detail = `{if from then `转发自「{from}」` else "Roost 面板"} · {info.repo}#{number}` },
 					repo = util.ifind(ws.repos, info.repo) or info.repo,
 					ref = info.fetch_ref,
 					inputs = final,
@@ -1357,6 +1407,44 @@ function M.dispatch_pr(
 	end)
 	if not ok then
 		cb(`无法启动 gh:{tostring(err)}`)
+	end
+end
+
+-- A `roost_run` event naming this machine: a manual run asked for on device `from`. Runs here
+-- with the inputs it carries (checked again); the event's row says what came of it.
+function run_forwarded(c: Core, p: any, row: eventlog.Row)
+	local id = if type(p.workflow) == "string" then p.workflow else "?"
+	local inputs: { [string]: string } = {}
+	if type(p.inputs) == "table" then
+		for k, v in p.inputs do
+			if type(k) == "string" and type(v) == "string" then
+				inputs[k] = v
+			end
+		end
+	end
+	local from = if type(p.from_name) == "string" and p.from_name ~= ""
+		then p.from_name
+		elseif type(p.from) == "string" then M.device_name(c, p.from)
+		else "?"
+	if type(p.pr) == "string" then
+		row.reasons[id] = `「{from}」请本机在 {p.pr} 上运行(读取拉取请求后排队)`
+		M.dispatch_pr(c, id, inputs, p.pr, function(err)
+			if err then
+				M.notice(c, "error", `「{from}」请本机运行的 {id} 未排队:{err}`)
+			end
+		end, nil, from)
+		return
+	end
+	local wf, final, why = manual(c, id, inputs)
+	local rid, err = nil, why
+	if wf then
+		rid, err = run_here(c, wf, final, nil, nil, `转发自「{from}」`, row.delivery)
+	end
+	if rid then
+		table.insert(row.runs, rid)
+	else
+		row.reasons[id] = err or "未能排队"
+		M.notice(c, "error", `「{from}」请本机运行的 {id} 未排队:{err or "未知原因"}`)
 	end
 end
 
@@ -1761,9 +1849,24 @@ function M.inbox_report(c: Core, run: store.Run, raw: string): string?
 	return note
 end
 
--- On an observer the executor's inbox (uploaded with its runs), else this machine's.
+-- This machine's inbox, with each workflow another device runs taken from that device's upload.
 local function inbox_boxes(c: Core): { [string]: inbox.Box }?
-	return if M.role(c) == "observer" then c.dev.remote_inbox else nil
+	if next(c.dev.remote) == nil then
+		return nil
+	end
+	local f = relay.fleet(c.relay)
+	local out: { [string]: inbox.Box } = {}
+	for wf, box in c.inbox.boxes do
+		out[wf] = box
+	end
+	for id, rem in c.dev.remote do
+		for wf, box in rem.inbox do
+			if fleet.owner(f, wf) == id then
+				out[wf] = box
+			end
+		end
+	end
+	return out
 end
 
 -- Every item not dismissed here, most pressing first.
@@ -1791,7 +1894,8 @@ function M.inbox_run(c: Core, wf: string, id: string, cb: (string?) -> ())
 			elseif a.pr then
 				M.dispatch_pr(c, a.workflow, a.inputs, a.pr, cb)
 			else
-				cb(M.dispatch(c, a.workflow, a.inputs))
+				local err = M.dispatch(c, a.workflow, a.inputs)
+				cb(err)
 			end
 			return
 		end
@@ -3668,18 +3772,6 @@ function on_finished(c: Core, run: store.Run)
 	local h = evolve_host(c)
 	local w = c.workflows
 	local wf = if w then w.by_id[run.workflow] else nil
-	-- A run that ends after this machine became an observer (it started as the executor): the
-	-- configuration is the new executor's now, so nothing is applied, undone or started here.
-	local observer = relay.role(c.relay) == "observer"
-	if observer then
-		for _, s in run.steps do
-			if s.kind == "upgrade" and s.state == "success" then
-				watch_upgrades(c, run.id)
-			end
-		end
-		M.changed(c)
-		return
-	end
 	if run.state == "success" and wf and wf.evolve then
 		local lines = evolve.apply(h, c.book, run)
 		if #lines > 0 then
@@ -3692,6 +3784,7 @@ function on_finished(c: Core, run: store.Run)
 			watch_upgrades(c, run.id)
 		end
 	end
+	-- Evolvers run on the device whose run fired them: they read its run directory.
 	local rolled = evolve.observe(h, c.book, run)
 	if table.find(rolled, run.workflow) == nil then
 		for _, f in evolve.fire(h, c.book, run) do
@@ -3823,14 +3916,20 @@ function M.upgrades(c: Core, n: number): { upgrade.Result }
 end
 
 -- ---------------------------------------------------------------------------------------------
--- Devices (lib/fleet.luau, agent/src/fleet.rs): the executor uploads its configuration and its
--- recent runs; an observer applies the configuration here and shows the runs.
+-- Devices (lib/fleet.luau, agent/src/fleet.rs): which device runs which workflow, the workflow
+-- configuration every device shares, and each device's recent runs. Any device edits the
+-- configuration: an edit here goes up on top of the revision this machine last had; a newer one
+-- on the relay is applied here (unsynced edits of this machine are backed up first).
+--
+-- This machine's last sync with the relay: kv `sync` = { url, revision } and SYNC_BASE, its
+-- configuration as built right after (what local edits are told by).
 
 local DEV_MS = 5000
--- The executor rebuilds its configuration at least this often (edits mark it dirty sooner).
+-- The configuration is built again at least this often (edits mark it dirty sooner).
 local CFG_EVERY = 30
--- A configuration that failed to apply is retried after this long (or when it changes).
-local MIRROR_RETRY = 60
+-- A configuration that failed to apply, or an upload that failed, is retried after this long.
+local CFG_RETRY = 60
+local SYNC_BASE = "sync-base.roost.toml"
 -- A running run's log tail is read again after this long; at most this many reads at once.
 local TAIL_EVERY = 5
 local MAX_TAILING = 4
@@ -3845,74 +3944,144 @@ export type Device = {
 	name: string?,
 	last_seen: number?,
 	cursor: number?,
-	executor: boolean,
+	default: boolean, -- the default device
 	me: boolean,
+	workflows: number, -- how many workflows it runs now
 }
 
-function M.role(c: Core): fleet.Role
-	return relay.role(c.relay)
+function M.me_id(c: Core): string
+	return c.relay.h.client_id
 end
 
-function M.executor(c: Core): fleet.Executor?
+-- The default device, when one is assigned.
+function M.default_device(c: Core): fleet.Executor?
 	return relay.executor(c.relay)
 end
 
--- Why the relay can't say who the executor is (its device record is unreadable), or nil.
+-- Why the relay can't say who runs what (its device record is unreadable), or nil.
 function M.fleet_error(c: Core): string?
 	return relay.fleet_error(c.relay)
 end
 
--- The devices the relay has heard from since it started, and the executor even when it hasn't.
+-- Whether devices share the work at all: a default device or an assignment exists (else every
+-- device runs every workflow).
+function M.shared(c: Core): boolean
+	if not c.relay.state.configured then
+		return false
+	end
+	local f = relay.fleet(c.relay)
+	return fleet.error(f) ~= nil or fleet.executor(f) ~= nil or next(fleet.assignments(f)) ~= nil
+end
+
+-- The device that runs workflow `id` now (nil: every device), and whether that is this machine.
+function M.owner(c: Core, id: string): (string?, boolean)
+	local o = if c.relay.state.configured then fleet.owner(relay.fleet(c.relay), id) else nil
+	return o, relay.runs_here(c.relay, id)
+end
+
+-- The device workflow `id` has of its own (nil: it follows the default device).
+function M.assigned(c: Core, id: string): string?
+	return if c.relay.state.configured then fleet.assigned(relay.fleet(c.relay), id) else nil
+end
+
+-- The devices the relay has heard from since it started, and those on record (the default
+-- device, assigned ones, ones that uploaded runs) even when it hasn't.
 function M.devices(c: Core): { Device }
 	local out: { Device } = {}
-	local ex = relay.executor(c.relay)
+	local f = relay.fleet(c.relay)
+	local ex = fleet.executor(f)
 	local me = c.relay.h.client_id
-	local agent = c.relay.state.agent
-	local seen: { [string]: boolean } = {}
-	if agent and type(agent.clients) == "table" then
-		for _, x in agent.clients do
-			if type(x) == "table" and type(x.id) == "string" and not seen[x.id] then
-				seen[x.id] = true
-				table.insert(out, {
-					id = x.id,
-					name = if type(x.name) == "string" and x.name ~= "" then x.name else nil,
-					last_seen = util.rfc3339(x.last_seen),
-					cursor = if type(x.cursor) == "number" then x.cursor else nil,
-					executor = ex ~= nil and ex.id == x.id,
-					me = x.id == me,
-				})
+	local counts: { [string]: number } = {}
+	if c.workflows then
+		for _, wf in c.workflows.list do
+			local o = fleet.owner(f, wf.id)
+			if o then
+				counts[o] = (counts[o] or 0) + 1
 			end
 		end
 	end
-	if ex and not seen[ex.id] then
-		table.insert(out, { id = ex.id, name = ex.name, executor = true, me = ex.id == me })
+	local seen: { [string]: boolean } = {}
+	local function add(id: string, name: string?, last_seen: number?, cursor: number?)
+		if seen[id] then
+			return
+		end
+		seen[id] = true
+		table.insert(out, {
+			id = id,
+			name = name or fleet.name_of(f, id),
+			last_seen = last_seen,
+			cursor = cursor,
+			default = ex ~= nil and ex.id == id,
+			me = id == me,
+			workflows = counts[id] or 0,
+		})
+	end
+	local agent = c.relay.state.agent
+	if agent and type(agent.clients) == "table" then
+		for _, x in agent.clients do
+			if type(x) == "table" and type(x.id) == "string" then
+				add(
+					x.id,
+					if type(x.name) == "string" and x.name ~= "" then x.name else nil,
+					util.rfc3339(x.last_seen),
+					if type(x.cursor) == "number" then x.cursor else nil
+				)
+			end
+		end
+	end
+	if ex then
+		add(ex.id, ex.name, nil, nil)
+	end
+	for _, id in util.keys(counts) do
+		add(id, nil, nil, nil)
+	end
+	if f and type(f.uploads) == "table" then
+		for _, id in util.keys(f.uploads) do
+			add(id, nil, nil, nil)
+		end
+	end
+	if not seen[me] then
+		add(me, c.relay.cfg.client_name, nil, nil)
 	end
 	table.sort(out, function(a, b)
-		if a.executor ~= b.executor then
-			return a.executor
+		if a.me ~= b.me then
+			return a.me
+		end
+		if a.default ~= b.default then
+			return a.default
 		end
 		return (a.last_seen or 0) > (b.last_seen or 0)
 	end)
 	return out
 end
 
--- Makes device `id` the executor (this machine or another the relay knows).
-function M.assign_executor(c: Core, id: string)
-	relay.assign(c.relay, id, function(ok, msg)
+-- Makes device `id` the default one (nil: none, every device runs what isn't assigned).
+function M.assign_default(c: Core, id: string?)
+	relay.assign(c.relay, fleet.DEFAULT, id, function(ok, msg)
 		if ok then
-			local ex = relay.executor(c.relay)
-			M.notice(c, "success", `执行者已改为「{fleet.label(ex)}」`)
-			c.dev.cfg_dirty = true
-			dev_loop(c)
+			M.notice(c, "success", if id then `默认设备已改为「{M.device_name(c, id)}」` else "已取消默认设备:未指定设备的工作流由每台设备运行")
 		else
-			M.notice(c, "error", `无法指定执行者:{msg}`)
+			M.notice(c, "error", `无法指定默认设备:{msg}`)
 		end
 	end)
 end
 
--- The executor's configuration as uploaded: every workflow, its files, the libraries in use, all
--- repositories (branch settings only) and every group; env values blank. Stable while nothing
--- changes (no time in it).
+-- Gives workflow `wf` to device `id` (nil: it follows the default device again).
+function M.assign_workflow(c: Core, wf: string, id: string?)
+	local w = c.workflows
+	local name = if w and w.by_id[wf] then w.by_id[wf].name else wf
+	relay.assign(c.relay, wf, id, function(ok, msg)
+		if ok then
+			M.notice(c, "success", if id then `{name} 改由「{M.device_name(c, id)}」运行` else `{name} 改为跟随默认设备`)
+		else
+			M.notice(c, "error", `无法指定 {name} 的运行设备:{msg}`)
+		end
+	end)
+end
+
+-- This machine's workflow configuration as shared: every workflow, its files, the libraries in
+-- use, all repositories (branch settings only) and every group; env values blank. Stable while
+-- nothing changes (no time in it).
 local function sync_text(c: Core): (string?, string?)
 	local w = c.workflows
 	if w == nil or #c.workflow_issues > 0 then
@@ -3927,48 +4096,391 @@ local function sync_text(c: Core): (string?, string?)
 		return nil, err
 	end
 	b.exported_at = 0
-	local text = bundle.encode(b, "Roost 设备同步:执行者的工作流配置(env 的值不上传)")
+	local text = bundle.encode(b, "Roost 设备同步:各设备共用的工作流配置(env 的值不上传)")
 	if #text > bundle.MAX_BYTES then
-		return nil, `配置超过 {bundle.MAX_BYTES // (1024 * 1024)} MiB,无法同步给观察者`
+		return nil, `配置超过 {bundle.MAX_BYTES // (1024 * 1024)} MiB,无法同步给其他设备`
 	end
 	return text, nil
 end
 
-local function upload_config(c: Core)
+-- The revision of the shared configuration this machine last synced with the relay, or nil.
+local function synced_rev(c: Core): string?
+	local ok, v = pcall(tern.kv.get, "sync")
+	if ok and type(v) == "table" and v.url == c.relay.cfg.url and type(v.revision) == "string" then
+		return v.revision
+	end
+	return nil
+end
+
+-- What this machine's configuration was right after its last sync (nil: never, or unreadable).
+-- Read from SYNC_BASE once per revision.
+local function synced_text(c: Core): string?
+	local rev = synced_rev(c)
+	local d = c.dev
+	if rev == nil then
+		return nil
+	elseif d.base_rev == rev then
+		return d.base_text
+	end
+	local ok, text = pcall(tern.fs.read, `{c.data}/{SYNC_BASE}`, bundle.MAX_BYTES + 1)
+	d.base_rev, d.base_text = rev, if ok and type(text) == "string" then text else nil
+	return d.base_text
+end
+
+local function mark_synced(c: Core, rev: string, text: string)
+	local d = c.dev
+	pcall(tern.fs.write, `{c.data}/{SYNC_BASE}`, text)
+	pcall(tern.kv.set, "sync", { url = c.relay.cfg.url, revision = rev })
+	d.base_rev, d.base_text = rev, text
+	d.cfg_at, d.cfg_err, d.cfg_failed = now(), nil, nil
+end
+
+-- Whether this machine's subscriptions may be stale for the others: the relay holds a
+-- configuration this machine hasn't got yet, this machine doesn't know yet what it holds (the
+-- relay hasn't answered since it was configured), or (with a relay that shares configurations) an
+-- edit here hasn't gone up yet, so the devices in charge don't have the workflows it subscribes.
+function config_behind(c: Core): boolean
+	if not c.relay.state.configured then
+		return false
+	end
+	local f = relay.fleet(c.relay)
+	if f == nil then
+		return true
+	end
+	local held = if type(f.config) == "table" and type(f.config.revision) == "string" then f.config.revision else nil
+	if held ~= nil and held ~= synced_rev(c) then
+		return true
+	end
+	local d = c.dev
+	-- `owners` marks a relay that keeps a shared configuration (older ones refuse other devices' uploads).
+	return type(f.owners) == "table" and (d.cfg_dirty or (d.cfg_text ~= nil and d.cfg_text ~= synced_text(c)))
+end
+
+function M.config_behind(c: Core): boolean
+	return config_behind(c)
+end
+
+-- How many `workflows.toml.before-sync-<time>` copies are kept (oldest go first).
+local MAX_SYNC_BACKUPS = 10
+
+-- Copies workflows.toml (env values included) to `workflows.toml.before-sync-<time>` and exports
+-- the workflows, before a newer shared configuration replaces edits that never left this machine.
+-- Returns the export's path; an error means nothing may be replaced (the workflows that would go
+-- are kept nowhere else).
+local function backup_before_sync(c: Core, old: string): (string?, string?)
+	local w = c.workflows
+	if w == nil or #c.workflow_issues > 0 then
+		return nil, "本机 workflows.toml 有错误,又有没同步出去的修改:修好后才会套用其他设备的配置(以免连同脚本文件一起丢失)"
+	end
+	local stamp = os.date("%Y%m%d-%H%M%S", math.floor(now())) :: string
+	local path = `{c.data}/workflows.toml.before-sync-{stamp}`
+	if old ~= "" then
+		local ok, err = pcall(function(): string?
+			tern.fs.write(path, old)
+			return nil
+		end)
+		if not ok then
+			return nil, `无法备份本机的 workflows.toml,没有同步:{err}`
+		end
+	end
+	local okl, names = pcall(tern.fs.list, c.data)
+	if okl and type(names) == "table" then
+		local copies: { string } = {}
+		for _, n in names do
+			if string.match(n, "^workflows%.toml%.before%-sync%-%d+%-%d+$") then
+				table.insert(copies, n)
+			end
+		end
+		table.sort(copies)
+		for i = 1, #copies - MAX_SYNC_BACKUPS do
+			pcall(tern.fs.remove, `{c.data}/{copies[i]}`)
+		end
+	end
+	if #w.list == 0 then
+		return nil, nil
+	end
+	local ids: { string } = {}
+	for _, wf in w.list do
+		table.insert(ids, wf.id)
+	end
+	local p, err = M.export_workflows(c, ids)
+	if p == nil then
+		return nil, `同步前导出本机工作流失败,没有同步(workflows.toml 已另存为 {path}):{err or "未知原因"}`
+	end
+	M.notice(c, "warning", `本机没同步出去的工作流配置被中继上的版本取代:原配置已备份到 {path},并导出到 {p}`)
+	return p, nil
+end
+
+-- Makes this machine's configuration the shared one (`text`, export format): libraries and
+-- workflow files it carries are written, workflows.toml replaced (repo paths and env values kept,
+-- see fleet.mirror_text), files of workflows it no longer has removed (kept when `merge`: they
+-- are imported again right after), groups replaced. `keep`: this machine has edits of its own,
+-- backed up first (the export's path is returned). Everything is checked before anything is
+-- written.
+local function apply_shared(c: Core, text: string, keep: boolean, merge: boolean): (string?, string?)
+	local b, berr = bundle.decode(text, true)
+	if b == nil then
+		return `共享的配置无法读取:{berr}`
+	end
+	local old, rerr = current_text(c)
+	if old == nil then
+		return rerr
+	end
+	local new, missing = fleet.mirror_text(b, old)
+	local w, issues = model.parse_workflows(new)
+	if w == nil then
+		return `共享的配置在本机无效:{issues_text(issues)}`
+	end
+	local wftrees, libtrees = trees(b)
+	for _, raw in b.workflows do
+		local id = tostring(raw.id)
+		if not model.valid_lib(id) then
+			return `工作流 id "{id}" 无效`
+		elseif store.pending(c.store, files.workflow_home(c.data, id)) then
+			return `工作流 {id} 的旧文件正在删除,稍后再同步`
+		end
+		local bad = files.check(wftrees[id] or {})
+		if bad then
+			return `{id} 的文件:{bad}`
+		end
+	end
+	for name, tree in libtrees do
+		if store.pending(c.store, files.lib_root(c.data, name)) then
+			return `文件库 "{name}" 正在删除,稍后再同步`
+		end
+		local bad = files.check(tree)
+		if bad then
+			return `文件库 "{name}":{bad}`
+		end
+	end
+	local exported: string? = nil
+	if keep then
+		local backup_err: string?
+		exported, backup_err = backup_before_sync(c, old)
+		if backup_err then
+			return backup_err
+		end
+	end
+	for _, name in util.keys(libtrees) do
+		local cur = M.library_files(c, name)
+		if cur == nil or not exists(files.lib_root(c.data, name)) or not same_tree(cur.text, libtrees[name]) then
+			local ferr = files.replace(files.lib_root(c.data, name), libtrees[name])
+			if ferr then
+				return `写入文件库 "{name}" 失败:{ferr}`
+			end
+		end
+	end
+	local shared: { [string]: boolean } = {}
+	for _, raw in b.workflows do
+		local id = tostring(raw.id)
+		shared[id] = true
+		local tree = wftrees[id] or {}
+		local cur = M.workflow_files(c, id)
+		if cur == nil or not same_tree(cur.text, tree) then
+			local ferr = files.replace(files.workflow_root(c.data, id), tree)
+			if ferr then
+				return `写入 {id} 的文件失败:{ferr}`
+			end
+		end
+	end
+	local before = c.workflows
+	if new ~= old then
+		local werr = write_workflows(c, old, new)
+		if werr then
+			return werr
+		end
+	end
+	if before then
+		for _, wf in before.list do
+			local home = files.workflow_home(c.data, wf.id)
+			if not shared[wf.id] and not merge and model.valid_lib(wf.id) and exists(home) then
+				store.discard(c.store, home)
+			end
+		end
+	end
+	if c.groups_err == nil then
+		local g = groups.empty()
+		groups.merge(g, b.groups, shared)
+		-- Folding is this machine's view: kept by group name.
+		for _, x in g.list do
+			for _, y in c.groups.list do
+				if y.name == x.name then
+					x.collapsed = y.collapsed
+				end
+			end
+		end
+		if groups.encode(g) ~= groups.encode(c.groups) then
+			local serr = groups.save(c.paths.groups, g)
+			if serr then
+				return `无法保存分组:{serr}`
+			end
+			c.groups = g
+		end
+	end
+	c.dev.missing = missing
+	return nil, exported
+end
+
+-- Rebuilds this machine's configuration text (when edits marked it dirty, else every CFG_EVERY).
+local function build_text(c: Core, force: boolean)
 	local d = c.dev
 	local t = now()
-	if d.cfg_busy or (not d.cfg_dirty and d.cfg_built and t - d.cfg_built < CFG_EVERY) then
+	if not force and not d.cfg_dirty and d.cfg_built and t - d.cfg_built < CFG_EVERY then
 		return
 	end
 	d.cfg_dirty, d.cfg_built = false, t
 	local text, err = sync_text(c)
-	if text == nil then
-		if d.cfg_err ~= err then
-			d.cfg_err = err
-			M.changed(c)
-		end
-		return
+	d.cfg_text = text
+	if err ~= d.cfg_err and (err or d.cfg_failed == nil) then
+		d.cfg_err = err
+		M.changed(c)
 	end
-	-- Unchanged and still what the relay holds: nothing to send. A relay that lost it (its files
-	-- were reset) gets it again.
-	local f = relay.fleet(c.relay)
-	local held = if f and type(f.config) == "table" then f.config.revision else nil
-	if text == d.cfg_text and held ~= nil and held == d.cfg_rev then
-		return
-	end
+end
+
+-- Fetches the relay's configuration (revision `held`) and applies it here, unless it is what this
+-- machine has already. Edits here that never went up (measured right before applying, files read
+-- again) are backed up first.
+local function fetch_shared(c: Core, held: string)
+	local d = c.dev
 	d.cfg_busy = true
-	relay.put_config(c.relay, text, function(ok, body, perr)
+	relay.get_config(c.relay, nil, function(ok, body, err)
 		d.cfg_busy = false
-		if ok then
-			local meta = if type(body) == "table" then body.config else nil
-			d.cfg_text, d.cfg_err, d.cfg_at = text, nil, now()
-			d.cfg_rev = if type(meta) == "table" and type(meta.revision) == "string" then meta.revision else nil
+		local cfg = if type(body) == "table" then body.config else nil
+		if not ok or type(body) ~= "table" or type(body.text) ~= "string" or type(cfg) ~= "table" or type(cfg.revision) ~= "string" then
+			d.cfg_err = err or "中继没有返回配置"
+			d.cfg_failed = { rev = held, at = now() }
+			M.changed(c)
+			return
+		end
+		local rev, text = cfg.revision :: string, body.text :: string
+		relay.note_config(c.relay, cfg)
+		M.reload_files(c)
+		build_text(c, true)
+		if text == d.cfg_text then
+			-- What this machine has already (its own edit, or nothing to change).
+			mark_synced(c, rev, text)
+			relay.sync(c.relay)
+			M.changed(c)
+			return
+		end
+		-- A workflows.toml still the starter template holds nothing worth keeping.
+		local keep = (d.cfg_text == nil or d.cfg_text ~= synced_text(c)) and read_file(c.paths.workflows) ~= DEFAULT_WORKFLOWS
+		local first = synced_rev(c) == nil
+		local okp, res, exported = pcall(apply_shared, c, text, keep, first and keep)
+		local merr = if okp then res else `同步共享的配置时出错:{res}`
+		if merr then
+			d.cfg_err = merr
+			d.cfg_failed = { rev = rev, at = now() }
 		else
-			d.cfg_err = perr or "上传失败"
-			d.cfg_dirty = true
+			build_text(c, true)
+			mark_synced(c, rev, d.cfg_text or "")
+			local who = if type(cfg.client) == "string" then M.device_name(c, cfg.client) else "?"
+			M.notice(c, "success", `已同步「{who}」修改的工作流配置`)
+			if first and okp and type(exported) == "string" then
+				-- Joining with workflows of its own: those the shared configuration lacks come back,
+				-- disabled (env values blank), and go up right away.
+				local summary, ierr = M.import_workflows(c, exported, false)
+				if summary then
+					M.notice(c, "warning", `本机原有、共用配置里没有的工作流已加回(已停用,env 的值见备份):{summary}`)
+					tern.timer(0, function()
+						dev_loop(c)
+					end)
+				elseif ierr and not string.find(ierr, "没有可导入的工作流", 1, true) then
+					M.notice(c, "warning", `本机原有的工作流没能加回(都在导出文件 {exported} 里,可手动导入):{ierr}`)
+				end
+			end
+			relay.sync(c.relay)
 		end
 		M.changed(c)
 	end)
+end
+
+-- Uploads this machine's configuration on top of `base` (the relay's revision, nil when it has
+-- none). Refused because another device got there first: the newer one is applied next.
+local function upload_shared(c: Core, text: string, base: string?)
+	local d = c.dev
+	d.cfg_busy = true
+	relay.put_config(c.relay, text, base, function(ok, body, err)
+		d.cfg_busy = false
+		local meta = if type(body) == "table" then body.config else nil
+		if ok and type(meta) == "table" and type(meta.revision) == "string" then
+			mark_synced(c, meta.revision, text)
+			relay.note_config(c.relay, meta)
+			relay.sync(c.relay)
+		elseif type(body) == "table" and body.code == "config_conflict" then
+			relay.note_config(c.relay, meta)
+		else
+			d.cfg_err = err or "上传失败"
+			d.cfg_failed = { rev = base or "", at = now() }
+		end
+		M.changed(c)
+	end)
+end
+
+-- A machine that synced under the old executor/observer scheme (kv `mirror`, `mirror_exec`,
+-- `workflows.toml.mirrored`): an observer that applied `held` is in sync already; the executor's
+-- configuration is what the relay holds plus edits made since, so it goes up on top of `held`.
+-- The old records go either way.
+local function migrate_sync(c: Core, held: string?)
+	local okm, m = pcall(tern.kv.get, "mirror")
+	local oke, ex = pcall(tern.kv.get, "mirror_exec")
+	local had_m = okm and m ~= nil
+	local had_ex = oke and ex ~= nil
+	if not had_m and not had_ex then
+		return
+	end
+	local url = c.relay.cfg.url
+	if held and synced_rev(c) == nil then
+		if had_ex and ex == url then
+			mark_synced(c, held, "")
+		elseif
+			had_m
+			and type(m) == "table"
+			and m.url == url
+			and type(m.revision) == "string"
+			and read_file(c.paths.workflows) == read_file(`{c.data}/workflows.toml.mirrored`)
+		then
+			-- Untouched since that mirror: in sync with it (a newer revision is fetched next, with
+			-- nothing to keep). Edited by hand: left to the first-sync path, which keeps the edits.
+			mark_synced(c, m.revision, c.dev.cfg_text or "")
+		end
+	end
+	pcall(tern.kv.set, "mirror", nil)
+	pcall(tern.kv.set, "mirror_exec", nil)
+	pcall(tern.fs.remove, `{c.data}/workflows.toml.mirrored`)
+end
+
+-- Brings this machine and the relay to the same configuration: a newer one there is applied here,
+-- an edit here goes up.
+local function sync_config(c: Core)
+	local d = c.dev
+	if d.cfg_busy then
+		return
+	end
+	build_text(c, false)
+	local f = relay.fleet(c.relay)
+	local held = if f and type(f.config) == "table" and type(f.config.revision) == "string" then f.config.revision else nil
+	migrate_sync(c, held)
+	local rev = synced_rev(c)
+	local text = d.cfg_text
+	local failed = d.cfg_failed
+	if held ~= nil and held ~= rev then
+		if failed and failed.rev == held and now() - failed.at < CFG_RETRY then
+			return
+		end
+		fetch_shared(c, held :: string)
+		return
+	end
+	local edited = text ~= nil and text ~= synced_text(c)
+	if text ~= nil and (held == nil or edited) then
+		if failed and failed.rev == (held or "") and now() - failed.at < CFG_RETRY then
+			return
+		end
+		upload_shared(c, text, held)
+	elseif c.relay.state.sync.state == "behind" and not config_behind(c) then
+		-- Nothing to send or apply: the subscriptions held back for it can go now.
+		relay.sync(c.relay)
+	end
 end
 
 -- Reads the last bytes of run `r`'s log into the tail cache.
@@ -4052,7 +4564,7 @@ local function upload_runs(c: Core)
 	-- Unchanged: sent already, unless the relay no longer has it (checked at most every minute;
 	-- its record of the runs comes with the status, not at once).
 	local f = relay.fleet(c.relay)
-	local held = f ~= nil and type(f.runs) == "table"
+	local held = f ~= nil and type(f.uploads) == "table" and type(f.uploads[c.relay.h.client_id]) == "table"
 	if not ok or (json == d.runs_json and (held or now() - (d.runs_at or 0) < RUNS_RECHECK)) then
 		return
 	end
@@ -4068,278 +4580,105 @@ local function upload_runs(c: Core)
 	end)
 end
 
--- How many `workflows.toml.before-sync-<time>` copies are kept (oldest go first).
-local MAX_SYNC_BACKUPS = 10
-
--- Before this machine's configuration is replaced by the executor's, when it may hold something
--- of its own: it never mirrored (no `workflows.toml.mirrored`), it has been the executor since the
--- last mirror, or workflows.toml changed since the mirror wrote it. Then workflows.toml (env values
--- included) is copied to `workflows.toml.before-sync-<time>` and the workflows are exported.
-local function backup_before_mirror(c: Core, old: string)
-	local oke, ran = pcall(tern.kv.get, "mirror_exec")
-	local executed = oke and type(ran) == "string" and ran ~= ""
-	if not executed and read_file(`{c.data}/workflows.toml.mirrored`) == old then
-		return
-	end
-	local stamp = os.date("%Y%m%d-%H%M%S", math.floor(now())) :: string
-	local path = `{c.data}/workflows.toml.before-sync-{stamp}`
-	if old ~= "" then
-		pcall(tern.fs.write, path, old)
-	end
-	local okl, names = pcall(tern.fs.list, c.data)
-	if okl and type(names) == "table" then
-		local copies: { string } = {}
-		for _, n in names do
-			if string.match(n, "^workflows%.toml%.before%-sync%-%d+%-%d+$") then
-				table.insert(copies, n)
-			end
-		end
-		table.sort(copies)
-		for i = 1, #copies - MAX_SYNC_BACKUPS do
-			pcall(tern.fs.remove, `{c.data}/{copies[i]}`)
-		end
-	end
-	local w = c.workflows
-	if w and #w.list > 0 and #c.workflow_issues == 0 then
-		local ids: { string } = {}
-		for _, wf in w.list do
-			table.insert(ids, wf.id)
-		end
-		local p, err = M.export_workflows(c, ids)
-		if p then
-			M.notice(c, "warning", `同步执行者的配置前,已备份本机的工作流:{path},并导出到 {p}`)
-		elseif err then
-			M.notice(c, "error", `同步前导出本机工作流失败(workflows.toml 已另存为 {path}):{err}`)
-		end
-	end
-end
-
--- Makes this machine's configuration the executor's (`text`, export format, revision `rev`):
--- libraries and workflow files it carries are written, workflows.toml replaced (repo paths and
--- env values kept, see fleet.mirror_text), files of workflows it no longer has removed, groups
--- replaced. Everything is checked before anything is written.
-local function apply_mirror(c: Core, text: string, rev: string): string?
-	local b, berr = bundle.decode(text, true)
-	if b == nil then
-		return `执行者的配置无法读取:{berr}`
-	end
-	local old, rerr = current_text(c)
-	if old == nil then
-		return rerr
-	end
-	local new, missing = fleet.mirror_text(b, old, fleet.label(relay.executor(c.relay)))
-	local w, issues = model.parse_workflows(new)
-	if w == nil then
-		return `执行者的配置在本机无效:{issues_text(issues)}`
-	end
-	local wftrees, libtrees = trees(b)
-	for _, raw in b.workflows do
-		local id = tostring(raw.id)
-		if not model.valid_lib(id) then
-			return `工作流 id "{id}" 无效`
-		elseif store.pending(c.store, files.workflow_home(c.data, id)) then
-			return `工作流 {id} 的旧文件正在删除,稍后再同步`
-		end
-		local bad = files.check(wftrees[id] or {})
-		if bad then
-			return `{id} 的文件:{bad}`
-		end
-	end
-	for name, tree in libtrees do
-		if store.pending(c.store, files.lib_root(c.data, name)) then
-			return `文件库 "{name}" 正在删除,稍后再同步`
-		end
-		local bad = files.check(tree)
-		if bad then
-			return `文件库 "{name}":{bad}`
-		end
-	end
-	backup_before_mirror(c, old)
-	for _, name in util.keys(libtrees) do
-		local cur = M.library_files(c, name)
-		if cur == nil or not exists(files.lib_root(c.data, name)) or not same_tree(cur.text, libtrees[name]) then
-			local ferr = files.replace(files.lib_root(c.data, name), libtrees[name])
-			if ferr then
-				return `写入文件库 "{name}" 失败:{ferr}`
-			end
-		end
-	end
-	local mirrored: { [string]: boolean } = {}
-	for _, raw in b.workflows do
-		local id = tostring(raw.id)
-		mirrored[id] = true
-		local tree = wftrees[id] or {}
-		local cur = M.workflow_files(c, id)
-		if cur == nil or not same_tree(cur.text, tree) then
-			local ferr = files.replace(files.workflow_root(c.data, id), tree)
-			if ferr then
-				return `写入 {id} 的文件失败:{ferr}`
-			end
-		end
-	end
-	local before = c.workflows
-	if new ~= old then
-		local werr = write_workflows(c, old, new)
-		if werr then
-			return werr
-		end
-	end
-	-- What the next mirror compares with to tell whether this machine changed anything since;
-	-- written now, so a step failing below doesn't make every retry back up again.
-	pcall(tern.fs.write, `{c.data}/workflows.toml.mirrored`, new)
-	pcall(tern.kv.set, "mirror_exec", false)
-	if before then
-		for _, wf in before.list do
-			local home = files.workflow_home(c.data, wf.id)
-			if not mirrored[wf.id] and model.valid_lib(wf.id) and exists(home) then
-				store.discard(c.store, home)
-			end
-		end
-	end
-	if c.groups_err == nil then
-		local g = groups.empty()
-		local all: { [string]: boolean } = {}
-		for id in mirrored do
-			all[id] = true
-		end
-		groups.merge(g, b.groups, all)
-		-- Folding is this machine's view: kept by group name.
-		for _, x in g.list do
-			for _, y in c.groups.list do
-				if y.name == x.name then
-					x.collapsed = y.collapsed
-				end
-			end
-		end
-		if groups.encode(g) ~= groups.encode(c.groups) then
-			local serr = groups.save(c.paths.groups, g)
-			if serr then
-				return `无法保存分组:{serr}`
-			end
-			c.groups = g
-		end
-	end
-	c.dev.mirror_missing = missing
-	pcall(tern.kv.set, "mirror", { url = c.relay.cfg.url, revision = rev })
-	return nil
-end
-
-local function fetch_config(c: Core)
+-- The other devices' runs, newest first (each with `device` set).
+function M.remote_runs(c: Core): { store.Run }
 	local d = c.dev
-	local f = relay.fleet(c.relay)
-	local meta = if f and type(f.config) == "table" then f.config else nil
-	if d.mirror_busy or meta == nil or type(meta.revision) ~= "string" then
-		return
+	if d.remote_list then
+		return d.remote_list
 	end
-	local rev = meta.revision :: string
-	local okk, applied = pcall(tern.kv.get, "mirror")
-	if okk and type(applied) == "table" and applied.url == c.relay.cfg.url and applied.revision == rev then
-		return
-	end
-	local failed = d.mirror_failed
-	if failed and failed.rev == rev and now() - failed.at < MIRROR_RETRY then
-		return
-	end
-	d.mirror_busy = true
-	relay.get_config(c.relay, nil, function(ok, body, err)
-		d.mirror_busy = false
-		local cfg = if type(body) == "table" then body.config else nil
-		local merr: string?
-		if not ok or type(body) ~= "table" or type(body.text) ~= "string" or type(cfg) ~= "table" then
-			merr = err or "中继没有返回配置"
-		elseif relay.role(c.relay) ~= "observer" then
-			-- Took over while this was in flight: this machine's configuration is the truth now.
-			M.changed(c)
-			return
-		else
-			local ok2, res = pcall(apply_mirror, c, body.text :: string, tostring(cfg.revision))
-			merr = if ok2 then res else `同步执行者的配置时出错:{res}`
+	local out: { store.Run } = {}
+	for _, id in util.keys(d.remote) do
+		for _, r in d.remote[id].runs do
+			table.insert(out, r)
 		end
-		if merr then
-			d.mirror_err = merr
-			d.mirror_failed = { rev = rev, at = now() }
-		else
-			d.mirror_err, d.mirror_failed, d.mirror_at = nil, nil, now()
-			M.notice(c, "success", "已同步执行者的工作流配置")
-		end
-		M.changed(c)
+	end
+	table.sort(out, function(a, b)
+		return a.created_at > b.created_at
 	end)
+	d.remote_list = out
+	return out
 end
 
+-- The log tail another device uploaded with run `r`.
+function M.remote_tail(c: Core, r: store.Run): string?
+	local rem = if r.device then c.dev.remote[r.device] else nil
+	return if rem then rem.tails[r.id] else nil
+end
+
+-- Fetches the runs of every other device whose upload changed; forgets devices that no longer
+-- have one on the relay.
 local function fetch_runs(c: Core)
 	local d = c.dev
-	if d.remote_busy then
-		return
+	local f = relay.fleet(c.relay)
+	local ups: { [string]: any } = if f and type(f.uploads) == "table" then f.uploads else {}
+	local me = c.relay.h.client_id
+	for id in d.remote do
+		if ups[id] == nil then
+			d.remote[id] = nil
+			d.remote_list = nil
+			M.changed(c)
+		end
 	end
-	d.remote_busy = true
-	relay.get_runs(c.relay, d.remote_rev, function(ok, body, err)
-		d.remote_busy = false
-		if not ok or type(body) ~= "table" then
-			if d.remote_err ~= err then
-				d.remote_err = err or "响应无效"
-				M.changed(c)
+	for id, meta in ups do
+		local rev = if type(meta) == "table" and type(meta.revision) == "string" then meta.revision else nil
+		local have = d.remote[id]
+		if type(id) ~= "string" or id == me or rev == nil or d.remote_busy[id] or (have and have.rev == rev) then
+			continue
+		end
+		d.remote_busy[id] = true
+		relay.get_runs(c.relay, id, if have then have.rev else nil, function(ok, body, err)
+			d.remote_busy[id] = nil
+			if not ok or type(body) ~= "table" then
+				if d.remote_err ~= err then
+					d.remote_err = err or "响应无效"
+					M.changed(c)
+				end
+				return
 			end
-			return
-		end
-		d.remote_err = nil
-		local meta = body.runs
-		if type(meta) ~= "table" then
-			-- Nothing uploaded yet.
-			if d.remote_rev ~= nil or #d.remote > 0 then
-				d.remote, d.remote_tails, d.remote_inbox, d.remote_rev, d.remote_at, d.remote_from = {}, {}, {}, nil, nil, nil
-				M.changed(c)
+			d.remote_err = nil
+			local m = body.runs
+			if type(m) ~= "table" then
+				d.remote[id] = nil
+			elseif body.unchanged == true then
+				local cur = d.remote[id]
+				if cur and type(m.revision) == "string" then
+					cur.rev = m.revision
+				end
+				return
+			else
+				local runs, tails, boxes = fleet.decode_runs(body.body)
+				for _, r in runs do
+					r.device = id
+				end
+				d.remote[id] = {
+					runs = runs,
+					tails = tails,
+					inbox = boxes,
+					rev = if type(m.revision) == "string" then m.revision else nil,
+					at = util.rfc3339(m.at),
+				}
 			end
-			return
-		end
-		if body.unchanged == true then
-			return
-		end
-		-- Still the previous executor's upload (the new one hasn't sent its own yet): show none.
-		local ex = relay.executor(c.relay)
-		if ex and meta.client ~= ex.id then
-			d.remote, d.remote_tails, d.remote_inbox = {}, {}, {}
-		else
-			d.remote, d.remote_tails, d.remote_inbox = fleet.decode_runs(body.body)
-		end
-		d.remote_rev = if type(meta.revision) == "string" then meta.revision else nil
-		d.remote_at = util.rfc3339(meta.at)
-		d.remote_from = if type(meta.client) == "string" then meta.client else nil
-		M.changed(c)
-	end)
+			d.remote_list = nil
+			M.changed(c)
+		end)
+	end
 end
 
 local function dev_tick(c: Core)
 	local d = c.dev
-	local role = relay.role(c.relay)
-	if role ~= d.role then
-		d.role = role
-		-- New role: upload everything afresh, fetch everything afresh.
-		d.cfg_text, d.cfg_dirty, d.runs_json, d.exec_noted = nil, true, nil, false
-		d.remote_rev, d.mirror_failed = nil, nil
-		M.changed(c)
-	end
-	if role == "executor" and not d.exec_noted then
-		-- Edits made here from now on exist nowhere else until uploaded: a later mirror backs up first.
-		d.exec_noted = pcall(tern.kv.set, "mirror_exec", c.relay.cfg.url)
-	end
-	local ex = relay.executor(c.relay)
-	local exid = if ex then ex.id else nil
-	if d.remote_exec ~= exid then
-		-- Another executor: the runs shown were the previous one's.
-		d.remote_exec = exid
-		d.remote, d.remote_tails, d.remote_rev, d.remote_at, d.remote_from = {}, {}, nil, nil, nil
-		M.changed(c)
-	end
-	if not c.relay.state.connected then
+	if not c.relay.state.configured then
+		if next(d.remote) then
+			d.remote, d.remote_list = {}, nil
+			M.changed(c)
+		end
 		return
 	end
-	if role == "executor" then
-		upload_config(c)
-		upload_runs(c)
-	elseif role == "observer" then
-		fetch_config(c)
-		fetch_runs(c)
+	if not c.relay.state.connected or relay.fleet_error(c.relay) then
+		return
 	end
+	sync_config(c)
+	upload_runs(c)
+	fetch_runs(c)
 end
 
 -- One tick now (errors logged, never fatal), and the loop's next when none is scheduled.

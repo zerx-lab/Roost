@@ -21,6 +21,9 @@
  *   [data-role='roost.wfcards']              a wrapping row of workflow cards (stretched to the tallest in a row)
  *   [data-role='roost.wftail']               a workflow card's last run and history strip, kept at the card's bottom
  *   [data-role='roost.events']               relayed events page
+ *   [data-role='roost.page']                 settings: a page's content column (capped in width); cards, pairs and stats sit in it
+ *   [data-role='roost.pair']                 settings: two columns of cards, side by side when wide, stacked when narrow
+ *   [data-role='roost.danger']               settings: a card of irreversible actions (delete, clear, forget credentials)
  *   [data-role='roost.relay']                settings: relay and devices page
  *   [data-role='roost.deliveries']           relay page: webhook delivery counts
  *   [data-role='roost.github']               settings: GitHub App page
@@ -151,6 +154,12 @@
 }
 [data-surface='plugin.roost.console'] [data-role='roost.wfgroup.head'] {
 	padding: 2px 2px 0;
+}
+
+/* Settings: a card of irreversible actions keeps a neutral ring (a tone would shout over routine
+ * cleanup) and marks only its head icon in the error color. */
+[data-surface='plugin.roost.settings'] [data-role='roost.danger'] > .sf-card-head .sf-card-ic {
+	color: var(--bad);
 }
 
 [data-surface='plugin.roost.console'] [data-role='roost.form'] .sf-field {

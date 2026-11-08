@@ -1,22 +1,26 @@
-//! The devices sharing this relay. At most one client is the **executor**: the only one that
-//! runs workflows, gets App tokens and pushes subscriptions. Every other client is an observer:
-//! it still reads events (to show them), mirrors the executor's workflow configuration and shows
-//! the executor's recent runs. With no executor assigned every client runs (the behaviour before
-//! devices existed), so assigning one is what stops duplicate runs.
+//! The devices sharing this relay and which of them runs what.
 //!
-//! Assignment is manual and compare-and-set on `revision`. Handing over from one executor to
-//! another records where the new one starts reading events: what the old one confirmed it had
-//! handled (`acked`, the `after` of an events poll that says `ack=<revision>`), so nothing is
-//! skipped; only a batch handed out while the assignment changes can run on both. A new executor
-//! starts with `acked` at its handover (or, coming from no executor, at its own cursor), so a
-//! second reassignment before it polls still hands over the right place.
+//! Every client reads every event and decides from this record which workflows are its own.
+//! `owners["*"]` names the **default device**: it runs every workflow not assigned elsewhere (none
+//! assigned: every device runs everything, the behaviour before devices existed).
+//! `owners[<workflow id>]` gives one workflow to one device. Each list is that assignment's
+//! history, oldest first: an entry's `seq` is the event store's head when it was made, so events
+//! after it are that entry's and earlier ones the previous entry's (before the first entry: the
+//! default device's, or for `*` every device's). A device catching up on a backlog thus runs
+//! exactly what was its own when each event arrived, and reassigning never skips or doubles an
+//! event. Entries no stored event needs any more are pruned.
 //!
-//! An unreadable `fleet.json` is not "no executor" (every device would run): until an executor is
-//! assigned again, nobody may act as one and the record says why (`error`).
+//! The workflow configuration is shared: any device uploads it, compare-and-set on the revision it
+//! last had, and the others apply it. Each device uploads its own run summaries.
 //!
-//! Files in the data directory: `fleet.json` (this state), `fleet-config.toml` (the executor's
-//! configuration, Roost's export format), `fleet-runs.json` (its run summaries, opaque here).
+//! An unreadable `fleet.json` is not "nothing assigned" (every device would run everything): until
+//! a default device is assigned again nobody runs, and the record says why (`error`).
+//!
+//! Files in the data directory: `fleet.json` (this state), `fleet-config.toml` (the shared
+//! configuration, Roost's export format), `fleet-runs-<hex client id>.json` (one device's run
+//! summaries, opaque here).
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,31 +33,40 @@ use tokio::sync::watch;
 
 /// Upper bound on the configuration text (Roost's export format caps itself at 1 MiB too).
 pub const MAX_CONFIG: usize = 1024 * 1024;
-/// Upper bound on the serialized run summaries.
+/// Upper bound on one device's serialized run summaries.
 pub const MAX_RUNS: usize = 512 * 1024;
-const MAX_STATE: u64 = 64 * 1024;
+const MAX_STATE: u64 = 4 * 1024 * 1024;
+/// The `owners` key of the default device.
+pub const DEFAULT: &str = "*";
+/// Entries kept per assignment (older ones go first even when stored events still need them).
+const MAX_HISTORY: usize = 8;
+/// Workflows that may have an assignment of their own.
+pub const MAX_ASSIGNED: usize = 512;
+/// Devices whose run summaries are kept (the one that uploaded longest ago goes first).
+pub const MAX_DEVICES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Acked {
-    pub store_id: String,
+pub struct Owner {
+    /// The device. None: the workflow follows the default device; for `*`, every device runs.
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The event store's head when this was assigned: later events are this owner's.
     pub seq: u64,
+    pub at: DateTime<Utc>,
 }
 
+/// The default device now (the last entry of `owners["*"]`), kept for display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Executor {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
     pub since: DateTime<Utc>,
-    /// The cursor this executor starts after when it took over from another one.
-    #[serde(default)]
-    pub handover: Option<u64>,
-    /// Its progress: the last event an events answer handed it.
-    #[serde(default)]
-    pub acked: Option<Acked>,
 }
 
-/// What the executor last uploaded (the content itself is kept beside the state).
+/// What a device last uploaded (the content itself is kept beside the state).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Blob {
     pub revision: String,
@@ -64,40 +77,51 @@ pub struct Blob {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
-    /// Bumped whenever the executor changes.
+    /// Bumped whenever an assignment changes.
     #[serde(default)]
     pub revision: u64,
     #[serde(default)]
     pub executor: Option<Executor>,
     #[serde(default)]
-    pub config: Option<Blob>,
+    pub owners: BTreeMap<String, Vec<Owner>>,
+    /// The event store the `seq`s count in.
     #[serde(default)]
-    pub runs: Option<Blob>,
-    /// Why the saved record couldn't be read; set only in memory, cleared by the next assignment.
+    pub store: Option<String>,
+    #[serde(default)]
+    pub config: Option<Blob>,
+    /// Each device's run summaries, by client id.
+    #[serde(default)]
+    pub uploads: BTreeMap<String, Blob>,
+    /// Why the saved record couldn't be read; set only in memory, cleared by the next assignment
+    /// of the default device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum FleetError {
-    /// The request needs the executor and came from another client (or none is assigned).
-    NotExecutor,
+    /// The record is unreadable: nothing but assigning the default device is accepted.
+    Broken,
     /// `base_revision` is not the current one.
     Conflict(Box<State>),
+    /// The configuration changed since the uploader last had it (the current one, if any).
+    ConfigConflict(Option<Blob>),
     TooLarge(usize),
+    TooMany(usize),
     Io(String),
 }
 
 struct Inner {
     state: State,
     config: Option<Arc<str>>,
-    runs: Option<Arc<RawValue>>,
+    runs: BTreeMap<String, Arc<RawValue>>,
 }
 
 pub struct Fleet {
     dir: PathBuf,
+    store_id: String,
     inner: Mutex<Inner>,
-    /// Bumped when the executor or the configuration changes, so long-polls answer at once.
+    /// Bumped when an assignment or the configuration changes, so long-polls answer at once.
     wake: watch::Sender<u64>,
     /// Serializes changes: each is written to disk before it is committed in memory.
     writing: tokio::sync::Mutex<()>,
@@ -114,21 +138,54 @@ fn revision_of(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes).get(..8).unwrap_or_default())
 }
 
+fn runs_file(client: &str) -> String {
+    format!("fleet-runs-{}.json", hex::encode(client.as_bytes()))
+}
+
+/// The default device as the last entry of `owners["*"]` says.
+fn executor_of(owners: &BTreeMap<String, Vec<Owner>>) -> Option<Executor> {
+    let o = owners.get(DEFAULT)?.last()?;
+    Some(Executor {
+        id: o.client.clone()?,
+        name: o.name.clone(),
+        since: o.at,
+    })
+}
+
+/// Drops what no stored event needs: an entry covers the events after its `seq` up to the next
+/// entry's, so a first entry whose successor starts before `oldest` covers none of them. A list
+/// left with one "follow the default" entry says nothing and goes too.
+fn prune(owners: &mut BTreeMap<String, Vec<Owner>>, oldest: u64) {
+    for list in owners.values_mut() {
+        while list.get(1).is_some_and(|next| next.seq < oldest) || list.len() > MAX_HISTORY {
+            list.drain(..1);
+        }
+    }
+    owners.retain(|_, list| match list.as_slice() {
+        [] => false,
+        [only] => only.client.is_some(),
+        _ => true,
+    });
+}
+
 impl Fleet {
-    /// Loads the saved state. No file: no executor (every client runs). A file that can't be read
-    /// leaves the record in `error` (nobody may act as the executor until one is assigned).
-    pub fn open(dir: PathBuf) -> Fleet {
+    /// Loads the saved state. No file: nothing assigned (every client runs everything). A file that
+    /// can't be read leaves the record in `error`. Assignments made on another event store (its
+    /// sequence numbers started again) keep only their current entry.
+    pub fn open(dir: PathBuf, store_id: &str) -> Fleet {
         let path = dir.join("fleet.json");
         let mut state: State = match read_capped(&path, MAX_STATE) {
             Some(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                tracing::error!("fleet.json unreadable: {e}; assign the executor again");
+                tracing::error!("fleet.json unreadable: {e}; assign the default device again");
                 State {
                     error: Some(format!("fleet.json unreadable: {e}")),
                     ..State::default()
                 }
             }),
             None if path.exists() => {
-                tracing::error!("fleet.json unreadable or too large; assign the executor again");
+                tracing::error!(
+                    "fleet.json unreadable or too large; assign the default device again"
+                );
                 State {
                     error: Some("fleet.json unreadable or too large".into()),
                     ..State::default()
@@ -136,6 +193,33 @@ impl Fleet {
             }
             None => State::default(),
         };
+        // A record from before assignments had a history: its executor is the default device.
+        if !state.owners.contains_key(DEFAULT)
+            && let Some(ex) = state.executor.clone()
+        {
+            state.owners.insert(
+                DEFAULT.to_string(),
+                vec![Owner {
+                    client: Some(ex.id),
+                    name: ex.name,
+                    seq: 0,
+                    at: ex.since,
+                }],
+            );
+        }
+        if state.store.as_deref() != Some(store_id) {
+            for list in state.owners.values_mut() {
+                if let Some(mut last) = list.pop() {
+                    last.seq = 0;
+                    *list = vec![last];
+                }
+            }
+            state
+                .owners
+                .retain(|_, l| l.iter().any(|o| o.client.is_some()));
+            state.store = Some(store_id.to_string());
+        }
+        state.executor = executor_of(&state.owners);
         let config = state.config.as_ref().and_then(|meta| {
             let b = read_capped(&dir.join("fleet-config.toml"), MAX_CONFIG as u64)?;
             let text = String::from_utf8(b).ok()?;
@@ -144,16 +228,24 @@ impl Fleet {
         if config.is_none() {
             state.config = None;
         }
-        let runs = state.runs.as_ref().and_then(|meta| {
-            let b = read_capped(&dir.join("fleet-runs.json"), MAX_RUNS as u64)?;
-            let raw: Box<RawValue> = serde_json::from_slice(&b).ok()?;
-            (revision_of(raw.get().as_bytes()) == meta.revision).then(|| Arc::<RawValue>::from(raw))
+        // The single executor's run summaries, from before each device uploaded its own.
+        let _ = std::fs::remove_file(dir.join("fleet-runs.json"));
+        let mut runs = BTreeMap::new();
+        state.uploads.retain(|client, meta| {
+            let loaded = read_capped(&dir.join(runs_file(client)), MAX_RUNS as u64)
+                .and_then(|b| serde_json::from_slice::<Box<RawValue>>(&b).ok())
+                .filter(|raw| revision_of(raw.get().as_bytes()) == meta.revision);
+            match loaded {
+                Some(raw) => {
+                    runs.insert(client.clone(), Arc::<RawValue>::from(raw));
+                    true
+                }
+                None => false,
+            }
         });
-        if runs.is_none() {
-            state.runs = None;
-        }
         Fleet {
             dir,
+            store_id: store_id.to_string(),
             inner: Mutex::new(Inner {
                 state,
                 config,
@@ -180,23 +272,21 @@ impl Fleet {
         self.wake.send_modify(|n| *n = n.wrapping_add(1));
     }
 
-    /// Whether `client` may act as the executor: anyone while none is assigned (and the record
-    /// was readable).
-    pub fn allows(&self, client: Option<&str>) -> bool {
-        let g = self.lock();
-        match (&g.state.executor, &g.state.error) {
-            (_, Some(_)) => false,
-            (None, None) => true,
-            (Some(ex), None) => client == Some(ex.id.as_str()),
-        }
+    /// Whether devices may act at all: not while the record is unreadable.
+    pub fn usable(&self) -> bool {
+        self.lock().state.error.is_none()
     }
 
-    fn is_executor(&self, client: &str) -> bool {
-        self.lock()
-            .state
-            .executor
-            .as_ref()
-            .is_some_and(|ex| ex.id == client)
+    /// The name the record has for `client`, when it appears in it.
+    pub fn known(&self, client: &str) -> Option<Option<String>> {
+        let g = self.lock();
+        g.state
+            .owners
+            .values()
+            .flatten()
+            .rev()
+            .find(|o| o.client.as_deref() == Some(client))
+            .map(|o| o.name.clone())
     }
 
     async fn save_state(&self, state: &State) -> Result<(), FleetError> {
@@ -206,85 +296,61 @@ impl Fleet {
             .map_err(|e| FleetError::Io(format!("cannot write fleet.json: {e}")))
     }
 
-    /// Makes `client` the executor when `base` is the current revision. Taking over from another
-    /// executor starts the new one after what the old one confirmed on `store_id`; coming from no
-    /// executor (everyone ran), after `own_cursor`, the new one's last poll.
+    /// Gives `key` (a workflow id, or `DEFAULT`) to `client` (None: a workflow follows the default
+    /// device again; the default cleared: every device runs) from the events after the store's
+    /// head on, when `base` is the current revision. `store` gives the head and the oldest stored
+    /// event (what the history must still cover); it is read once the change holds the lock, so
+    /// only events pushed during the write itself can still be seen under the old record. Only
+    /// the default device may be assigned while the record is unreadable.
     pub async fn assign(
         &self,
-        client: &str,
+        key: &str,
+        client: Option<&str>,
         name: Option<String>,
         base: u64,
-        store_id: &str,
-        own_cursor: Option<u64>,
+        store: impl FnOnce() -> (u64, u64),
     ) -> Result<State, FleetError> {
         let _w = self.writing.lock().await;
         let cur = self.state();
         if cur.revision != base {
             return Err(FleetError::Conflict(Box::new(cur)));
         }
-        if cur.error.is_none() && cur.executor.as_ref().is_some_and(|ex| ex.id == client) {
+        let broken = cur.error.is_some();
+        if broken && key != DEFAULT {
+            return Err(FleetError::Broken);
+        }
+        let now_owner = cur
+            .owners
+            .get(key)
+            .and_then(|l| l.last())
+            .and_then(|o| o.client.as_deref());
+        if !broken && now_owner == client {
             return Ok(cur);
         }
-        let handover = cur
-            .executor
-            .as_ref()
-            .and_then(|ex| ex.acked.as_ref())
-            .filter(|a| a.store_id == store_id)
-            .map(|a| a.seq);
-        let start = if cur.executor.is_some() {
-            handover
-        } else {
-            own_cursor
-        };
+        if key != DEFAULT
+            && !cur.owners.contains_key(key)
+            && cur.owners.keys().filter(|k| *k != DEFAULT).count() >= MAX_ASSIGNED
+        {
+            return Err(FleetError::TooMany(MAX_ASSIGNED));
+        }
+        let (head, oldest) = store();
         let mut next = cur;
+        next.owners.entry(key.to_string()).or_default().push(Owner {
+            client: client.map(str::to_string),
+            name: client.and(name),
+            seq: head,
+            at: Utc::now(),
+        });
+        prune(&mut next.owners, oldest);
+        next.executor = executor_of(&next.owners);
         next.revision += 1;
         next.error = None;
-        next.executor = Some(Executor {
-            id: client.to_string(),
-            name,
-            since: Utc::now(),
-            handover,
-            acked: start.map(|seq| Acked {
-                store_id: store_id.to_string(),
-                seq,
-            }),
-        });
+        next.store = Some(self.store_id.clone());
         self.save_state(&next).await?;
         self.lock().state = next.clone();
         self.bump();
-        tracing::info!(
-            client,
-            ?handover,
-            revision = next.revision,
-            "executor assigned"
-        );
+        tracing::info!(key, ?client, head, revision = next.revision, "assigned");
         Ok(next)
-    }
-
-    /// Records that the executor of `revision` has handled the events up to `seq` (it polls after
-    /// them). Ignored from anyone else, or for an assignment that is no longer current. Kept in
-    /// memory when it can't be saved (only a restart would forget it).
-    pub async fn ack(&self, client: &str, revision: u64, store_id: &str, seq: u64) {
-        let _w = self.writing.lock().await;
-        let mut next = self.state();
-        if next.revision != revision {
-            return;
-        }
-        let acked = Acked {
-            store_id: store_id.to_string(),
-            seq,
-        };
-        let Some(ex) = next.executor.as_mut().filter(|ex| ex.id == client) else {
-            return;
-        };
-        if ex.acked.as_ref() == Some(&acked) {
-            return;
-        }
-        ex.acked = Some(acked);
-        if let Err(FleetError::Io(e)) = self.save_state(&next).await {
-            tracing::warn!("cannot record executor progress: {e}");
-        }
-        self.lock().state = next;
     }
 
     pub fn config(&self) -> (Option<Blob>, Option<Arc<str>>) {
@@ -292,24 +358,36 @@ impl Fleet {
         (g.state.config.clone(), g.config.clone())
     }
 
-    pub fn runs(&self) -> (Option<Blob>, Option<Arc<RawValue>>) {
+    pub fn runs(&self, client: &str) -> (Option<Blob>, Option<Arc<RawValue>>) {
         let g = self.lock();
-        (g.state.runs.clone(), g.runs.clone())
+        (
+            g.state.uploads.get(client).cloned(),
+            g.runs.get(client).cloned(),
+        )
     }
 
-    /// Stores the executor's configuration. Unchanged text writes nothing.
-    pub async fn put_config(&self, client: &str, text: String) -> Result<Blob, FleetError> {
+    /// Stores the shared configuration when `base` is the revision the relay holds (None: it holds
+    /// none). The text it already holds is accepted whatever `base` says.
+    pub async fn put_config(
+        &self,
+        client: &str,
+        text: String,
+        base: Option<&str>,
+    ) -> Result<Blob, FleetError> {
         if text.len() > MAX_CONFIG {
             return Err(FleetError::TooLarge(MAX_CONFIG));
         }
         let _w = self.writing.lock().await;
-        if !self.is_executor(client) {
-            return Err(FleetError::NotExecutor);
+        let mut next = self.state();
+        if next.error.is_some() {
+            return Err(FleetError::Broken);
         }
         let revision = revision_of(text.as_bytes());
-        let mut next = self.state();
         if let Some(b) = next.config.as_ref().filter(|b| b.revision == revision) {
             return Ok(b.clone());
+        }
+        if next.config.as_ref().map(|b| b.revision.as_str()) != base {
+            return Err(FleetError::ConfigConflict(next.config));
         }
         crate::util::write_atomic(&self.dir.join("fleet-config.toml"), text.as_bytes())
             .await
@@ -331,36 +409,52 @@ impl Fleet {
         Ok(blob)
     }
 
-    /// Stores the executor's run summaries (any JSON; the plugin defines the shape).
+    /// Stores `client`'s run summaries (any JSON; the plugin defines the shape). A new device over
+    /// MAX_DEVICES pushes out the one that uploaded longest ago.
     pub async fn put_runs(&self, client: &str, raw: Box<RawValue>) -> Result<Blob, FleetError> {
         let bytes = raw.get().len();
         if bytes > MAX_RUNS {
             return Err(FleetError::TooLarge(MAX_RUNS));
         }
         let _w = self.writing.lock().await;
-        if !self.is_executor(client) {
-            return Err(FleetError::NotExecutor);
-        }
         let revision = revision_of(raw.get().as_bytes());
         let mut next = self.state();
-        if let Some(b) = next.runs.as_ref().filter(|b| b.revision == revision) {
+        if let Some(b) = next.uploads.get(client).filter(|b| b.revision == revision) {
             return Ok(b.clone());
         }
-        crate::util::write_atomic(&self.dir.join("fleet-runs.json"), raw.get().as_bytes())
+        let mut evicted = None;
+        if !next.uploads.contains_key(client)
+            && next.uploads.len() >= MAX_DEVICES
+            && let Some(old) = next
+                .uploads
+                .iter()
+                .min_by_key(|(_, b)| b.at)
+                .map(|(c, _)| c.clone())
+        {
+            next.uploads.remove(&old);
+            evicted = Some(old);
+        }
+        crate::util::write_atomic(&self.dir.join(runs_file(client)), raw.get().as_bytes())
             .await
-            .map_err(|e| FleetError::Io(format!("cannot write fleet-runs.json: {e}")))?;
+            .map_err(|e| FleetError::Io(format!("cannot write the run summaries: {e}")))?;
         let blob = Blob {
             revision,
             client: client.to_string(),
             at: Utc::now(),
             bytes,
         };
-        next.runs = Some(blob.clone());
+        next.uploads.insert(client.to_string(), blob.clone());
         self.save_state(&next).await?;
         {
             let mut g = self.lock();
             g.state = next;
-            g.runs = Some(Arc::from(raw));
+            g.runs.insert(client.to_string(), Arc::from(raw));
+            if let Some(old) = &evicted {
+                g.runs.remove(old);
+            }
+        }
+        if let Some(old) = evicted {
+            let _ = tokio::fs::remove_file(self.dir.join(runs_file(&old))).await;
         }
         Ok(blob)
     }
@@ -374,99 +468,152 @@ mod tests {
         RawValue::from_string(s.to_string()).unwrap()
     }
 
-    #[tokio::test]
-    async fn assignment_hands_over_what_the_old_executor_confirmed_and_survives_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = Fleet::open(dir.path().to_path_buf());
-        assert!(
-            f.allows(Some("a")) && f.allows(None),
-            "no executor: everyone runs"
-        );
-
-        // From no executor: a starts where its own polls were.
-        let s = f
-            .assign("a", Some("mac".into()), 0, "st", Some(4))
-            .await
-            .unwrap();
-        let ex = s.executor.as_ref().unwrap();
-        assert_eq!((s.revision, ex.handover), (1, None));
-        assert_eq!(ex.acked.as_ref().map(|a| a.seq), Some(4));
-        assert!(f.allows(Some("a")) && !f.allows(Some("b")) && !f.allows(None));
-        assert!(matches!(
-            f.assign("b", None, 0, "st", None).await,
-            Err(FleetError::Conflict(_))
-        ));
-
-        f.ack("b", 1, "st", 9).await; // not the executor: ignored
-        f.ack("a", 0, "st", 8).await; // an old assignment: ignored
-        f.ack("a", 1, "st", 7).await;
-        let s = f.assign("b", None, 1, "st", Some(30)).await.unwrap();
-        assert_eq!(s.executor.as_ref().unwrap().handover, Some(7));
-
-        // b never polled as the executor: c still starts after 7, not at its own cursor.
-        let s = f.assign("c", None, 2, "st", Some(40)).await.unwrap();
-        assert_eq!(s.executor.as_ref().unwrap().handover, Some(7));
-
-        // A cursor on another store says nothing about this one.
-        f.ack("c", 3, "old", 3).await;
-        let s = f.assign("a", None, 3, "st", None).await.unwrap();
-        assert_eq!(s.executor.as_ref().unwrap().handover, None);
-
-        let again = Fleet::open(dir.path().to_path_buf());
-        assert_eq!(again.state().revision, 4);
-        assert!(again.allows(Some("a")) && !again.allows(Some("b")));
-
-        // An unreadable record lets nobody act as the executor until one is assigned again.
-        std::fs::write(dir.path().join("fleet.json"), "{ truncated").unwrap();
-        let broken = Fleet::open(dir.path().to_path_buf());
-        assert!(broken.state().error.is_some());
-        assert!(!broken.allows(Some("a")) && !broken.allows(None));
-        let s = broken.assign("a", None, 0, "st", None).await.unwrap();
-        assert!(s.error.is_none() && broken.allows(Some("a")));
+    fn owners_of(s: &State, key: &str) -> Vec<(Option<String>, u64)> {
+        s.owners
+            .get(key)
+            .map(|l| l.iter().map(|o| (o.client.clone(), o.seq)).collect())
+            .unwrap_or_default()
     }
 
     #[tokio::test]
-    async fn uploads_need_the_executor_and_keep_revisions() {
+    async fn assignments_keep_the_history_stored_events_need_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let f = Fleet::open(dir.path().to_path_buf());
+        let f = Fleet::open(dir.path().to_path_buf(), "st");
+        assert!(f.usable());
+
+        let s = f
+            .assign(DEFAULT, Some("a"), Some("mac".into()), 0, || (4, 1))
+            .await
+            .unwrap();
+        assert_eq!(s.revision, 1);
+        assert_eq!(s.executor.as_ref().map(|e| e.id.as_str()), Some("a"));
         assert!(matches!(
-            f.put_config("a", "x".into()).await,
-            Err(FleetError::NotExecutor)
+            f.assign("wf", Some("b"), None, 0, || (5, 1)).await,
+            Err(FleetError::Conflict(_))
         ));
-        f.assign("a", None, 0, "st", None).await.unwrap();
+        let s = f.assign("wf", Some("b"), None, 1, || (6, 1)).await.unwrap();
+        // The same owner again changes nothing.
+        let same = f.assign("wf", Some("b"), None, 2, || (9, 1)).await.unwrap();
+        assert_eq!(same.revision, 2);
+        let s = f
+            .assign("wf", None, None, s.revision, || (10, 1))
+            .await
+            .unwrap();
+        assert_eq!(owners_of(&s, "wf"), vec![(Some("b".into()), 6), (None, 10)]);
+        // Once no stored event is at or before 10, b's entry covers nothing.
+        let s = f
+            .assign(DEFAULT, Some("c"), None, s.revision, || (12, 11))
+            .await
+            .unwrap();
+        assert!(
+            !s.owners.contains_key("wf"),
+            "following the default says nothing"
+        );
+        assert_eq!(
+            owners_of(&s, DEFAULT),
+            vec![(Some("a".into()), 4), (Some("c".into()), 12)]
+        );
+
+        let again = Fleet::open(dir.path().to_path_buf(), "st");
+        assert_eq!(again.state().revision, s.revision);
+        assert_eq!(again.state().executor.unwrap().id, "c");
+        assert_eq!(again.known("a"), Some(Some("mac".into())));
+
+        // Another event store: sequence numbers start again, only current owners stay.
+        let other = Fleet::open(dir.path().to_path_buf(), "new");
+        assert_eq!(
+            owners_of(&other.state(), DEFAULT),
+            vec![(Some("c".into()), 0)]
+        );
+
+        // An unreadable record: nothing goes until the default device is assigned again.
+        std::fs::write(dir.path().join("fleet.json"), "{ truncated").unwrap();
+        let broken = Fleet::open(dir.path().to_path_buf(), "st");
+        assert!(!broken.usable());
         assert!(matches!(
-            f.put_config("b", "x".into()).await,
-            Err(FleetError::NotExecutor)
+            broken.assign("wf", Some("a"), None, 0, || (1, 1)).await,
+            Err(FleetError::Broken)
         ));
+        assert!(matches!(
+            broken.put_config("a", "x".into(), None).await,
+            Err(FleetError::Broken)
+        ));
+        let s = broken
+            .assign(DEFAULT, Some("a"), None, 0, || (1, 1))
+            .await
+            .unwrap();
+        assert!(s.error.is_none() && broken.usable());
+    }
+
+    #[tokio::test]
+    async fn an_old_record_makes_its_executor_the_default_device() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fleet.json"),
+            r#"{"revision":3,"executor":{"id":"a","name":"mac","since":"2026-11-06T00:00:00Z","handover":7,"acked":{"store_id":"st","seq":9}},"runs":{"revision":"x","client":"a","at":"2026-11-06T00:00:00Z","bytes":1}}"#,
+        )
+        .unwrap();
+        let f = Fleet::open(dir.path().to_path_buf(), "st");
+        let s = f.state();
+        assert!(s.error.is_none());
+        assert_eq!(owners_of(&s, DEFAULT), vec![(Some("a".into()), 0)]);
+        assert_eq!(s.executor.unwrap().name.as_deref(), Some("mac"));
+    }
+
+    #[tokio::test]
+    async fn the_configuration_is_compare_and_set_and_runs_are_per_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Fleet::open(dir.path().to_path_buf(), "st");
         let mut rx = f.subscribe();
         rx.borrow_and_update();
-        let b1 = f.put_config("a", "[roost]\n".into()).await.unwrap();
+        let b1 = f.put_config("a", "[roost]\n".into(), None).await.unwrap();
         assert!(
             rx.has_changed().unwrap(),
             "a new configuration wakes long-polls"
         );
-        let b2 = f.put_config("a", "[roost]\n".into()).await.unwrap();
-        assert_eq!(
-            (b1.revision.clone(), b1.at),
-            (b2.revision, b2.at),
-            "unchanged"
-        );
+        // The same text is accepted whatever base it comes with.
+        let b2 = f.put_config("b", "[roost]\n".into(), None).await.unwrap();
+        assert_eq!((b1.revision.clone(), b1.at), (b2.revision, b2.at));
+        // An edit made on an older revision is refused with the current one.
+        match f.put_config("b", "two".into(), None).await {
+            Err(FleetError::ConfigConflict(Some(cur))) => assert_eq!(cur.revision, b1.revision),
+            other => panic!("{other:?}"),
+        }
+        let b3 = f
+            .put_config("b", "two".into(), Some(&b1.revision))
+            .await
+            .unwrap();
+        assert_eq!(b3.client, "b");
         assert!(matches!(
-            f.put_config("a", "x".repeat(MAX_CONFIG + 1)).await,
+            f.put_config("a", "x".repeat(MAX_CONFIG + 1), Some(&b3.revision))
+                .await,
             Err(FleetError::TooLarge(_))
         ));
-        let r = f.put_runs("a", raw(r#"{"runs":[1]}"#)).await.unwrap();
+        let ra = f.put_runs("a", raw(r#"{"runs":[1]}"#)).await.unwrap();
+        f.put_runs("b", raw(r#"{"runs":[2]}"#)).await.unwrap();
 
-        let again = Fleet::open(dir.path().to_path_buf());
+        let again = Fleet::open(dir.path().to_path_buf(), "st");
         let (meta, text) = again.config();
-        assert_eq!(meta.unwrap().revision, b1.revision);
-        assert_eq!(text.as_deref(), Some("[roost]\n"));
-        let (meta, body) = again.runs();
-        assert_eq!(meta.unwrap().revision, r.revision);
+        assert_eq!(meta.unwrap().revision, b3.revision);
+        assert_eq!(text.as_deref(), Some("two"));
+        let (meta, body) = again.runs("a");
+        assert_eq!(meta.unwrap().revision, ra.revision);
         assert_eq!(body.unwrap().get(), r#"{"runs":[1]}"#);
+        assert_eq!(again.runs("b").1.unwrap().get(), r#"{"runs":[2]}"#);
+
+        for i in 0..MAX_DEVICES {
+            f.put_runs(&format!("d{i}"), raw("{}")).await.unwrap();
+        }
+        assert!(f.runs("a").0.is_none(), "the oldest upload made room");
+        assert!(!dir.path().join(runs_file("a")).exists());
 
         // A content file that no longer matches its recorded revision is dropped.
         std::fs::write(dir.path().join("fleet-config.toml"), "tampered").unwrap();
-        assert!(Fleet::open(dir.path().to_path_buf()).config().0.is_none());
+        assert!(
+            Fleet::open(dir.path().to_path_buf(), "st")
+                .config()
+                .0
+                .is_none()
+        );
     }
 }

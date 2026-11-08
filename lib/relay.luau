@@ -6,12 +6,13 @@
 -- Persistent client state lives in tern.kv, keyed by relay URL so pointing at another agent
 -- starts clean: `cursor` = { url, store_id, seq }, `subs` = { url, rev, fp, at?, adopted? }
 -- (`adopted`: the server's subscriptions were kept over differing local ones after a conflict),
--- `fleet` = { url, state } (the relay's device record, so the role is known before the relay
--- answers), `takeover` = { url, revision } (the executor assignment whose handover was applied).
+-- `fleet` = { url, state } (the relay's device record, so assignments are known before the relay
+-- answers).
 --
--- Devices (agent/src/fleet.rs, lib/fleet.luau): with an executor assigned, only it handles
--- events (observers get them through `observe`, for display), pushes subscriptions and gets App
--- tokens. Becoming the executor moves the cursor to where the previous one stopped.
+-- Devices (agent/src/fleet.rs, lib/fleet.luau): every device reads every event; the core runs
+-- the workflows the device record gives this machine. Devices on the same configuration push the
+-- same subscriptions (the relay accepts what it already runs whatever base comes with it); one
+-- whose configuration is behind the shared one doesn't push until it caught up.
 
 local util = require("./util")
 local fleet = require("./fleet")
@@ -60,7 +61,6 @@ export type State = {
 	last_test: number?,
 	waiting: boolean, -- polling paused until a valid workflows.toml loads
 	fleet: { [string]: any }?, -- the relay's device record (fleet.rs State), as last seen
-	takeover_at: number?, -- when this client last took over as executor at the old one's cursor
 }
 
 export type Subs = { [string]: { events: { string } } }
@@ -68,8 +68,6 @@ export type Subs = { [string]: { events: { string } } }
 export type Handlers = {
 	-- Handles one relayed event; errors are caught and logged.
 	event: (e: { [string]: any }) -> (),
-	-- An event an observer reads (the executor runs it): shown only.
-	observe: (e: { [string]: any }) -> (),
 	-- Events already read, for display only (no payloads; never run): see `backfill`.
 	history: (list: { { [string]: any } }) -> (),
 	-- Whether the events page has nothing saved yet and wants recent history.
@@ -83,6 +81,11 @@ export type Handlers = {
 	subs: () -> Subs?,
 	-- Workflows outside callers may start: id → SHA-256 of their token (api triggers).
 	dispatch: () -> { [string]: string },
+	-- Whether this machine's configuration is behind the shared one (its subscriptions are stale).
+	behind: () -> boolean,
+	-- The shared configuration on the relay changed (another device uploaded it): sync now rather
+	-- than at the next device tick.
+	config_changed: () -> (),
 }
 
 export type Relay = {
@@ -129,21 +132,22 @@ function M.fleet(r: Relay): { [string]: any }?
 	return if saved and type(saved.state) == "table" then saved.state else nil
 end
 
--- What this client is: solo (no relay, or no executor assigned), executor or observer.
-function M.role(r: Relay): fleet.Role
-	if not r.state.configured then
-		return "solo"
-	end
-	return fleet.role(M.fleet(r), r.h.client_id)
-end
-
+-- The default device, when one is assigned.
 function M.executor(r: Relay): fleet.Executor?
 	return if r.state.configured then fleet.executor(M.fleet(r)) else nil
 end
 
--- Why the configured relay can't say who the executor is (its record is unreadable), or nil.
+-- Why the configured relay can't say who runs what (its record is unreadable), or nil.
 function M.fleet_error(r: Relay): string?
 	return if r.state.configured then fleet.error(M.fleet(r)) else nil
+end
+
+-- Whether this machine runs workflow `wf` (for event `seq`, else now): always without a relay.
+function M.runs_here(r: Relay, wf: string, seq: number?): boolean
+	if not r.state.configured then
+		return true
+	end
+	return fleet.runs_here(M.fleet(r), r.h.client_id, wf, seq)
 end
 
 function kv_get(key: string): any
@@ -164,21 +168,41 @@ function mine(r: Relay, key: string): { [string]: any }?
 	return nil
 end
 
--- Takes in a device record from any relay answer; saved when the executor or its error changed.
+-- Takes in a device record from any relay answer; saved when an assignment, the shared
+-- configuration, the record's shape (a relay upgraded to per-workflow owners) or its error changed.
 local function note_fleet(r: Relay, f: any)
 	if type(f) ~= "table" then
 		return
 	end
 	local before = M.fleet(r)
 	r.state.fleet = f
-	local was = fleet.executor(before)
-	local now_ex = fleet.executor(f)
-	local changed = before == nil
+	local function rev_of(x: any): any
+		return if type(x) == "table" and type(x.config) == "table" then x.config.revision else nil
+	end
+	if
+		before == nil
 		or before.revision ~= f.revision
-		or (was and was.id) ~= (now_ex and now_ex.id)
 		or fleet.error(before) ~= fleet.error(f)
-	if changed then
+		or rev_of(before) ~= rev_of(f)
+		or (before.owners == nil) ~= (f.owners == nil)
+	then
 		kv_set("fleet", { url = r.cfg.url, state = f })
+	end
+	if before ~= nil and rev_of(before) ~= rev_of(f) then
+		r.h.config_changed()
+	end
+	-- Held back only for not knowing what the relay holds: go on now.
+	if r.state.sync.state == "behind" and not r.h.behind() then
+		M.sync(r)
+	end
+end
+
+-- What this machine learnt of the shared configuration from its own upload (or a refused one):
+-- the record says so before the relay's next answer does.
+function M.note_config(r: Relay, meta: any)
+	local f = r.state.fleet
+	if f and type(meta) == "table" and type(meta.revision) == "string" then
+		f.config = meta
 	end
 end
 
@@ -190,8 +214,8 @@ local function describe(res: FetchResult, body: any): string
 		return "令牌被拒绝(检查 roost.toml 的 relay.token 与服务器 agent.toml 的 [auth].token)"
 	end
 	local msg = if type(body) == "table" and type(body.error) == "string" then body.error else nil
-	if res.status == 403 and type(body) == "table" and body.code == "not_executor" then
-		return `本机不是执行者(执行者:{fleet.label(fleet.executor(body.fleet))}):只有执行者能这样做`
+	if type(body) == "table" and body.code == "fleet_broken" then
+		return "中继读不出设备记录:在设置的「中继与设备」页重新指定默认设备之前,任何设备都不运行"
 	end
 	return `HTTP {res.status}{if msg then ":" .. msg else ""}`
 end
@@ -233,8 +257,8 @@ function M.request(
 				decoded = if okd then v else nil
 			end
 			local good = res.error == nil and res.status >= 200 and res.status < 300
-			-- A refusal for not being the executor says who is: act on it at once.
-			if res.status == 403 and type(decoded) == "table" and decoded.code == "not_executor" then
+			-- The record went unreadable: act on it at once.
+			if type(decoded) == "table" and decoded.code == "fleet_broken" then
 				note_fleet(r, decoded.fleet)
 			end
 			cb(good, res.status, decoded, if good then nil else describe(res, decoded))
@@ -294,12 +318,6 @@ function M.push_subs(r: Relay, subs: Subs, force: boolean)
 		r.h.changed()
 		return
 	end
-	if M.role(r) == "observer" then
-		-- The executor's subscriptions are the relay's; it refuses an observer's anyway.
-		st.sync = { state = "observer" }
-		r.h.changed()
-		return
-	end
 	if st.busy.push then
 		r.push_again = { force = force or (r.push_again ~= nil and r.push_again.force) }
 		return
@@ -347,11 +365,23 @@ function M.push_subs(r: Relay, subs: Subs, force: boolean)
 		r.push_again = nil
 		if again and st.sync.state ~= "conflict" then
 			local cur = r.h.subs()
-			if cur and (again.force or M.needs_push(r, cur)) then
+			if cur and (again.force or (M.needs_push(r, cur) and not r.h.behind())) then
 				M.push_subs(r, cur, again.force)
 			end
 		end
 	end)
+end
+
+-- Subscriptions held back while this machine's configuration is behind the shared one. Without
+-- word from the relay at all (its record unknown, the last call failed) that reads as offline,
+-- the way a failed push does.
+local function hold(r: Relay)
+	local st = r.state
+	if M.fleet(r) == nil and st.error then
+		st.sync = { state = "offline", at = r.h.now(), error = st.error }
+	else
+		st.sync = { state = "behind" }
+	end
 end
 
 -- Settles the sync state against the relay's last /status. The relay runs the revision we last
@@ -365,8 +395,9 @@ local function reconcile(r: Relay, may_push: boolean)
 	if remote == nil or st.busy.push or st.sync.state == "conflict" then
 		return
 	end
-	if M.role(r) == "observer" then
-		st.sync = { state = "observer" }
+	if r.h.behind() then
+		-- Its subscriptions are stale until the shared configuration is applied here.
+		hold(r)
 		return
 	end
 	local subs = r.h.subs()
@@ -398,6 +429,11 @@ function M.sync(r: Relay)
 		return
 	end
 	if M.needs_push(r, subs) then
+		if r.h.behind() then
+			hold(r)
+			r.h.changed()
+			return
+		end
 		M.push_subs(r, subs, false)
 	else
 		reconcile(r, false)
@@ -492,68 +528,6 @@ local function backfill(r: Relay, gen: number, upto: number)
 	end)
 end
 
--- Which assignment a takeover record is for: the revision alone repeats after the relay loses
--- its device record (it starts again from 0), so the assignment time goes with it.
-local function assignment_key(f: { [string]: any }, ex: fleet.Executor): string
-	return `{tostring(f.revision)}@{ex.since or ""}`
-end
-
--- The assignment revision this client handles events under, when it is the executor and has
--- taken over (its cursor is then what it has handled): sent as `ack` with its polls.
-local function acting(r: Relay): number?
-	local f = r.state.fleet
-	local ex = fleet.executor(f)
-	if f == nil or ex == nil or ex.id ~= r.h.client_id or type(f.revision) ~= "number" then
-		return nil
-	end
-	local done = mine(r, "takeover")
-	return if done and done.key == assignment_key(f, ex) then f.revision else nil
-end
-
--- This client was just made the executor: it starts after the cursor the previous executor
--- confirmed (the events up to it were handled there, the later ones were not), and its
--- subscriptions become the relay's (its kv record of the last push is stale after observing).
--- True when the cursor moved: the batch in hand was read from the old position.
-local function takeover(r: Relay, cursor: { [string]: any }?, body: { [string]: any }): boolean
-	local f = r.state.fleet
-	local ex = fleet.executor(f)
-	if f == nil or ex == nil or ex.id ~= r.h.client_id then
-		return false
-	end
-	local key = assignment_key(f, ex)
-	local done = mine(r, "takeover")
-	if done and done.key == key then
-		return false
-	end
-	local to = ex.handover
-	local head = body.head
-	local moved = false
-	if
-		to
-		and cursor
-		and cursor.store_id == body.store_id
-		and cursor.seq ~= to
-		and (type(head) ~= "number" or to <= head)
-	then
-		kv_set("cursor", { url = r.cfg.url, store_id = body.store_id, seq = to })
-		r.state.takeover_at = r.h.now()
-		moved = true
-	end
-	-- Marked done only once the cursor is where it must be.
-	kv_set("takeover", { url = r.cfg.url, key = key })
-	local okp, perr = pcall(function(): string?
-		local subs = r.h.subs()
-		if subs then
-			M.push_subs(r, subs, true)
-		end
-		return nil
-	end)
-	if not okp then
-		tern.log.warn("roost: pushing subscriptions on takeover failed", perr)
-	end
-	return moved
-end
-
 function poll(r: Relay, gen: number)
 	if gen ~= r.gen or not r.state.configured then
 		return
@@ -579,11 +553,6 @@ function poll(r: Relay, gen: number)
 		-- keep the panel on its stale "not connected" state for up to POLL_WAIT seconds.
 		local wait = if st.connected then POLL_WAIT else 0
 		q = `/api/v1/events?wait={wait}&limit=50&after={math.floor(cursor.seq)}`
-		local rev = acting(r)
-		if rev and type(cursor.store_id) == "string" and string.match(cursor.store_id, "^%x+$") then
-			-- The store goes along: a cursor from a wiped store says nothing about the new one.
-			q ..= `&ack={math.floor(rev)}&store={cursor.store_id}`
-		end
 	else
 		-- First contact: learn the head at once; events after it come with the next poll.
 		q = "/api/v1/events?wait=0&limit=1"
@@ -597,6 +566,9 @@ function poll(r: Relay, gen: number)
 			local was, before = st.connected, st.error
 			st.connected = false
 			st.error = err or "响应无效"
+			if st.sync.state == "behind" then
+				hold(r)
+			end
 			r.backoff = math.min(MAX_BACKOFF, r.backoff * 2)
 			if was or st.error ~= before then
 				r.h.changed()
@@ -610,15 +582,12 @@ function poll(r: Relay, gen: number)
 		st.head, st.store_id = body.head, body.store_id
 		-- Straight back into the next long-poll, whatever happens below.
 		schedule_poll(r, gen, 0.05)
-		note_fleet(r, body.fleet)
+		-- A relay from before devices sends none: nothing assigned, nothing shared.
+		note_fleet(r, if type(body.fleet) == "table" then body.fleet else {})
 		if fleet.error(r.state.fleet) then
-			-- The relay can't say who the executor is: nobody reads on (the cursor stays), so the
-			-- executor assigned next finds these events still ahead of it.
+			-- The relay can't say who runs what: nobody reads on (the cursor stays), so these
+			-- events are still ahead once the record is repaired.
 			schedule_poll(r, gen, NOT_READY_RETRY)
-			r.h.changed()
-			return
-		end
-		if takeover(r, cursor, body) then
 			r.h.changed()
 			return
 		end
@@ -650,15 +619,10 @@ function poll(r: Relay, gen: number)
 			end
 			local seq = cursor.seq
 			local list = body.events or {}
-			local observer = M.role(r) == "observer"
 			for _, e in list do
 				if type(e) == "table" and type(e.seq) == "number" and e.seq > seq then
 					local okh, herr = pcall(function(): string?
-						if observer then
-							r.h.observe(e)
-						else
-							r.h.event(e)
-						end
+						r.h.event(e)
 						return nil
 					end)
 					if not okh then
@@ -687,7 +651,7 @@ function M.refresh_status(r: Relay)
 		local st = r.state
 		if ok and type(body) == "table" then
 			st.agent, st.agent_at = body, r.h.now()
-			note_fleet(r, body.fleet)
+			note_fleet(r, if type(body.fleet) == "table" then body.fleet else {})
 			if st.restarting and body.boot_id ~= st.restarting.from then
 				st.restarting = nil
 			end
@@ -696,6 +660,9 @@ function M.refresh_status(r: Relay)
 			st.agent_at = nil
 			if not st.connected then
 				st.error = err
+			end
+			if st.sync.state == "behind" then
+				hold(r)
 			end
 		end
 		r.h.changed()
@@ -830,31 +797,40 @@ function M.clear_events(r: Relay, cb: (boolean, string, any) -> ())
 end
 
 -- ---------------------------------------------------------------------------------------------
--- Devices: the executor, its configuration and its runs (agent/src/fleet.rs)
+-- Devices: who runs what, the shared configuration, each device's runs (agent/src/fleet.rs)
 
--- Makes `client` (a device the relay has heard from) the executor. Compare-and-set on the device
--- record's revision, so a choice made on a stale view is refused.
-function M.assign(r: Relay, client: string, cb: (boolean, string) -> ())
+-- Gives `key` (a workflow id, or fleet.DEFAULT for the default device) to device `client` (nil:
+-- the workflow follows the default device; no default: every device runs). Compare-and-set on
+-- the device record's revision, so a choice made on a stale view is refused.
+function M.assign(r: Relay, key: string, client: string?, cb: (boolean, string) -> ())
 	local st = r.state
 	if st.busy.assign then
+		cb(false, "上一次指派还没完成")
 		return
 	end
 	local f = M.fleet(r)
 	local base = if f and type(f.revision) == "number" then f.revision else 0
+	local who: any = if client then client else tern.json.null
+	local path, body
+	if key == fleet.DEFAULT then
+		path, body = "/api/v1/fleet/executor", { client = who, base_revision = base }
+	else
+		path, body = "/api/v1/fleet/assign", { workflow = key, client = who, base_revision = base }
+	end
 	st.busy.assign = true
 	r.h.changed()
 	local gen = r.gen
-	M.request(r, "PUT", "/api/v1/fleet/executor", { client = client, base_revision = base }, 15000, function(ok, status, body, err)
+	M.request(r, "PUT", path, body, 15000, function(ok, status, resp, err)
 		if gen ~= r.gen then
 			return
 		end
 		st.busy.assign = nil
-		if type(body) == "table" then
-			note_fleet(r, body.fleet)
+		if type(resp) == "table" then
+			note_fleet(r, resp.fleet)
 		end
 		local msg = err or ""
 		if status == 409 then
-			msg = "执行者刚被其他设备改过:看一下现在的执行者再决定"
+			msg = "设备分配刚被其他设备改过:看一下现在的分配再决定"
 		elseif status == 404 then
 			msg = "中继启动以来还没收到这台设备的请求:先让它连上中继"
 		end
@@ -875,9 +851,11 @@ local function device_call(r: Relay, method: string, path: string, body: any, cb
 	end)
 end
 
--- The executor's configuration (Roost's export format). `cb(ok, { config = meta }, err)`.
-function M.put_config(r: Relay, text: string, cb: (boolean, any, string?) -> ())
-	device_call(r, "PUT", "/api/v1/fleet/config", { text = text }, cb)
+-- Uploads the shared configuration (Roost's export format) edited on top of revision `base` (nil:
+-- this machine never had one). `cb(ok, { config = meta }, err)`; a newer one on the relay answers
+-- `code = "config_conflict"` with its `config`.
+function M.put_config(r: Relay, text: string, base: string?, cb: (boolean, any, string?) -> ())
+	device_call(r, "PUT", "/api/v1/fleet/config", { text = text, base = if base then base else tern.json.null }, cb)
 end
 
 -- `have`: the revision held here; the answer then has no text when it is still current.
@@ -886,14 +864,40 @@ function M.get_config(r: Relay, have: string?, cb: (boolean, any, string?) -> ()
 	device_call(r, "GET", "/api/v1/fleet/config" .. q, nil, cb)
 end
 
--- The executor's run summaries, `json` already encoded (lib/fleet.luau summaries).
+-- This machine's run summaries, `json` already encoded (lib/fleet.luau summaries).
 function M.put_runs(r: Relay, json: string, cb: (boolean, any, string?) -> ())
 	device_call(r, "PUT", "/api/v1/fleet/runs", json, cb)
 end
 
-function M.get_runs(r: Relay, have: string?, cb: (boolean, any, string?) -> ())
+-- Device `client`'s run summaries; `have` as for get_config.
+function M.get_runs(r: Relay, client: string, have: string?, cb: (boolean, any, string?) -> ())
+	if not string.match(client, "^[%w%-_%.]+$") then
+		cb(false, nil, "设备 id 无效")
+		return
+	end
 	local q = if have and string.match(have, "^%x+$") then `?have={have}` else ""
-	device_call(r, "GET", "/api/v1/fleet/runs" .. q, nil, cb)
+	device_call(r, "GET", `/api/v1/fleet/runs/{client}` .. q, nil, cb)
+end
+
+-- Asks device `target` to run workflow `workflow` (a `roost_run` event it reads; later when it is
+-- offline now). `pr`: the pull request as typed in the run form.
+function M.post_run(
+	r: Relay,
+	workflow: string,
+	target: string,
+	inputs: { [string]: string },
+	pr: string?,
+	cb: (boolean, any, string?) -> ()
+)
+	-- An empty table would go out as an array: leave the inputs out instead.
+	local body: { [string]: any } = { workflow = workflow, target = target }
+	if next(inputs) ~= nil then
+		body.inputs = inputs
+	end
+	if pr then
+		body.pr = pr
+	end
+	device_call(r, "POST", "/api/v1/fleet/run", body, cb)
 end
 
 return M

@@ -1404,7 +1404,7 @@ do -- an edit during a push is pushed right after it; offline pushes retry on re
 	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TREE, [DATA .. "/roost.toml"] = ROOST })
 	local puts: { any } = {}
 	s.http = function(method, path, body)
-		if method == "PUT" then
+		if method == "PUT" and path == "/api/v1/subscriptions" then
 			table.insert(puts, body)
 			if #puts == 1 then
 				return false -- held open
@@ -2990,8 +2990,8 @@ name = "x"
 run = "true"
 ]==]
 
--- The executor's configuration as the relay holds it (export format, env values blank).
-local EXEC_CFG = [==[
+-- The shared configuration as the relay holds it (export format, env values blank).
+local SHARED_CFG = [==[
 [roost]
 format = 1
 exported_at = 0
@@ -3011,10 +3011,6 @@ libs = ["shared"]
 github = "comment"
 repos = ["acme/web"]
 comment = "/roost"
-[[workflow.trigger]]
-schedule = "cron"
-cron = "*/5 * * * *"
-tz = "UTC"
 [[workflow.step]]
 name = "work"
 run = "echo theirs"
@@ -3034,55 +3030,57 @@ name = "Ops"
 workflows = ["fix"]
 ]==]
 
-do -- devices: an observer lists events without running them, mirrors the executor's configuration
-	-- and shows its runs; made the executor, it takes over at the old one's cursor and uploads
+do -- devices: a workflow runs on the device it had when the relay got the event; the shared
+	-- configuration is applied here and an edit here goes up; manual runs of another device's
+	-- workflow go to it, and ones asked of this machine run here
 	local s = scenario({
 		[DATA .. "/workflows.toml"] = WF_MINE,
 		[DATA .. "/roost.toml"] = ROOST,
 		[DATA .. "/workflows/old/files/a.sh"] = "echo old\n",
 	})
 	s.c.relay.h.client_id = "me"
+	local AT = "2026-11-05T11:00:00Z"
 	local fl: any = {
-		revision = 1,
-		executor = { id = "other", name = "Mac B", since = "2026-11-05T11:00:00Z" },
-		config = { revision = "c1", client = "other", at = "2026-11-05T11:00:00Z", bytes = #EXEC_CFG },
+		revision = 2,
+		executor = { id = "other", name = "Mac B", since = AT },
+		owners = {
+			["*"] = { { client = "other", name = "Mac B", seq = 0, at = AT } },
+			fix = { { client = "me", seq = 11, at = AT } },
+		},
+		config = { revision = "c1", client = "other", at = AT, bytes = #SHARED_CFG },
+		uploads = { other = { revision = "r1", client = "other", at = AT, bytes = 1 } },
 	}
+	local cfg_text = SHARED_CFG
 	local queue: { any } = {}
-	local afters: { string } = {}
 	local pushes: { any } = {}
-	local uploads: { [string]: any } = {}
+	local configs: { any } = {}
+	local runs_put: { any } = {}
+	local forwarded: { any } = {}
 	s.http = function(method, path, body)
-		local executor = fl.executor and fl.executor.id
 		if method == "PUT" and path == "/api/v1/subscriptions" then
-			if executor ~= "me" then
-				return 403, { error = "only the executor", code = "not_executor", fleet = fl }
-			end
 			table.insert(pushes, body)
-			return 200, { revision = "s2", changed = false }
+			return 200, { revision = "s2", changed = true }
 		elseif method == "GET" and string.sub(path, 1, 15) == "/api/v1/events?" then
-			local after = string.match(path, "after=(%d+)") or "none"
 			local evs = queue
 			queue = {}
-			if #evs > 0 then
-				table.insert(afters, after)
-			end
-			return 200, { store_id = "S", head = 11, oldest = 1, gap = false, events = evs, fleet = fl }
+			return 200, { store_id = "S", head = 30, oldest = 1, gap = false, events = evs, fleet = fl }
 		elseif path == "/api/v1/fleet/config" then
 			if method == "PUT" then
-				uploads.config = body
-				return 200, { config = { revision = "c2" } }
+				table.insert(configs, body)
+				if body.base ~= fl.config.revision then
+					return 409, { error = "changed", code = "config_conflict", config = fl.config }
+				end
+				fl.config = { revision = `c{#configs + 1}`, client = "me", at = AT, bytes = #body.text }
+				cfg_text = body.text
+				return 200, { config = fl.config }
 			end
-			return 200, { config = fl.config, text = EXEC_CFG }
-		elseif string.sub(path, 1, 18) == "/api/v1/fleet/runs" then
-			if method == "PUT" then
-				uploads.runs = body
-				return 200, { runs = { revision = "r2" } }
-			end
-			if string.find(path, "have=r1", 1, true) then
-				return 200, { runs = { revision = "r1" }, unchanged = true }
-			end
+			return 200, { config = fl.config, text = cfg_text }
+		elseif path == "/api/v1/fleet/runs" then
+			table.insert(runs_put, body)
+			return 200, { runs = { revision = "m1" } }
+		elseif string.sub(path, 1, 24) == "/api/v1/fleet/runs/other" then
 			return 200, {
-				runs = { revision = "r1", client = "other", at = "2026-11-05T12:00:00Z" },
+				runs = { revision = "r1", client = "other", at = AT },
 				body = {
 					format = 1,
 					runs = {
@@ -3100,39 +3098,37 @@ do -- devices: an observer lists events without running them, mirrors the execut
 					},
 				},
 			}
+		elseif path == "/api/v1/fleet/run" then
+			table.insert(forwarded, body)
+			return 202, { seq = 31 }
 		elseif path == "/api/v1/status" then
-			return 200, { boot_id = "b1", version = "0.1.0", fleet = fl, clients = { { id = "me", last_seen = "2026-11-05T12:00:00Z", cursor = 11 } } }
+			return 200, {
+				boot_id = "b1",
+				version = "0.1.0",
+				fleet = fl,
+				clients = {
+					{ id = "me", last_seen = AT, cursor = 10 },
+					{ id = "other", name = "Mac B", last_seen = AT, cursor = 10 },
+				},
+			}
 		end
 		return 404, { error = "nope" }
 	end
-	s.behave = function(_p)
-		return "exit:0"
-	end
 	s.env.kv.cursor = { url = "https://relay.test", store_id = "S", seq = 10 }
 	s.core.start(s.c)
-	step(s, 1)
-	eq(s.core.role(s.c), "observer", "the relay names another executor")
-	eq(#pushes, 0, "an observer's subscriptions are refused, never pushed")
-	eq(s.env.files[DATA .. "/workflows/old/files/a.sh"], "echo old\n", "this machine's own files, before mirroring")
-	queue = { comment_event(11, "/roost please", "MEMBER") }
-	step(s, 1)
-	eq(s.env.kv.cursor.seq, 11, "the observer reads on")
-	eq(#s.c.store.runs, 0, "but runs nothing")
-	eq(s.c.events[1].delivery, "d11")
-	eq(s.c.events[1].observed, "Mac B", "listed as the executor's")
-	truthy(string.find(s.core.dispatch(s.c, "fix") or "", "观察者", 1, true), "manual runs refused")
-
+	eq(#pushes, 0, "nothing pushed before the relay says what it holds")
 	step(s, 6)
 	local wf = s.env.files[DATA .. "/workflows.toml"]
-	truthy(string.find(wf, 'echo theirs', 1, true), "the executor's workflows: " .. wf)
+	truthy(string.find(wf, "echo theirs", 1, true), "the shared workflows: " .. wf)
 	truthy(string.find(wf, 'path = "~/code/web"', 1, true), "this machine's repo path kept")
-	truthy(string.find(wf, 'branch = "dev"', 1, true), "the executor's branch")
+	truthy(string.find(wf, 'branch = "dev"', 1, true), "the shared branch")
 	truthy(string.find(wf, '"secret"', 1, true), "this machine's env value kept")
-	eq(string.find(wf, 'id = "old"', 1, true), nil, "workflows the executor lacks are gone")
-	eq(s.c.dev.mirror_missing[1], "acme/api", "repos still without a local path")
-	eq(s.env.files[DATA .. "/workflows/fix/files/notes.md"], "hello\n", "workflow files mirrored")
-	eq(s.env.files[DATA .. "/library/shared/x.py"], "print(1)\n", "libraries mirrored")
-	eq(s.env.files[DATA .. "/workflows/old/files/a.sh"], nil, "the dropped workflow's files are removed")
+	truthy(string.find(wf, 'id = "old"', 1, true), "joining: this machine's own workflow comes back")
+	eq(s.c.workflows.by_id.old.enabled, false, "disabled until someone turns it on")
+	eq(s.c.dev.missing[1], "acme/api", "repos without a local path")
+	eq(s.env.files[DATA .. "/workflows/fix/files/notes.md"], "hello\n", "workflow files applied")
+	eq(s.env.files[DATA .. "/library/shared/x.py"], "print(1)\n", "libraries applied")
+	eq(s.env.files[DATA .. "/workflows/old/files/a.sh"], "echo old\n", "with its files")
 	eq(s.c.groups.list[1].name, "Ops")
 	local function backups(): { string }
 		local out: { string } = {}
@@ -3144,87 +3140,168 @@ do -- devices: an observer lists events without running them, mirrors the execut
 		table.sort(out)
 		return out
 	end
-	eq(#backups(), 1, "the original kept before the first mirror")
+	eq(#backups(), 1, "this machine's own configuration kept before the first sync")
 	eq(s.env.files[backups()[1]], WF_MINE)
-	eq(s.env.kv.mirror.revision, "c1")
-	truthy(s.core.save_workflow(s.c, "fix", { id = "fix", name = "x" })[1].message:find("观察者"), "edits refused")
-	eq(s.c.dev.remote[1].id, "ab12", "the executor's runs")
-	eq(s.c.dev.remote_tails.ab12, "line\n")
-	step(s, 300)
-	eq(#s.c.store.runs, 0, "the mirrored schedule doesn't fire on an observer")
+	step(s, 6)
+	eq(configs[1] and configs[1].base, "c1", "the joined configuration goes up on top of c1")
+	truthy(configs[1] and string.find(configs[1].text, 'id = "old"', 1, true), "with this machine's workflow")
+	eq(s.env.kv.sync.revision, fl.config.revision)
+	truthy(#pushes >= 1, "subscriptions pushed once the configuration is the shared one")
+	truthy(#runs_put >= 1, "this machine's runs uploaded")
+	local theirs = s.c.dev.remote.other.runs[1]
+	eq(theirs.id, "ab12", "the other device's runs")
+	eq(theirs.device, "other")
+	eq(s.core.remote_tail(s.c, theirs), "line\n")
+	eq(s.core.remote_runs(s.c)[1].id, "ab12")
 
-	-- Made the executor where the old one had handled up to 10: event 11 is this machine's now.
-	fl = {
-		revision = 2,
-		executor = { id = "me", since = "2026-11-05T12:05:00Z", handover = 10 },
-		config = fl.config,
-	}
-	queue = {}
+	-- fix became this machine's from event 12 on: 11 is the default device's, 12 runs here.
+	local function github_runs(): { any }
+		local out: { any } = {}
+		for _, r in s.c.store.runs do
+			if r.trigger.kind == "github" then
+				table.insert(out, r)
+			end
+		end
+		return out
+	end
+	queue = { comment_event(11, "/roost please", "MEMBER"), comment_event(12, "/roost again", "MEMBER") }
 	step(s, 1)
-	eq(s.core.role(s.c), "executor")
-	eq(s.env.kv.cursor.seq, 10, "cursor moved back to the handover")
-	truthy(#pushes >= 1 and pushes[1].base_revision == nil, "subscriptions pushed as the relay's own")
-	queue = { comment_event(11, "/roost please", "MEMBER") }
-	step(s, 1)
-	eq(afters[#afters], "10", "read again from the handover")
-	eq(#s.c.store.runs, 1, "the event the old executor never handled runs here")
-	local rows = 0
+	local gh = github_runs()
+	eq(#gh, 1, "only the event after the assignment runs here")
+	eq(gh[1].trigger.delivery, "d12")
 	for _, e in s.c.events do
 		if e.delivery == "d11" then
-			rows += 1
-			eq(e.observed, nil, "the observed row became this machine's")
-			eq(#e.runs, 1)
+			eq(e.reasons.fix, "由「Mac B」运行")
 		end
 	end
-	eq(rows, 1, "one row per event")
-	step(s, 6)
-	truthy(uploads.config and string.find(uploads.config.text, "[roost]", 1, true), "the configuration uploaded")
-	truthy(uploads.config and not string.find(uploads.config.text, "secret", 1, true), "without env values")
-	truthy(uploads.runs and uploads.runs.runs[1].workflow == "fix", "the runs uploaded")
 
-	-- Handed back to the other machine: what this one held as the executor is backed up first.
-	s.now += 60
-	fl = {
-		revision = 3,
-		executor = { id = "other", name = "Mac B", since = "2026-11-05T12:20:00Z", handover = 11 },
-		config = { revision = "c3", client = "other", at = "2026-11-05T12:20:00Z", bytes = #EXEC_CFG },
-	}
+	-- An edit here goes up on top of the revision this machine has.
+	local had = s.env.kv.sync.revision
+	s.env.files[DATA .. "/workflows.toml"] = (string.gsub(s.env.files[DATA .. "/workflows.toml"], "echo theirs", "echo edited"))
 	step(s, 8)
-	eq(s.core.role(s.c), "observer")
-	eq(s.env.kv.mirror.revision, "c3")
-	eq(#backups(), 2, "backed up again: this machine was the executor since its last mirror")
+	local up = configs[#configs]
+	eq(up and up.base, had, "uploaded on top of the synced revision")
+	truthy(string.find(up.text, "echo edited", 1, true), "with the edit")
+	eq(string.find(up.text, "secret", 1, true), nil, "without env values")
+	eq(s.env.kv.sync.revision, fl.config.revision)
+
+	-- fix follows the default device again: a manual run goes to it.
+	fl.revision = 3
+	table.insert(fl.owners.fix, { seq = 20, at = AT })
+	step(s, 1)
+	local err, other = s.core.dispatch(s.c, "fix")
+	eq(err, nil)
+	eq(other, "Mac B")
+	step(s, 1)
+	eq(#forwarded, 1)
+	eq(forwarded[1].target, "other")
+	eq(forwarded[1].workflow, "fix")
+
+	-- One asked of this machine runs here whoever has the workflow.
+	local before = #s.c.store.runs
+	queue = {
+		{
+			seq = 21,
+			delivery = "run-1",
+			event = "roost_run",
+			info = { event = "roost_run", action = "run", title = "fix", sender = "device" },
+			payload = { workflow = "fix", target = "me", from = "other", from_name = "Mac B" },
+		},
+	}
+	step(s, 1)
+	eq(#s.c.store.runs, before + 1, "the forwarded run queued here")
+	local fr = last_run(s)
+	eq(fr.trigger.kind, "manual")
+	truthy(string.find(fr.trigger.detail, "Mac B", 1, true), fr.trigger.detail)
+
+	-- Another device uploaded while this machine had an unsynced edit: theirs wins, ours is kept.
+	s.now += 60
+	fl.config = { revision = "c9", client = "other", at = AT, bytes = #SHARED_CFG }
+	cfg_text = SHARED_CFG
+	s.env.files[DATA .. "/workflows.toml"] = (string.gsub(s.env.files[DATA .. "/workflows.toml"], "echo edited", "echo mine again"))
+	step(s, 8)
+	eq(s.env.kv.sync.revision, "c9")
+	truthy(string.find(s.env.files[DATA .. "/workflows.toml"], "echo theirs", 1, true), "the newer configuration applied")
+	eq(#backups(), 2, "the unsynced edit backed up first")
+	truthy(string.find(s.env.files[backups()[2]], "echo mine again", 1, true), "the backup holds the edit")
+
+	-- An unreadable device record: nothing runs and nothing is read on.
+	local cursor = s.env.kv.cursor.seq
+	fl = { error = "fleet.json unreadable" }
+	queue = { comment_event(25, "/roost please", "MEMBER") }
+	step(s, 2)
+	truthy(s.core.run_block(s.c), "runs refused")
+	eq(s.env.kv.cursor.seq, cursor, "the cursor stays")
 end
 
-do -- devices: events listed as history (first contact) still run here after a takeover rewinds
-	local s = scenario({ [DATA .. "/workflows.toml"] = WF_TREE, [DATA .. "/roost.toml"] = ROOST })
-	s.c.relay.h.client_id = "me"
-	s.env.kv.cursor = { url = "https://relay.test", store_id = "S", seq = 12 }
-	local fl: any = { revision = 1, executor = { id = "other", since = "2026-11-05T11:00:00Z" } }
-	s.http = function(_method, path, _body)
-		if string.find(path, "payload=false", 1, true) then
-			local e = comment_event(11, "/roost please", "MEMBER")
-			e.payload = nil
-			return 200, { store_id = "S", head = 12, oldest = 1, gap = false, events = { e }, fleet = fl }
-		elseif string.sub(path, 1, 15) == "/api/v1/events?" then
-			local evs = if string.find(path, "after=10", 1, true) then { comment_event(11, "/roost please", "MEMBER") } else {}
-			return 200, { store_id = "S", head = 12, oldest = 1, gap = false, events = evs, fleet = fl }
-		elseif path == "/api/v1/status" then
-			return 200, { boot_id = "b1", version = "0.1.0", fleet = fl }
+do -- devices: after the upgrade from executor/observers, the old executor's configuration goes up
+	-- on top of what the relay holds, an observer untouched since it applied it is in sync, and one
+	-- edited by hand keeps its edits (backed up, its own workflows joined)
+	local function joined(kv: { [string]: any }, mirrored: string?): (Scenario, { any })
+		local s = scenario({ [DATA .. "/workflows.toml"] = WF_MINE, [DATA .. "/roost.toml"] = ROOST })
+		if mirrored then
+			s.env.files[DATA .. "/workflows.toml.mirrored"] = mirrored
 		end
-		return 200, { revision = "r" }
+		s.c.relay.h.client_id = "me"
+		for k, v in kv do
+			s.env.kv[k] = v
+		end
+		local AT = "2026-11-05T11:00:00Z"
+		local fl: any = {
+			revision = 1,
+			executor = { id = "me", since = AT },
+			owners = { ["*"] = { { client = "me", seq = 0, at = AT } } },
+			config = { revision = "c1", client = "me", at = AT, bytes = #SHARED_CFG },
+		}
+		local configs: { any } = {}
+		s.http = function(method, path, body)
+			if string.sub(path, 1, 15) == "/api/v1/events?" then
+				return 200, { store_id = "S", head = 1, oldest = 1, gap = false, events = {}, fleet = fl }
+			elseif path == "/api/v1/fleet/config" then
+				if method == "PUT" then
+					table.insert(configs, body)
+					fl.config = { revision = "c2", client = "me", at = AT, bytes = #body.text }
+					return 200, { config = fl.config }
+				end
+				return 200, { config = fl.config, text = SHARED_CFG }
+			elseif path == "/api/v1/status" then
+				return 200, { boot_id = "b1", version = "0.1.0", fleet = fl }
+			end
+			return 200, { revision = "r" }
+		end
+		s.env.kv.cursor = { url = "https://relay.test", store_id = "S", seq = 1 }
+		s.core.start(s.c)
+		step(s, 12)
+		return s, configs
 	end
-	s.behave = function(_p)
-		return "exit:0"
+	local function backups(s: Scenario): number
+		local n = 0
+		for k in s.env.files do
+			if string.match(k, "workflows%.toml%.before%-sync%-") then
+				n += 1
+			end
+		end
+		return n
 	end
-	s.core.start(s.c)
-	step(s, 2)
-	eq(s.c.events[1].history, true, "listed as history")
-	eq(#s.c.store.runs, 0)
-	fl = { revision = 2, executor = { id = "me", since = "2026-11-05T12:00:00Z", handover = 10 } }
-	step(s, 2)
-	eq(#s.c.store.runs, 1, "the history event the old executor never handled runs after the takeover")
-	eq(#s.c.events, 1, "its row became the run's")
-	eq(s.c.events[1].history, nil)
+
+	local ex, up = joined({ mirror_exec = "https://relay.test" })
+	eq(up[1] and up[1].base, "c1", "the old executor uploads on top of what it uploaded before")
+	truthy(up[1] and string.find(up[1].text, "echo mine", 1, true), "its own configuration")
+	eq(backups(ex), 0)
+	eq(ex.env.kv.mirror_exec, nil, "the old record goes")
+
+	local mk = { mirror = { url = "https://relay.test", revision = "c1" } }
+	local ob, none = joined(mk, WF_MINE)
+	eq(#none, 0, "an observer that applied c1 has nothing to send")
+	eq(backups(ob), 0, "nor anything to back up")
+	eq(ob.env.files[DATA .. "/workflows.toml"], WF_MINE, "nor anything to apply")
+	eq(ob.env.kv.sync.revision, "c1")
+	eq(ob.env.kv.mirror, nil)
+	eq(ob.env.files[DATA .. "/workflows.toml.mirrored"], nil, "the old mirror copy goes")
+
+	local hand, sent = joined(mk, "# what the mirror wrote, since edited\n")
+	eq(backups(hand), 1, "edited by hand: kept before the shared configuration is applied")
+	truthy(sent[1] and string.find(sent[1].text, 'id = "old"', 1, true), "its own workflow joins the shared one")
 end
 
 print("ok")

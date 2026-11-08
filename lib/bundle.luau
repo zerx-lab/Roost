@@ -102,7 +102,7 @@ end
 
 -- Reads an export back. Checks the shape only; whether the workflows are valid is the importer's
 -- question (they are checked together with the workflows already here). `allow_empty`: a file
--- without workflows is fine (device sync: the executor may have none).
+-- without workflows is fine (device sync: the shared configuration may have none).
 function M.decode(text: string, allow_empty: boolean?): (Bundle?, string?)
 	if #text > M.MAX_BYTES then
 		return nil, `文件超过 {M.MAX_BYTES // (1024 * 1024)} MiB`
